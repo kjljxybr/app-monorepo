@@ -2,7 +2,7 @@
 
 import type { ReactNode } from 'react';
 
-import { act, renderHook } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { createStore } from 'jotai';
 
 import type {
@@ -161,6 +161,9 @@ const mockGetIndexedAccountsOfWallet: jest.MockedFunction<
   ({ walletId }: { walletId: string }) => Promise<{
     accounts: IIndexedAccount[];
   }>
+> = jest.fn();
+const mockGetIndexedAccountSafe: jest.MockedFunction<
+  ({ id }: { id: string }) => Promise<IIndexedAccount | undefined>
 > = jest.fn();
 const mockGetSingletonAccountsOfWallet: jest.MockedFunction<
   ({
@@ -321,6 +324,8 @@ jest.mock('@onekeyhq/kit/src/background/instance/backgroundApiProxy', () => ({
       getAllHdHwQrWallets: () => mockGetAllHdHwQrWallets(),
       getIndexedAccountsOfWallet: ({ walletId }: { walletId: string }) =>
         mockGetIndexedAccountsOfWallet({ walletId }),
+      getIndexedAccountSafe: ({ id }: { id: string }) =>
+        mockGetIndexedAccountSafe({ id }),
       getSingletonAccountsOfWallet: ({
         walletId,
         activeNetworkId,
@@ -481,6 +486,13 @@ describe('useAccountSelectorActions', () => {
         { id: 'hd-1--1', walletId: 'hd-1' } as IIndexedAccount,
       ],
     });
+    mockGetIndexedAccountSafe.mockImplementation(
+      async ({ id }) =>
+        ({
+          id,
+          walletId: 'hd-1',
+        }) as IIndexedAccount,
+    );
     mockGetSingletonAccountsOfWallet.mockResolvedValue({ accounts: [] });
     mockGetWalletSafe.mockResolvedValue({ id: 'hd-1' } as IWallet);
     mockIsTempWalletRemoved.mockResolvedValue(false);
@@ -752,6 +764,59 @@ describe('useAccountSelectorActions', () => {
     expect(activeAccountInitDoneListener).not.toHaveBeenCalled();
     unsubscribe();
     unsubscribeInitDone();
+  });
+
+  it('clears a stale active account after its selected account is removed', async () => {
+    const clearedSelection = {
+      ...defaultSelectedAccount(),
+      networkId: 'evm--1',
+      deriveType: 'default' as const,
+    };
+    const staleActiveAccount = {
+      ...defaultActiveAccountInfo(),
+      ready: true,
+      wallet: { id: 'hd-1' } as IWallet,
+      indexedAccount: {
+        id: 'hd-1--0',
+        walletId: 'hd-1',
+      } as IIndexedAccount,
+    };
+    const clearedActiveAccount = {
+      ...defaultActiveAccountInfo(),
+      ready: true,
+      network: { id: 'evm--1' } as IServerNetwork,
+    };
+    mockBuildActiveAccountInfoFromSelectedAccount.mockResolvedValue({
+      activeAccount: clearedActiveAccount,
+    });
+
+    const { store, Wrapper } = createWrapper();
+    store.set(accountSelectorStorageInitDoneAtom(), true);
+    store.set(selectedAccountsAtom(), { 0: clearedSelection });
+    store.set(activeAccountsAtom(), { 0: staleActiveAccount });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let reloadOutcome: string | undefined;
+    await act(async () => {
+      reloadOutcome = (
+        await result.current.reloadActiveAccountInfo({
+          num: 0,
+          selectedAccount: clearedSelection,
+          perfContext: {
+            selectionReason: 'removeAccountSelectionClear',
+            selectionTransitionId: 1,
+          },
+        })
+      ).outcome;
+    });
+
+    expect(reloadOutcome).toBe('commit');
+    expect(mockBuildActiveAccountInfoFromSelectedAccount).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(store.get(activeAccountsAtom())[0]).toBe(clearedActiveAccount);
   });
 
   it('skips an active-account build when the queued selection is already stale', async () => {
@@ -1194,6 +1259,45 @@ describe('useAccountSelectorActions', () => {
       });
     });
 
+    it('waits for explicit storage persistence before confirming', async () => {
+      const saveDeferred = createDeferred<{ persisted: boolean }>();
+      mockSaveSelectedAccount.mockReturnValueOnce(saveDeferred.promise);
+
+      const { store, Wrapper } = createWrapper();
+      store.set(accountSelectorContextDataAtom(), {
+        sceneName: EAccountSelectorSceneName.home,
+      });
+      seedSelection(store, 'tron--0x2b6653dc');
+      const { result } = renderHook(() => useAccountSelectorActions().current, {
+        wrapper: Wrapper,
+      });
+      let confirmed = false;
+      let confirmPromise: Promise<boolean> | undefined;
+
+      await act(async () => {
+        confirmPromise = result.current.confirmAccountSelect({
+          indexedAccount: qrIndexedAccount,
+          othersWalletAccount: undefined,
+          num: 0,
+        });
+        void confirmPromise.then((value) => {
+          confirmed = value;
+        });
+        await waitFor(() => {
+          expect(mockSaveSelectedAccount).toHaveBeenCalledTimes(1);
+        });
+      });
+
+      expect(confirmed).toBe(false);
+
+      await act(async () => {
+        saveDeferred.resolve({ persisted: true });
+        await confirmPromise;
+      });
+
+      expect(confirmed).toBe(true);
+    });
+
     it('drops a stale fallback result when a newer selection completes first', async () => {
       const resolvers = new Map<string, (value: string | undefined) => void>();
       mockGetAllNetworksFallbackNetworkId.mockImplementation(
@@ -1522,6 +1626,38 @@ describe('useAccountSelectorActions', () => {
     expect(mockSaveSelectedAccount).toHaveBeenCalledTimes(1);
   });
 
+  it('coalesces sequential storage saves for the same selection revision', async () => {
+    const selectedAccount = createHdSelectedAccount('hd-1--0');
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 1000 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    await act(async () => {
+      await result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount,
+        selectedAccountUpdatedAt: 1000,
+        trigger: 'confirm-explicit',
+      });
+      await result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount,
+        selectedAccountUpdatedAt: 1000,
+        trigger: 'selection-effect',
+      });
+    });
+
+    expect(mockSaveSelectedAccount).toHaveBeenCalledTimes(1);
+    expect(mockSaveGlobalDeriveType).toHaveBeenCalledTimes(1);
+  });
+
   it('does not apply a global derive type resolved for a stale selection', async () => {
     const globalDeriveDeferred = createDeferred<string>();
     mockGetGlobalDeriveType.mockReturnValueOnce(globalDeriveDeferred.promise);
@@ -1743,6 +1879,41 @@ describe('useAccountSelectorActions', () => {
     });
   });
 
+  it('applies a different home-swap selection with the same timestamp', async () => {
+    mockShouldSyncHomeAndSwapSelectedAccount.mockResolvedValue(true);
+
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--1'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: {
+        eventEmitDisabled: false,
+        updatedAt: 2000,
+      },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    await act(async () => {
+      await result.current.syncHomeAndSwapSelectedAccount({
+        eventPayload: {
+          selectedAccount: createHdSelectedAccount('hd-1--0'),
+          selectedAccountUpdatedAt: 2000,
+          sceneName: EAccountSelectorSceneName.swap,
+          num: 0,
+        },
+        sceneName: EAccountSelectorSceneName.home,
+        num: 0,
+      });
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--0',
+    });
+  });
+
   it('keeps a restored indexed account when active account is temporarily incomplete', async () => {
     const selectedAccount = createHdSelectedAccount('hd-1--1');
 
@@ -1777,6 +1948,56 @@ describe('useAccountSelectorActions', () => {
       indexedAccountId: 'hd-1--1',
       focusedWallet: 'hd-1',
     });
+  });
+
+  it('clears a removed account in addressInput without selecting a fallback', async () => {
+    const selectedAccount = createHdSelectedAccount('hd-1--1');
+    mockGetIndexedAccountSafe.mockResolvedValue(undefined);
+    const { store, Wrapper } = createWrapper(
+      EAccountSelectorSceneName.addressInput,
+    );
+    store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    await act(async () => {
+      await result.current.autoSelectNextAccount({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.addressInput,
+        triggerBy: EAccountSelectorAutoSelectTriggerBy.removeAccount,
+      });
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      focusedWallet: undefined,
+      indexedAccountId: undefined,
+      othersWalletAccountId: undefined,
+      walletId: undefined,
+    });
+    expect(mockGetAllHdHwQrWallets).not.toHaveBeenCalled();
+  });
+
+  it('keeps an existing account in addressInput after an unrelated removal', async () => {
+    const selectedAccount = createHdSelectedAccount('hd-1--1');
+    const { store, Wrapper } = createWrapper(
+      EAccountSelectorSceneName.addressInput,
+    );
+    store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    await act(async () => {
+      await result.current.autoSelectNextAccount({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.addressInput,
+        triggerBy: EAccountSelectorAutoSelectTriggerBy.removeAccount,
+      });
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]).toEqual(selectedAccount);
+    expect(mockGetAllHdHwQrWallets).not.toHaveBeenCalled();
   });
 
   it('keeps a restored indexed account when active wallet is temporarily missing', async () => {

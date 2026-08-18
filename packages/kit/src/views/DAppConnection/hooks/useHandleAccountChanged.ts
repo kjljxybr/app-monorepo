@@ -4,8 +4,10 @@ import { useThrottledCallback } from 'use-debounce';
 
 import type { IAccountSelectorActiveAccountInfo } from '@onekeyhq/kit/src/states/jotai/contexts/accountSelector';
 import {
+  defaultSelectedAccount,
+  selectedAccountsAtom,
+  useAccountSelectorContextData,
   useActiveAccount,
-  useSelectedAccount,
 } from '@onekeyhq/kit/src/states/jotai/contexts/accountSelector';
 import type { IAccountSelectorSelectedAccount } from '@onekeyhq/kit-bg/src/dbs/simple/entity/SimpleDbEntityAccountSelector';
 
@@ -26,8 +28,8 @@ export function useHandleDiscoveryAccountChanged({
   num: number;
   handleAccountChanged?: IHandleAccountChanged;
 }) {
+  const { store } = useAccountSelectorContextData();
   const { activeAccount } = useActiveAccount({ num });
-  const { selectedAccount } = useSelectedAccount({ num });
 
   const accountAddress = activeAccount?.account?.address;
 
@@ -38,26 +40,51 @@ export function useHandleDiscoveryAccountChanged({
     activeAccount?.indexedAccount?.id ?? '',
     activeAccount?.dbAccount?.id ?? '',
     activeAccount?.network?.id ?? '',
+    activeAccount?.deriveType ?? '',
   ].join('-');
 
   const activeAccountRef = useRef(activeAccount);
-  const selectedAccountRef = useRef(selectedAccount);
   const accountAddressRef = useRef(accountAddress);
+  const storeRef = useRef(store);
   activeAccountRef.current = activeAccount;
-  selectedAccountRef.current = selectedAccount;
   accountAddressRef.current = accountAddress;
+  storeRef.current = store;
 
   const handleAccountChangedThrottle = useThrottledCallback(
     () => {
+      const currentStore = storeRef.current;
       if (
         handleAccountChanged &&
         activeAccountDepsId &&
-        activeAccountRef.current
+        activeAccountRef.current &&
+        currentStore
       ) {
+        const selectedAccount =
+          currentStore.get(selectedAccountsAtom())[num] ??
+          defaultSelectedAccount();
+        const latestActiveAccount = activeAccountRef.current;
+        let activeIdentityMatchesSelection = false;
+        if (selectedAccount.indexedAccountId) {
+          activeIdentityMatchesSelection =
+            latestActiveAccount.indexedAccount?.id ===
+            selectedAccount.indexedAccountId;
+        } else if (selectedAccount.othersWalletAccountId) {
+          activeIdentityMatchesSelection =
+            latestActiveAccount.account?.id ===
+            selectedAccount.othersWalletAccountId;
+        }
+        if (
+          !activeIdentityMatchesSelection ||
+          latestActiveAccount.wallet?.id !== selectedAccount.walletId ||
+          latestActiveAccount.network?.id !== selectedAccount.networkId ||
+          latestActiveAccount.deriveType !== selectedAccount.deriveType
+        ) {
+          return;
+        }
         handleAccountChanged(
           {
-            activeAccount: activeAccountRef.current,
-            selectedAccount: selectedAccountRef.current,
+            activeAccount: latestActiveAccount,
+            selectedAccount,
           },
           num,
         );

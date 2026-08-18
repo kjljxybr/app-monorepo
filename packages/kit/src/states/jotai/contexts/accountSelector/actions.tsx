@@ -922,7 +922,10 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             });
           }
         };
+        const forceReloadClearedSelection =
+          transitionMeta?.reason === 'removeAccountSelectionClear';
         if (
+          !forceReloadClearedSelection &&
           shouldKeepCurrentActiveAccountForIncompleteSelection({
             storageInitDone: get(accountSelectorStorageInitDoneAtom()),
             selectedAccount,
@@ -2340,18 +2343,23 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           .catch(() => undefined);
 
         if (sceneInfo?.sceneName) {
-          void this.saveToStorage
-            .call(set, {
-              selectedAccount,
-              sceneName: sceneInfo.sceneName,
-              sceneUrl: sceneInfo.sceneUrl,
-              num,
-              trigger: 'confirm-explicit',
-              selectedAccountUpdatedAt: get(accountSelectorUpdateMetaAtom())[
-                num
-              ]?.updatedAt,
-            })
-            .catch(() => undefined);
+          phase = 'storage';
+          await this.saveToStorage.call(set, {
+            selectedAccount,
+            sceneName: sceneInfo.sceneName,
+            sceneUrl: sceneInfo.sceneUrl,
+            num,
+            trigger: 'confirm-explicit',
+            selectedAccountUpdatedAt: get(accountSelectorUpdateMetaAtom())[num]
+              ?.updatedAt,
+          });
+        }
+
+        if (
+          this.confirmAccountSelectLatestRequestIdMap.get(confirmRequestKey) !==
+          confirmRequestId
+        ) {
+          return false;
         }
 
         appEventBus.emit(EAppEventBusNames.ConfirmAccountSelected, {
@@ -3545,7 +3553,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             if (
               eventPayloadUpdatedAt &&
               currentUpdatedAt &&
-              currentUpdatedAt >= eventPayloadUpdatedAt
+              currentUpdatedAt > eventPayloadUpdatedAt
             ) {
               logCrossSceneResult({ outcome: 'stale-before-fix' });
               return { outcome: 'stale-before-fix' };
@@ -4178,6 +4186,11 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
     >
   >();
 
+  saveToStorageCompletedRevisionMap = new WeakMap<
+    IAccountSelectorSelectedAccount,
+    Map<string, { trigger: string }>
+  >();
+
   saveToStorage = contextAtomMethod(
     async (
       get,
@@ -4195,6 +4208,27 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       const inflightScopeKey = `${payload.sceneName}:${
         payload.sceneUrl || ''
       }:${payload.num}:${payload.selectedAccountUpdatedAt ?? 'no-revision'}`;
+      const completedRevision =
+        payload.selectedAccountUpdatedAt === undefined
+          ? undefined
+          : this.saveToStorageCompletedRevisionMap
+              .get(payload.selectedAccount)
+              ?.get(inflightScopeKey);
+      if (completedRevision) {
+        if (perfEnabled) {
+          defaultLogger.accountSelector.perf.trace(
+            'selectionStorageCoalesced',
+            {
+              num: payload.num,
+              originalTrigger: completedRevision.trigger,
+              outcome: 'skip-completed-revision',
+              sceneName: payload.sceneName,
+              trigger: payload.trigger || 'unspecified',
+            },
+          );
+        }
+        return;
+      }
       const existingInflight = this.saveToStorageInflightMap
         .get(payload.selectedAccount)
         ?.get(inflightScopeKey);
@@ -4218,6 +4252,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       const operationId = perfEnabled
         ? getNextAccountSelectorPerfOperationId()
         : undefined;
+      let storageRevisionHandled = false;
       const saveTask = (async () => {
         const { serviceAccountSelector } = backgroundApiProxy;
         const transitionMeta = getSelectedAccountPerfCommitMeta(
@@ -4378,6 +4413,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               // console.log(
               //   'AccountSelector.saveToStorage skip, selectedAccount not changed',
               // );
+              storageRevisionHandled = true;
               logStorageResult({ outcome: 'noop-already-saved' });
               return;
             }
@@ -4484,6 +4520,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 fixedPayload,
               );
             }
+            storageRevisionHandled = true;
             logStorageResult({
               eventEmitted: !eventEmitDisabled,
               eventEmitDisabled,
@@ -4533,6 +4570,24 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       });
       try {
         await saveTask;
+        if (
+          storageRevisionHandled &&
+          payload.selectedAccountUpdatedAt !== undefined
+        ) {
+          let completedByScope = this.saveToStorageCompletedRevisionMap.get(
+            payload.selectedAccount,
+          );
+          if (!completedByScope) {
+            completedByScope = new Map();
+            this.saveToStorageCompletedRevisionMap.set(
+              payload.selectedAccount,
+              completedByScope,
+            );
+          }
+          completedByScope.set(inflightScopeKey, {
+            trigger: payload.trigger || 'unspecified',
+          });
+        }
       } finally {
         if (inflightByScope.get(inflightScopeKey)?.promise === saveTask) {
           inflightByScope.delete(inflightScopeKey);
@@ -5027,8 +5082,52 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         });
       }
 
-      // addressInput scene should keep empty selection, let user select account manually
+      // Non-auto-select scenes should stay empty after their selected account
+      // is removed instead of keeping a dangling account identity.
       if (!accountSelectorUtils.isSceneCanAutoSelect({ sceneName })) {
+        if (triggerBy === EAccountSelectorAutoSelectTriggerBy.removeAccount) {
+          const selectedAccount = this.getSelectedAccount.call(set, { num });
+          let selectedAccountStillExists = true;
+          if (selectedAccount.indexedAccountId) {
+            selectedAccountStillExists = Boolean(
+              await serviceAccount.getIndexedAccountSafe({
+                id: selectedAccount.indexedAccountId,
+              }),
+            );
+          } else if (selectedAccount.othersWalletAccountId) {
+            try {
+              await serviceAccount.getAccount({
+                accountId: selectedAccount.othersWalletAccountId,
+                networkId: selectedAccount.networkId ?? '',
+              });
+            } catch {
+              selectedAccountStillExists = false;
+            }
+          }
+          if (!selectedAccountStillExists) {
+            phase = 'clear-removed-account';
+            const selectionResult = await this.updateSelectedAccount.call(set, {
+              num,
+              parentOperationId: operationId,
+              reason: 'removeAccountSelectionClear',
+              builder: (current) => ({
+                ...current,
+                focusedWallet: undefined,
+                indexedAccountId: undefined,
+                othersWalletAccountId: undefined,
+                walletId: undefined,
+              }),
+            });
+            logAutoSelectResult({
+              outcome:
+                selectionResult.outcome === 'commit'
+                  ? 'cleared-removed-account'
+                  : selectionResult.outcome,
+              transitionId: selectionResult.transitionId,
+            });
+            return selectionResult;
+          }
+        }
         logAutoSelectResult({ outcome: 'skip-scene' });
         return;
       }

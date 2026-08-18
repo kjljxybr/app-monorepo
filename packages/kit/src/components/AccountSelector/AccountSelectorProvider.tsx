@@ -2,6 +2,7 @@ import {
   Profiler,
   type ProfilerOnRenderCallback,
   type ReactNode,
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -11,8 +12,10 @@ import {
 import { isEqual } from 'lodash';
 
 import { EJotaiContextStoreNames } from '@onekeyhq/kit-bg/src/states/jotai/atoms/jotaiContextStoreMap';
+import appGlobals from '@onekeyhq/shared/src/appGlobals';
 import { OneKeyLocalError } from '@onekeyhq/shared/src/errors';
 import { defaultLogger } from '@onekeyhq/shared/src/logger/logger';
+import platformEnv from '@onekeyhq/shared/src/platformEnv';
 
 import {
   AccountSelectorJotaiProvider,
@@ -31,7 +34,10 @@ import {
   isAccountSelectorPerfDebugEnabled,
 } from '../../states/jotai/contexts/accountSelector/perfDebug';
 import { jotaiContextStore } from '../../states/jotai/utils/jotaiContextStore';
-import { JotaiContextStoreMirrorTracker } from '../../states/jotai/utils/JotaiContextStoreMirrorTracker';
+import {
+  type IJotaiContextStoreMirrorPerfContext,
+  JotaiContextStoreMirrorTracker,
+} from '../../states/jotai/utils/JotaiContextStoreMirrorTracker';
 
 import { AccountSelectorStorageReady } from './AccountSelectorStorageReady';
 
@@ -42,6 +48,69 @@ import type {
   IAccountSelectorUpdateMeta,
   ISelectedAccountsAtomMap,
 } from '../../states/jotai/contexts/accountSelector/atoms';
+
+const AccountSelectorMirrorTracker = memo(JotaiContextStoreMirrorTracker);
+
+type IAccountSelectorE2EStateAccessor = {
+  getSnapshot: (params: {
+    num: number;
+    sceneName: IAccountSelectorContextData['sceneName'];
+    sceneUrl?: string;
+  }) =>
+    | {
+        active:
+          | {
+              accountName: string;
+              address: string | undefined;
+              deriveType: string | undefined;
+              indexedAccountId: string | undefined;
+              networkId: string | undefined;
+              ready: boolean;
+              walletId: string | undefined;
+            }
+          | undefined;
+        selected: ISelectedAccountsAtomMap[number] | undefined;
+      }
+    | undefined;
+};
+
+const accountSelectorE2EAppGlobals = appGlobals as typeof appGlobals & {
+  $$accountSelectorE2EStateAccessor?: IAccountSelectorE2EStateAccessor;
+};
+
+if (platformEnv.isE2E) {
+  accountSelectorE2EAppGlobals.$$accountSelectorE2EStateAccessor = {
+    getSnapshot: ({ num, sceneName, sceneUrl }) => {
+      const store = jotaiContextStore.getStore({
+        storeName: EJotaiContextStoreNames.accountSelector,
+        accountSelectorInfo: {
+          enabledNum: [num],
+          sceneName,
+          sceneUrl,
+        },
+      });
+      if (!store) {
+        return undefined;
+      }
+      const selected = store.get(selectedAccountsAtom())[num];
+      const active = store.get(activeAccountsAtom())[num];
+      return {
+        active: active
+          ? {
+              accountName: active.accountName,
+              address: active.account?.address,
+              deriveType: active.deriveType,
+              indexedAccountId: active.indexedAccount?.id,
+              networkId: active.network?.id,
+              ready: active.ready,
+              walletId: active.wallet?.id,
+            }
+          : undefined,
+        selected,
+      };
+    },
+  };
+}
 
 function AccountSelectorAvailableNetworksInit(props: {
   availableNetworksMap?: IAccountSelectorAvailableNetworksMap;
@@ -113,6 +182,19 @@ export function AccountSelectorProviderMirror({
   if (shouldProfile && providerInstanceIdRef.current === undefined) {
     providerInstanceIdRef.current = getNextAccountSelectorPerfOperationId();
   }
+  const mirrorPerfContext = useMemo<
+    IJotaiContextStoreMirrorPerfContext | undefined
+  >(
+    () =>
+      shouldProfile && providerInstanceIdRef.current !== undefined
+        ? {
+            perfDebugName: perfDebugName || 'unlabeled',
+            providerInstanceId: providerInstanceIdRef.current,
+            sceneName: stableConfig.sceneName,
+          }
+        : undefined,
+    [perfDebugName, shouldProfile, stableConfig.sceneName],
+  );
   const providerPerfStateRef = useRef<{
     activeAccounts: Partial<Record<number, IAccountSelectorActiveAccountInfo>>;
     availableNetworks: IAccountSelectorAvailableNetworksMap;
@@ -345,7 +427,10 @@ export function AccountSelectorProviderMirror({
 
   return (
     <>
-      <JotaiContextStoreMirrorTracker {...data} />
+      <AccountSelectorMirrorTracker
+        {...data}
+        accountSelectorPerfContext={mirrorPerfContext}
+      />
       {shouldProfile ? (
         <Profiler
           id={`AccountSelectorProvider:${perfDebugName ?? 'unlabeled'}:${stableConfig.sceneName}:${enabledNumKey}:${providerInstanceIdRef.current ?? 'unknown'}`}

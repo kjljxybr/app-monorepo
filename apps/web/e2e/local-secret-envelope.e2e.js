@@ -226,6 +226,21 @@ function shouldRunHeadless() {
   return parseBooleanEnv(process.env.WEB_E2E_HEADLESS, isCI);
 }
 
+function getSlowMoMs() {
+  const rawValue = process.env.WEB_E2E_SLOW_MO_MS;
+  if (rawValue === undefined) {
+    return 0;
+  }
+
+  const value = Number(rawValue);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(
+      `Invalid WEB_E2E_SLOW_MO_MS value "${rawValue}". Expected a non-negative number.`,
+    );
+  }
+  return value;
+}
+
 async function launchBrowser() {
   const executablePath = getChromeExecutablePath();
   if (!executablePath) {
@@ -234,11 +249,16 @@ async function launchBrowser() {
     );
   }
   const headless = shouldRunHeadless();
-  log(`launch browser in ${headless ? 'headless' : 'headed'} mode`);
+  const slowMo = getSlowMoMs();
+  const slowMoDescription = slowMo > 0 ? ` with ${slowMo}ms slow motion` : '';
+  log(
+    `launch browser in ${headless ? 'headless' : 'headed'} mode${slowMoDescription}`,
+  );
   return chromium.launch({
     args: ['--no-sandbox'],
     executablePath,
     headless,
+    slowMo,
   });
 }
 

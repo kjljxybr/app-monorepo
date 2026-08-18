@@ -25,6 +25,7 @@ import timerUtils from '@onekeyhq/shared/src/utils/timerUtils';
 import backgroundApiProxy from '../../background/instance/backgroundApiProxy';
 
 import { useAccountSelectorCreateAddress } from './hooks/useAccountSelectorCreateAddress';
+import { AccountSelectorTestIDs } from './testIDs';
 
 export function AccountSelectorCreateAddressButton({
   num,
@@ -129,7 +130,7 @@ export function AccountSelectorCreateAddressButton({
     buttonRender ||
     ((props) => (
       <Button
-        testID="account-selector-create-address-btn"
+        testID={AccountSelectorTestIDs.createAddressButton}
         size="small"
         borderWidth={0}
         variant="tertiary"

@@ -35,6 +35,7 @@ import { EReasonForNeedPassword } from '@onekeyhq/shared/types/setting';
 import backgroundApiProxy from '../../../background/instance/backgroundApiProxy';
 import { useAccountSelectorLazyAction } from '../../../states/jotai/contexts/accountSelector/actionsLazy';
 import { TutorialsList } from '../../TutorialsList';
+import { AccountSelectorTestIDs } from '../testIDs';
 
 import { useCreateQrWallet } from './useCreateQrWallet';
 
@@ -305,7 +306,9 @@ export function useAccountSelectorCreateAddress() {
                           children: (
                             <Stack>
                               <Button
-                                testID="account-selector-is-btc-only-wallet-btn"
+                                testID={
+                                  AccountSelectorTestIDs.btcOnlyWalletButton
+                                }
                                 size="small"
                                 mt="$2"
                                 iconAfter="OpenOutline"
@@ -333,7 +336,7 @@ export function useAccountSelectorCreateAddress() {
                       <Button
                         variant="tertiary"
                         onPress={() => showIntercom()}
-                        testID="account-selector-btn"
+                        testID={AccountSelectorTestIDs.genericButton}
                       >
                         {intl.formatMessage({
                           id: ETranslations.global_contact_us,

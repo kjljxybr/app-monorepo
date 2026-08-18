@@ -9,8 +9,10 @@ import {
   encryptImportedCredential,
   encryptRevealableSeed,
   encryptVerifyString,
+  entropyToMnemonic,
   getSecretEncryptV2LocalTargetIterations,
   readSecretEncryptPayloadMetadata,
+  sha256,
 } from '@onekeyhq/core/src/secret';
 import { PBKDF2_LEGACY_NUM_OF_ITERATIONS } from '@onekeyhq/shared/src/appCrypto/consts';
 import {
@@ -64,6 +66,7 @@ import {
 } from '../dbs/local/localSecretEnvelope';
 import { EIndexedDBBucketNames } from '../dbs/local/types';
 import {
+  perpsActiveAccountAtom,
   settingsAtomInitialValue,
   settingsPersistAtom,
 } from '../states/jotai/atoms';
@@ -155,6 +158,14 @@ const LOCAL_SECRET_ENVELOPE_E2E_PASSWORD = 'onekey-lse-e2e-password';
 const LOCAL_SECRET_ENVELOPE_E2E_CREDENTIAL_ID_PREFIX = 'hd-lse-e2e-credential';
 const LOCAL_SECRET_ENVELOPE_E2E_RESTORE_CREDENTIAL_ID_PREFIX =
   'imported-lse-restore-e2e-credential';
+const ACCOUNT_SELECTOR_E2E_WALLET_ENTROPY_LABELS = {
+  alpha: 'onekey-account-selector-e2e-wallet-alpha-v1',
+  beta: 'onekey-account-selector-e2e-wallet-beta-v1',
+} as const;
+const ACCOUNT_SELECTOR_E2E_WALLET_NAMES = new Set(['E2E A', 'E2E B']);
+
+type IAccountSelectorE2EWalletFixtureId =
+  keyof typeof ACCOUNT_SELECTOR_E2E_WALLET_ENTROPY_LABELS;
 
 function assertLocalSecretEnvelopeE2E(
   condition: boolean,
@@ -660,6 +671,33 @@ class ServiceE2E extends ServiceBase {
   }
 
   @backgroundMethodForDev()
+  async getPerpsActiveAccountE2E(params: IBackgroundMethodWithDevOnlyPassword) {
+    checkDevOnlyPassword(params);
+    return perpsActiveAccountAtom.get();
+  }
+
+  @backgroundMethodForDev()
+  async getAccountSelectorE2EEncodedMnemonic({
+    fixtureId,
+    ...params
+  }: IBackgroundMethodWithDevOnlyPassword & {
+    fixtureId: IAccountSelectorE2EWalletFixtureId;
+  }) {
+    checkDevOnlyPassword(params);
+    const label = ACCOUNT_SELECTOR_E2E_WALLET_ENTROPY_LABELS[fixtureId];
+    if (!label) {
+      throw new OneKeyLocalError(
+        `Unknown Account Selector E2E wallet fixture: ${fixtureId}`,
+      );
+    }
+    const entropyHash = await sha256(bufferUtils.toBuffer(label, 'utf8'));
+    const mnemonic = entropyToMnemonic(entropyHash.subarray(0, 16));
+    return this.backgroundApi.servicePassword.encodeSensitiveText({
+      text: mnemonic,
+    });
+  }
+
+  @backgroundMethodForDev()
   async removeAccountSelectorE2EWallet({
     walletId,
     ...params
@@ -668,7 +706,7 @@ class ServiceE2E extends ServiceBase {
     const wallet = await this.backgroundApi.serviceAccount.getWalletSafe({
       walletId,
     });
-    if (!wallet?.name?.startsWith('E2E Wallet ')) {
+    if (!wallet || !ACCOUNT_SELECTOR_E2E_WALLET_NAMES.has(wallet.name)) {
       throw new OneKeyLocalError(
         'removeAccountSelectorE2EWallet only accepts isolated E2E fixtures',
       );

@@ -80,6 +80,7 @@ import { useOnLock } from '../../hooks/useOnLock';
 import { usePromiseResult } from '../../hooks/usePromiseResult';
 import { useReferFriends } from '../../hooks/useReferFriends';
 import { useThemeVariant } from '../../hooks/useThemeVariant';
+import { canAccessBulkSend } from '../../views/BulkSend/access';
 import { useBulkSendModeDialog } from '../../views/BulkSend/hooks/useBulkSendModeDialog';
 import { useNavigateToBulkSend } from '../../views/BulkSend/hooks/useNavigateToBulkSend';
 import { useDeviceManagerNavigation } from '../../views/DeviceManagement/hooks/useDeviceManagerNavigation';
@@ -1107,6 +1108,11 @@ const MoreActionWalletGrid = () => {
 
   const { user, isPrimeActive } = useOneKeyAuth();
   const isPrimeUser = isPrimeActive && user?.onekeyUserId;
+  const hasBulkSendAccess = canAccessBulkSend({
+    isE2E: platformEnv.isE2E === true,
+    isPrimeActive,
+    oneKeyUserId: user?.onekeyUserId,
+  });
   const {
     activeAccount: { account, network, wallet, indexedAccount },
   } = useActiveAccount({ num: 0 });
@@ -1146,7 +1152,7 @@ const MoreActionWalletGrid = () => {
   }, [network?.id, checkIsPrimeUser, navigation, wallet?.id]);
 
   const openBulkSendModule = useCallback(async () => {
-    if (!checkIsPrimeUser(EPrimeFeatures.BulkSend)) {
+    if (!hasBulkSendAccess && !checkIsPrimeUser(EPrimeFeatures.BulkSend)) {
       return;
     }
 
@@ -1167,6 +1173,7 @@ const MoreActionWalletGrid = () => {
     navigateToBulkSend,
     showBulkSendModeDialog,
     checkIsPrimeUser,
+    hasBulkSendAccess,
   ]);
 
   const openAddressRiskCheckModule = useCallback(() => {
@@ -1249,7 +1256,7 @@ const MoreActionWalletGrid = () => {
             }),
             icon: 'ChevronDoubleUpOutline' as const,
             onPress: () => {
-              if (!isPrimeUser) {
+              if (!hasBulkSendAccess) {
                 defaultLogger.prime.subscription.primeEntryClick({
                   featureName: EPrimeFeatures.BulkSend,
                   entryPoint: 'moreActions',
@@ -1259,7 +1266,7 @@ const MoreActionWalletGrid = () => {
               void openBulkSendModule();
             },
             trackID: 'bulk-send-in-more-action',
-            isPrimeFeature: true,
+            isPrimeFeature: !platformEnv.isE2E,
           },
       platformEnv.isWebDappMode
         ? undefined
@@ -1291,6 +1298,7 @@ const MoreActionWalletGrid = () => {
     intl,
     isPrimeActive,
     isPrimeUser,
+    hasBulkSendAccess,
     openBulkCopyAddressesModule,
     openBulkSendModule,
     openAddressRiskCheckModule,

@@ -76,6 +76,36 @@ type IAccountSelectorEffectsPerfObserverProps = {
   updateMeta: IAccountSelectorUpdateMeta | undefined;
 };
 
+function AccountSelectorEffectsPerfCommitObserver({
+  effectInstanceId,
+  num,
+  sceneName,
+}: {
+  effectInstanceId: number;
+  num: number;
+  sceneName: EAccountSelectorSceneName;
+}) {
+  const renderVersionRef = useRef(0);
+  const commitCountRef = useRef(0);
+  const lastCommittedRenderVersionRef = useRef(0);
+  renderVersionRef.current += 1;
+  // oxlint-disable-next-line use-effect-no-deps/use-effect-no-deps
+  useEffect(() => {
+    if (lastCommittedRenderVersionRef.current === renderVersionRef.current) {
+      return;
+    }
+    lastCommittedRenderVersionRef.current = renderVersionRef.current;
+    commitCountRef.current += 1;
+    defaultLogger.accountSelector.perf.trace('effectsHostCommit', {
+      commitCount: commitCountRef.current,
+      effectInstanceId,
+      num,
+      sceneName,
+    });
+  });
+  return null;
+}
+
 const AccountSelectorEffectsPerfObserver = memo(
   function AccountSelectorEffectsPerfObserver({
     effectInstanceId,
@@ -882,7 +912,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
         if (
           eventPayloadUpdatedAt &&
           currentUpdatedAt &&
-          currentUpdatedAt >= eventPayloadUpdatedAt
+          currentUpdatedAt > eventPayloadUpdatedAt
         ) {
           shouldUpdateAtom = false;
         }
@@ -934,16 +964,23 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
   }, [actions, num, sceneName, swapToAnotherAccountSwitchOn]);
 
   return perfDebugEnabled && effectInstanceId !== undefined ? (
-    <AccountSelectorEffectsPerfObserver
-      effectInstanceId={effectInstanceId}
-      isReady={isReady}
-      num={num}
-      sceneName={sceneName}
-      sceneUrl={sceneUrl}
-      selectedAccount={selectedAccount}
-      swapToAnotherAccountSwitchOn={swapToAnotherAccountSwitchOn}
-      updateMeta={updateMeta}
-    />
+    <>
+      <AccountSelectorEffectsPerfCommitObserver
+        effectInstanceId={effectInstanceId}
+        num={num}
+        sceneName={sceneName}
+      />
+      <AccountSelectorEffectsPerfObserver
+        effectInstanceId={effectInstanceId}
+        isReady={isReady}
+        num={num}
+        sceneName={sceneName}
+        sceneUrl={sceneUrl}
+        selectedAccount={selectedAccount}
+        swapToAnotherAccountSwitchOn={swapToAnotherAccountSwitchOn}
+        updateMeta={updateMeta}
+      />
+    </>
   ) : null;
 }
 

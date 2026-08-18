@@ -459,7 +459,7 @@ export function AccountSelectorWalletListSideBar({
               focusedWallet={selectedAccount.focusedWallet}
               onWalletPress={onWalletPress}
               onWalletLongPress={drag}
-              testID={`wallet-${item.id}`}
+              testID={AccountManagerTestIDs.wallet(item.id)}
               badge={item.badge}
               isEditMode={isEditableRouteParams}
               shouldShowCreateHiddenWalletButtonFn={

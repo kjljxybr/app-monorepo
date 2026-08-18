@@ -17,6 +17,7 @@ import { useActiveAccount } from '../../states/jotai/contexts/accountSelector';
 import { NetworkAvatarBase } from '../NetworkAvatar';
 
 import { useUnifiedNetworkSelectorTrigger } from './hooks/useUnifiedNetworkSelectorTrigger';
+import { AccountSelectorTestIDs } from './testIDs';
 
 const MAX_DISPLAY_NETWORKS = 2;
 
@@ -136,7 +137,7 @@ function AllNetworksManagerTrigger({
     // selector and switch to a single chain (or enable a compatible one).
     return (
       <XStack
-        testID="account-all-networks-trigger-button"
+        testID={AccountSelectorTestIDs.allNetworksTrigger}
         borderRadius="$2"
         hoverStyle={{
           bg: '$bgHover',
@@ -167,7 +168,7 @@ function AllNetworksManagerTrigger({
 
   return (
     <XStack
-      testID="account-all-networks-trigger-button"
+      testID={AccountSelectorTestIDs.allNetworksTrigger}
       borderRadius="$2"
       hoverStyle={{
         bg: '$bgHover',

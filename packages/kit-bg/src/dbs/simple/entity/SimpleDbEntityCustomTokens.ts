@@ -383,6 +383,37 @@ export class SimpleDbEntityCustomTokens extends SimpleDbEntityBase<ICustomTokenD
       .filter(Boolean);
   }
 
+  private async getAccountXpubOrAddressIfAvailable({
+    accountId,
+    networkId,
+  }: {
+    accountId: string;
+    networkId: string;
+  }): Promise<string | null | undefined> {
+    const serviceAccount = appGlobals.$backgroundApiProxy.serviceAccount;
+    try {
+      return await serviceAccount.getAccountXpubOrAddress({
+        networkId,
+        accountId,
+      });
+    } catch (error) {
+      const dbAccount = await serviceAccount.getDBAccountSafe({ accountId });
+      const indexedAccount = dbAccount?.indexedAccountId
+        ? await serviceAccount.getIndexedAccountSafe({
+            id: dbAccount.indexedAccountId,
+          })
+        : undefined;
+      if (!dbAccount || (dbAccount.indexedAccountId && !indexedAccount)) {
+        defaultLogger.accountSelector.perf.trace('consumerReadSkipped', {
+          consumer: 'customTokens',
+          reason: dbAccount ? 'indexed-account-removed' : 'account-removed',
+        });
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
   @backgroundMethod()
   async getHiddenTokens({
     accountXpubOrAddress,
@@ -396,32 +427,11 @@ export class SimpleDbEntityCustomTokens extends SimpleDbEntityBase<ICustomTokenD
     accountId: string;
   }): Promise<IAccountTokenWithAccountId[]> {
     if (!accountXpubOrAddress) {
-      try {
-        // eslint-disable-next-line no-param-reassign
-        accountXpubOrAddress =
-          await appGlobals.$backgroundApiProxy.serviceAccount.getAccountXpubOrAddress(
-            {
-              networkId,
-              accountId,
-            },
-          );
-      } catch (error) {
-        const serviceAccount = appGlobals.$backgroundApiProxy.serviceAccount;
-        const dbAccount = await serviceAccount.getDBAccountSafe({ accountId });
-        const indexedAccount = dbAccount?.indexedAccountId
-          ? await serviceAccount.getIndexedAccountSafe({
-              id: dbAccount.indexedAccountId,
-            })
-          : undefined;
-        if (!dbAccount || (dbAccount.indexedAccountId && !indexedAccount)) {
-          defaultLogger.accountSelector.perf.trace('consumerReadSkipped', {
-            consumer: 'customTokens',
-            reason: dbAccount ? 'indexed-account-removed' : 'account-removed',
-          });
-          return [];
-        }
-        throw error;
-      }
+      // eslint-disable-next-line no-param-reassign
+      accountXpubOrAddress = await this.getAccountXpubOrAddressIfAvailable({
+        networkId,
+        accountId,
+      });
     }
     const tokens = await this.getTokensByStatus({
       customTokensRawData,
@@ -449,13 +459,10 @@ export class SimpleDbEntityCustomTokens extends SimpleDbEntityBase<ICustomTokenD
   }): Promise<IAccountTokenWithAccountId[]> {
     if (!accountXpubOrAddress) {
       // eslint-disable-next-line no-param-reassign
-      accountXpubOrAddress =
-        await appGlobals.$backgroundApiProxy.serviceAccount.getAccountXpubOrAddress(
-          {
-            networkId,
-            accountId,
-          },
-        );
+      accountXpubOrAddress = await this.getAccountXpubOrAddressIfAvailable({
+        networkId,
+        accountId,
+      });
     }
     const tokens = await this.getTokensByStatus({
       customTokensRawData,

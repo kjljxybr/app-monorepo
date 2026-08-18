@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo } from 'react';
+import { memo, useEffect, useMemo, useRef } from 'react';
 
 import type {
   IJotaiContextStoreData,
@@ -12,6 +12,7 @@ import {
   useJotaiContextTrackerMap,
 } from '@onekeyhq/kit-bg/src/states/jotai/atoms';
 import { CONTEXT_ATOM_COLD_START_CACHE_KEYS } from '@onekeyhq/shared/src/consts/jotaiConsts';
+import { defaultLogger } from '@onekeyhq/shared/src/logger/logger';
 import platformEnv from '@onekeyhq/shared/src/platformEnv';
 import { useDebugComponentRemountLog } from '@onekeyhq/shared/src/utils/debug/debugUtils';
 import { isSwapColdStartAllNetworkContextNetworkId } from '@onekeyhq/shared/src/utils/swapColdStartCacheSnapshotUtils';
@@ -39,6 +40,16 @@ const COLD_START_SCOPED_KEY_SEPARATOR = '::';
 const ACCOUNT_SELECTOR_HOME_SCOPE_KEY = 'store:accountSelector@home';
 const SWAP_COLD_START_SCOPE_KEY = `store:${EJotaiContextStoreNames.swap}`;
 const accountSelectorEnabledNumCounts = new Map<string, Map<number, number>>();
+
+export type IJotaiContextStoreMirrorPerfContext = {
+  perfDebugName: string;
+  providerInstanceId: number;
+  sceneName: string;
+};
+
+type IJotaiContextStoreMirrorTrackerProps = IJotaiContextStoreData & {
+  accountSelectorPerfContext?: IJotaiContextStoreMirrorPerfContext;
+};
 
 function getColdStartSnapshot() {
   return (globalThis as IGlobalColdStartSnapshot).__ONEKEY_CTX_ATOM_SNAPSHOT__;
@@ -132,14 +143,39 @@ function hasSwapColdStartSnapshot() {
 }
 
 // AccountSelectorMapTracker
-export function JotaiContextStoreMirrorTracker(data: IJotaiContextStoreData) {
+export function JotaiContextStoreMirrorTracker({
+  accountSelectorPerfContext,
+  ...data
+}: IJotaiContextStoreMirrorTrackerProps) {
   const { storeName, accountSelectorInfo } = data;
+  const renderVersionRef = useRef(0);
+  const commitCountRef = useRef(0);
+  const lastCommittedRenderVersionRef = useRef(0);
+  renderVersionRef.current += 1;
   useDebugComponentRemountLog({
     name: `JotaiContextStoreMirrorTracker`,
     payload: data,
   });
   const { setMap } = useJotaiContextTrackerMap();
   const storeId = buildJotaiContextStoreId(data);
+  // oxlint-disable-next-line use-effect-no-deps/use-effect-no-deps
+  useEffect(() => {
+    if (
+      !accountSelectorPerfContext ||
+      lastCommittedRenderVersionRef.current === renderVersionRef.current
+    ) {
+      return;
+    }
+    lastCommittedRenderVersionRef.current = renderVersionRef.current;
+    commitCountRef.current += 1;
+    defaultLogger.accountSelector.perf.trace('mirrorTrackerCommit', {
+      commitCount: commitCountRef.current,
+      perfDebugName: accountSelectorPerfContext.perfDebugName,
+      providerInstanceId: accountSelectorPerfContext.providerInstanceId,
+      sceneName: accountSelectorPerfContext.sceneName,
+      storeId,
+    });
+  });
   useEffect(() => {
     const processMapCount = (action: 'add' | 'remove') => {
       const toMergeMap: IJotaiContextStoreMap = {};
@@ -203,6 +239,16 @@ export function JotaiContextStoreMirrorTracker(data: IJotaiContextStoreData) {
       if (action === 'remove' && value.count <= 0) {
         jotaiContextStore.completeStoreResetIfRequestedById(storeId);
       }
+      if (accountSelectorPerfContext) {
+        defaultLogger.accountSelector.perf.trace('mirrorTrackerRegistration', {
+          action,
+          perfDebugName: accountSelectorPerfContext.perfDebugName,
+          providerInstanceId: accountSelectorPerfContext.providerInstanceId,
+          registrationCount: Math.max(0, value.count),
+          sceneName: accountSelectorPerfContext.sceneName,
+          storeId,
+        });
+      }
     };
 
     processMapCount('add');
@@ -210,7 +256,13 @@ export function JotaiContextStoreMirrorTracker(data: IJotaiContextStoreData) {
     return () => {
       processMapCount('remove');
     };
-  }, [accountSelectorInfo, setMap, storeId, storeName]);
+  }, [
+    accountSelectorInfo,
+    accountSelectorPerfContext,
+    setMap,
+    storeId,
+    storeName,
+  ]);
 
   return null;
 }

@@ -37,6 +37,7 @@ import { showBotWalletDisabledToast } from '../../utils/botWalletDisabledToast';
 import { shouldBlockBotWalletCopyAddress } from '../../utils/botWalletStatusUtils';
 
 import { LazyAccountSelectorCreateAddressButton } from './LazyAccountSelectorCreateAddressButton';
+import { AccountSelectorTestIDs } from './testIDs';
 
 const AllNetworkAccountSelector = ({
   num,
@@ -90,7 +91,7 @@ const AllNetworkAccountSelector = ({
       placement="bottom"
       renderTrigger={
         <XStack
-          testID="account-selector-copy-address-btn"
+          testID={AccountSelectorTestIDs.copyAddressButton}
           gap="$2"
           p="$1"
           m="$-1"
@@ -159,7 +160,7 @@ function CopyButton({
   const intl = useIntl();
   return visible ? (
     <IconButton
-      testID="account-selector-copy-address-btn"
+      testID={AccountSelectorTestIDs.copyAddressButton}
       title={intl.formatMessage({
         id: ETranslations.global_copy_address,
       })}
@@ -383,11 +384,11 @@ export function AccountSelectorActiveAccountHome({
               }}
               hitSlop={NATIVE_HIT_SLOP}
               userSelect="none"
-              testID="account-selector-address"
+              testID={AccountSelectorTestIDs.address}
             >
               {platformEnv.isE2E ? (
                 <SizableText
-                  testID="account-selector-address-text"
+                  testID={AccountSelectorTestIDs.addressText}
                   size="$bodyMd"
                   width={200}
                 >
@@ -395,7 +396,7 @@ export function AccountSelectorActiveAccountHome({
                 </SizableText>
               ) : (
                 <SizableText
-                  testID="account-selector-address-text"
+                  testID={AccountSelectorTestIDs.addressText}
                   size="$bodyMd"
                 >
                   {accountUtils.shortenAddress({ address: account?.address })}
