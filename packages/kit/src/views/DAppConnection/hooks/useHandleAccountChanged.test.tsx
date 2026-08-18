@@ -11,8 +11,17 @@ function createMockAccountSelectorStore(
   };
 }
 
+type IMockActiveAccount = {
+  account?: { address: string; id: string };
+  dbAccount?: { id: string };
+  deriveType?: string;
+  indexedAccount?: { id: string };
+  network?: { id: string };
+  wallet?: { id: string };
+};
+
 let mockContextStore = createMockAccountSelectorStore({});
-let mockActiveAccount = {
+let mockActiveAccount: IMockActiveAccount = {
   account: { address: '0x1', id: 'account-1' },
   dbAccount: undefined,
   deriveType: 'default',
@@ -200,5 +209,92 @@ describe('useHandleDiscoveryAccountChanged', () => {
       expect.objectContaining({ selectedAccount: latestSelectedAccount }),
       0,
     );
+  });
+  it('reports an others account that only resolved to a dbAccount', () => {
+    // An others account incompatible with the current network leaves
+    // activeAccount.account undefined, while othersWalletAccountId was built
+    // from dbAccount.id. The dapp must still be told about the change.
+    const selectedAccount = {
+      deriveType: 'default',
+      networkId: 'evm--1',
+      othersWalletAccountId: 'others-account-1',
+      walletId: 'wallet-others',
+    };
+    mockContextStore = createMockAccountSelectorStore(selectedAccount);
+    mockActiveAccount = {
+      account: undefined,
+      dbAccount: { id: 'others-account-1' },
+      deriveType: 'default',
+      indexedAccount: undefined,
+      network: { id: 'evm--1' },
+      wallet: { id: 'wallet-others' },
+    };
+    const handleAccountChanged = jest.fn();
+
+    renderHook(() =>
+      useHandleDiscoveryAccountChanged({ handleAccountChanged, num: 0 }),
+    );
+
+    expect(handleAccountChanged).toHaveBeenCalledTimes(1);
+    expect(handleAccountChanged).toHaveBeenLastCalledWith(
+      expect.objectContaining({ selectedAccount }),
+      0,
+    );
+  });
+
+  it('reports a wallet that carries no account identity', () => {
+    // Every account of the wallet was deleted; creating the first one is still
+    // offered, so the selection has neither an indexed nor an others account id.
+    const selectedAccount = {
+      deriveType: 'default',
+      networkId: 'evm--1',
+      walletId: 'wallet-1',
+    };
+    mockContextStore = createMockAccountSelectorStore(selectedAccount);
+    mockActiveAccount = {
+      account: undefined,
+      dbAccount: undefined,
+      deriveType: 'default',
+      indexedAccount: undefined,
+      network: { id: 'evm--1' },
+      wallet: { id: 'wallet-1' },
+    };
+    const handleAccountChanged = jest.fn();
+
+    renderHook(() =>
+      useHandleDiscoveryAccountChanged({ handleAccountChanged, num: 0 }),
+    );
+
+    expect(handleAccountChanged).toHaveBeenCalledTimes(1);
+    expect(handleAccountChanged).toHaveBeenLastCalledWith(
+      expect.objectContaining({ selectedAccount }),
+      0,
+    );
+  });
+
+  it('does not report a leftover account while the selection carries none', () => {
+    // The selection lost its account identity but the active account has not
+    // caught up yet: reporting it would hand the dapp the previous account.
+    const selectedAccount = {
+      deriveType: 'default',
+      networkId: 'evm--1',
+      walletId: 'wallet-1',
+    };
+    mockContextStore = createMockAccountSelectorStore(selectedAccount);
+    mockActiveAccount = {
+      account: { address: '0x1', id: 'account-1' },
+      dbAccount: undefined,
+      deriveType: 'default',
+      indexedAccount: { id: 'indexed-account-1' },
+      network: { id: 'evm--1' },
+      wallet: { id: 'wallet-1' },
+    };
+    const handleAccountChanged = jest.fn();
+
+    renderHook(() =>
+      useHandleDiscoveryAccountChanged({ handleAccountChanged, num: 0 }),
+    );
+
+    expect(handleAccountChanged).not.toHaveBeenCalled();
   });
 });

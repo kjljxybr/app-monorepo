@@ -1,6 +1,8 @@
 import { useCallback } from 'react';
 
-import { SizableText, XStack } from '@onekeyhq/components';
+import { useIntl } from 'react-intl';
+
+import { SizableText, Toast, XStack } from '@onekeyhq/components';
 import backgroundApiProxy from '@onekeyhq/kit/src/background/instance/backgroundApiProxy';
 import { AccountAvatar } from '@onekeyhq/kit/src/components/AccountAvatar';
 import { ListItem } from '@onekeyhq/kit/src/components/ListItem';
@@ -11,6 +13,7 @@ import useAppNavigation from '@onekeyhq/kit/src/hooks/useAppNavigation';
 import { usePromiseResult } from '@onekeyhq/kit/src/hooks/usePromiseResult';
 import { useAccountSelectorActions } from '@onekeyhq/kit/src/states/jotai/contexts/accountSelector/actions';
 import { useUniversalSearchActions } from '@onekeyhq/kit/src/states/jotai/contexts/universalSearch';
+import { ETranslations } from '@onekeyhq/shared/src/locale';
 import { defaultLogger } from '@onekeyhq/shared/src/logger/logger';
 import platformEnv from '@onekeyhq/shared/src/platformEnv';
 import accountUtils from '@onekeyhq/shared/src/utils/accountUtils';
@@ -37,6 +40,7 @@ export function UniversalSearchAddressItem({
   getSearchInput,
   source,
 }: IUniversalSearchAddressItemProps) {
+  const intl = useIntl();
   const navigation = useAppNavigation();
   const accountSelectorActions = useAccountSelectorActions();
   const universalSearchActions = useUniversalSearchActions();
@@ -87,23 +91,38 @@ export function UniversalSearchAddressItem({
     });
 
     navigation.pop();
-    if (
-      accountUtils.isOthersAccount({
-        accountId: item.payload.account?.id,
-      })
-    ) {
-      await accountSelectorActions.current.confirmAccountSelect({
-        num: 0,
-        indexedAccount: undefined,
-        othersWalletAccount: item.payload.account,
-        forceSelectToNetworkId: item.payload.network?.id,
-      });
-    } else {
-      await accountSelectorActions.current.confirmAccountSelect({
-        num: 0,
-        indexedAccount: item.payload.indexedAccount,
-        othersWalletAccount: undefined,
-        forceSelectToNetworkId: item.payload.network?.id,
+    try {
+      if (
+        accountUtils.isOthersAccount({
+          accountId: item.payload.account?.id,
+        })
+      ) {
+        await accountSelectorActions.current.confirmAccountSelect({
+          num: 0,
+          indexedAccount: undefined,
+          othersWalletAccount: item.payload.account,
+          forceSelectToNetworkId: item.payload.network?.id,
+        });
+      } else {
+        await accountSelectorActions.current.confirmAccountSelect({
+          num: 0,
+          indexedAccount: item.payload.indexedAccount,
+          othersWalletAccount: undefined,
+          forceSelectToNetworkId: item.payload.network?.id,
+        });
+      }
+    } catch {
+      // confirmAccountSelect rejects when persisting the selection fails. The
+      // search modal is already popped, so the user lands on the previous
+      // account with no hint that the switch failed. Surface it, then fall
+      // through: the click still happened and still belongs in recent searches.
+      Toast.error({
+        title: intl.formatMessage({
+          id: ETranslations.global_an_error_occurred,
+        }),
+        message: intl.formatMessage({
+          id: ETranslations.global_an_error_occurred_desc,
+        }),
       });
     }
 
@@ -148,6 +167,7 @@ export function UniversalSearchAddressItem({
   }, [
     accountSelectorActions,
     getSearchInput,
+    intl,
     item.payload,
     item.type,
     navigation,

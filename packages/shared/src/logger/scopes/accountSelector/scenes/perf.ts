@@ -42,6 +42,7 @@ export type TAccountSelectorPerfEventName =
   | 'consumerReadSkipped'
   | 'dappConnectionAccountObserved'
   | 'effectsHostCommit'
+  | 'repeatedStaleDropsDetected'
   | 'effectsStateObserved'
   | 'externalActivationRequested'
   | 'externalActivationResult'

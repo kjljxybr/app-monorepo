@@ -98,11 +98,21 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
           return;
         }
         if (globalSyncResult.globalDeriveType) {
-          logResult(
-            `global-${globalSyncResult.selectionResult?.outcome || 'resolved'}`,
-            globalSyncResult.selectionResult?.transitionId,
-          );
-          return;
+          const globalOutcome = globalSyncResult.selectionResult?.outcome;
+          const currentDeriveType = actions.current.getSelectedAccount({
+            num,
+          }).deriveType;
+          if (globalOutcome !== 'stale' || currentDeriveType) {
+            logResult(
+              `global-${globalOutcome || 'resolved'}`,
+              globalSyncResult.selectionResult?.transitionId,
+            );
+            return;
+          }
+          // The global sync lost a race and the selection that won still has no
+          // derive type, so keep going and let the fallback below resolve one
+          // against the current selection. A selection that already carries a
+          // newer derive type is left alone by the check above.
         }
         if (deriveInfo) {
           logResult('skip-existing-derive');
@@ -154,7 +164,10 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
           await actions.current.updateSelectedAccountDeriveType({
             num,
             deriveType: newDeriveType,
-            expectedSelection,
+            // Scoped to the network only: this effect does not re-run when the
+            // account changes, so a full-selection guard would drop the fallback
+            // for good and leave the account without a derive type.
+            expectedNetworkId: networkId,
             parentOperationId: operationId,
             reason: 'autoDeriveFallback',
           });

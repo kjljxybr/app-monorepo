@@ -92,6 +92,7 @@ import {
   accountSelectorEditModeAtom,
   accountSelectorStorageInitDoneAtom,
   accountSelectorStorageReadyAtom,
+  accountSelectorStoreScopeIdAtom,
   accountSelectorSyncLoadingAtom,
   accountSelectorUpdateMetaAtom,
   activeAccountsAtom,
@@ -110,6 +111,7 @@ import {
   recordActiveAccountPerfStateUpdate,
   recordSelectedAccountPerfStateUpdate,
 } from './perfDebug';
+import { takeStaleDropLogSlot } from './staleDropLog';
 
 import type {
   IAccountSelectorActiveAccountInfo,
@@ -125,6 +127,40 @@ const RECENT_ACCOUNT_SWITCH_COLD_START_MS = 5 * 60 * 1000;
 // Version 1 can contain a Swap num 1 fallback that was selected from an
 // incomplete map. Do not restore that recipient state after this fix lands.
 const ACCOUNT_SELECTOR_RECENT_SELECTION_CACHE_VERSION = 2;
+
+// Concurrent updates make a single stale drop expected. Three in a row without a
+// commit means the caller keeps losing its update, so fail loudly off production.
+const CONSECUTIVE_STALE_DROP_ALERT_THRESHOLD = 3;
+
+// Upper bound for the run counter below. Entries are keyed per scene, and the
+// discover scene keys on the dapp origin, so the key space grows with the number
+// of dapps visited while nothing removes an entry whose run never ended.
+const CONSECUTIVE_STALE_DROP_COUNT_MAP_LIMIT = 1000;
+
+// Storage outcomes that abort after a write already landed. The newer save takes
+// over the record, but the change event for this one is never emitted, so dapp
+// and swap consumers can miss the switch entirely. Outcomes that abort before any
+// write are omitted on purpose: the newer save replays them.
+const STORAGE_SIDE_EFFECT_STALE_OUTCOMES = new Set([
+  'stale-after-global-derive',
+  'stale-after-write',
+  'stale-before-event',
+]);
+
+// Declares whether a raw selection write also advances updateMeta.updatedAt.
+// 'bumped'    — the caller advances the revision alongside the write, so the
+//               staleness guards downstream can see that the selection moved.
+// 'untracked' — an initialization-style write that deliberately leaves the
+//               revision alone. Never use it for a user-visible selection
+//               change: guards compare the revision, and a change they cannot
+//               see is a change a concurrent writer will silently discard.
+type ISelectionWriteRevisionPolicy = 'bumped' | 'untracked';
+
+// Which guard rejected the update. Recorded instead of the raw revision
+// timestamps: the values differ on every drop, which would defeat the log
+// transport's identical-message collapsing, and the useful signal is only
+// whether the revision moved or the selection itself changed.
+type ISelectionStaleGuard = 'revision' | 'selection';
 
 type ISelectionUpdateOutcome = 'commit' | 'noop' | 'skip-empty' | 'stale';
 
@@ -375,13 +411,18 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         } as any,
       }),
       'refresh',
+      'untracked',
     );
   });
 
-  setSelectedAccountsAtom(
+  // Private on purpose: selection writes should go through updateSelectedAccount,
+  // which owns the mutex, the revision bump and the outcome reporting. The few
+  // remaining direct callers must declare their revision policy explicitly.
+  private setSelectedAccountsAtom(
     set: IJotaiSetter,
     fn: (currentValue: ISelectedAccountsAtomMap) => ISelectedAccountsAtomMap,
-    reason?: string,
+    reason: string,
+    revisionPolicy: ISelectionWriteRevisionPolicy,
     parentOperationId?: number,
   ) {
     set(selectedAccountsAtom(), (currentValue) => {
@@ -406,6 +447,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               parentOperationId,
               previous,
               reason: reason || 'unknown',
+              revisionPolicy,
             });
           } else if (isForcedRefresh && previous !== current) {
             const transitionMeta = recordSelectedAccountPerfStateUpdate({
@@ -414,6 +456,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               parentOperationId,
               previous,
               reason,
+              revisionPolicy,
             });
             defaultLogger.accountSelector.perf.trace('selectionRefresh', {
               num,
@@ -1599,6 +1642,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         updateMeta?: IAccountSelectorUpdateMeta;
         num: number;
         deriveType: IAccountDeriveTypes;
+        expectedNetworkId?: string;
         expectedSelection?: IAccountSelectorSelectedAccount;
         parentOperationId?: number;
         reason?: string;
@@ -1607,6 +1651,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       const {
         num,
         deriveType,
+        expectedNetworkId,
         expectedSelection,
         parentOperationId,
         reason,
@@ -1618,10 +1663,19 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         num,
         parentOperationId,
         reason: reason || 'updateSelectedAccountDeriveType',
-        builder: (v) => ({
-          ...v,
-          deriveType: deriveType || 'default',
-        }),
+        // A resolved derive type belongs to the network it was resolved for, so
+        // callers that resolve asynchronously scope staleness to networkId here.
+        // Comparing the whole selection instead would let an unrelated account
+        // switch discard the result, leaving deriveType unset with no retry.
+        builder: (v) => {
+          if (expectedNetworkId && v.networkId !== expectedNetworkId) {
+            return v;
+          }
+          return {
+            ...v,
+            deriveType: deriveType || 'default',
+          };
+        },
       });
     },
   );
@@ -1684,6 +1738,12 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
 
   mutexUpdateSelectedAccount = new Semaphore(1);
 
+  // Counts *consecutive* stale drops per (scene, num). A single drop is normal
+  // under concurrency; an unbroken run of them means updates are being discarded
+  // for good, which is otherwise silent. Any non-stale outcome ends the run, and
+  // the map is bounded by CONSECUTIVE_STALE_DROP_COUNT_MAP_LIMIT.
+  consecutiveStaleDropCountMap = new Map<string, number>();
+
   updateSelectedAccount = contextAtomMethod(
     async (
       get,
@@ -1696,6 +1756,12 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         parentOperationId?: number;
         reason?: string;
         shouldCommit?: () => boolean;
+        /**
+         * Invoked exactly once per call, inside the update mutex. Callers are
+         * allowed to capture values computed here (see `syncFromScene`), so a
+         * second invocation would leave those captures describing a selection
+         * that was never committed. Recompute the whole update instead.
+         */
         builder: (
           oldAccount: IAccountSelectorSelectedAccount,
         ) => IAccountSelectorSelectedAccount;
@@ -1739,9 +1805,11 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           const logSelectionUpdateResult = ({
             outcome,
             selectedAccount,
+            staleGuard,
           }: {
             outcome: ISelectionUpdateOutcome;
             selectedAccount: IAccountSelectorSelectedAccount;
+            staleGuard?: ISelectionStaleGuard;
           }): ISelectionUpdateResult => {
             const transitionMeta =
               getSelectedAccountPerfCommitMeta(selectedAccount);
@@ -1770,6 +1838,86 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 },
               );
             }
+            const staleCountKey = `${sceneInfo?.sceneName ?? ''}__${
+              sceneInfo?.sceneUrl ?? ''
+            }__${num}`;
+            // Reset on the negated condition rather than on an allow-list of
+            // outcomes: 'stale' is the only outcome that discards the update, so
+            // every other one (including any added later) ends the run. Listing
+            // the resetting outcomes instead would let a new outcome fall through
+            // both branches and turn the counter into "stale drops since the last
+            // commit", which trips the alert on unrelated drops spread over time.
+            if (outcome !== 'stale') {
+              this.consecutiveStaleDropCountMap.delete(staleCountKey);
+            } else {
+              const suppressedSinceLastLog = takeStaleDropLogSlot(
+                `selection__${staleCountKey}`,
+              );
+              if (suppressedSinceLastLog !== undefined) {
+                defaultLogger.accountSelector.staleDrop.selectionUpdateDropped({
+                  current: oldSelectedAccount,
+                  expected: expectedSelection,
+                  num,
+                  reason: requestReason,
+                  sceneName: sceneInfo?.sceneName,
+                  staleGuard,
+                  suppressedSinceLastLog,
+                });
+              }
+              const consecutiveCount =
+                (this.consecutiveStaleDropCountMap.get(staleCountKey) || 0) + 1;
+              // Wiping the whole map is deliberate, and an LRU would be the wrong
+              // shape here: this is not a cache, and no entry is worth more than
+              // any other. The count feeds the diagnostic below and nothing else -
+              // never a selection, a persistence decision or a stale verdict - so
+              // dropping it can only delay an alert until the run rebuilds, never
+              // fabricate one. Clearing before the write keeps the run that is
+              // currently being counted.
+              if (
+                this.consecutiveStaleDropCountMap.size >=
+                CONSECUTIVE_STALE_DROP_COUNT_MAP_LIMIT
+              ) {
+                this.consecutiveStaleDropCountMap.clear();
+              }
+              this.consecutiveStaleDropCountMap.set(
+                staleCountKey,
+                consecutiveCount,
+              );
+              if (consecutiveCount >= CONSECUTIVE_STALE_DROP_ALERT_THRESHOLD) {
+                defaultLogger.accountSelector.staleDrop.repeatedStaleDropsDetected(
+                  {
+                    consecutiveCount,
+                    num,
+                    reason: requestReason,
+                    sceneName: sceneInfo?.sceneName,
+                  },
+                );
+                if (perfEnabled) {
+                  defaultLogger.accountSelector.perf.trace(
+                    'repeatedStaleDropsDetected',
+                    {
+                      consecutiveCount,
+                      num,
+                      reason: requestReason,
+                      sceneName: sceneInfo?.sceneName,
+                    },
+                  );
+                }
+                // Throwing is the fastest signal while developing, but this runs
+                // inside the update mutex and nothing on the path catches
+                // (useAutoSelectAccount, ConnectWalletModal), so under E2E it
+                // became an unhandled rejection that failed the page-error check
+                // with no indication of the real problem. E2E asserts the trace
+                // event above instead, which fails just as hard and says why.
+                if (platformEnv.isDev && !platformEnv.isE2E) {
+                  const message = `AccountSelector: ${consecutiveCount} consecutive stale selection drops without a commit (scene=${
+                    sceneInfo?.sceneName ?? 'unknown'
+                  }, num=${num}, reason=${requestReason})`;
+                  console.error(message);
+                  throw new OneKeyLocalError(message);
+                }
+              }
+            }
             return {
               outcome,
               transitionId:
@@ -1794,6 +1942,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             return logSelectionUpdateResult({
               outcome: 'stale',
               selectedAccount: oldSelectedAccount,
+              staleGuard: 'revision',
             });
           }
           if (
@@ -1803,9 +1952,12 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             return logSelectionUpdateResult({
               outcome: 'stale',
               selectedAccount: oldSelectedAccount,
+              staleGuard: 'selection',
             });
           }
 
+          // Single, mutex-protected invocation of `builder` - see the contract
+          // on the payload type. Do not turn this into a retry loop.
           const newSelectedAccount: IAccountSelectorSelectedAccount = cloneDeep(
             builder(oldSelectedAccount),
           );
@@ -1971,6 +2123,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               [num]: newSelectedAccount,
             }),
             reason || 'updateSelectedAccount',
+            'bumped',
             payload.parentOperationId,
           );
           set(accountSelectorUpdateMetaAtom(), (v) => ({
@@ -2039,6 +2192,8 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
   // scenes cannot cancel each other.
   confirmAccountSelectLatestRequestIdMap = new Map<string, number>();
 
+  storeScopeIdSequence = 0;
+
   confirmAccountSelectRequestSequence = 0;
 
   confirmAccountSelect = contextAtomMethod(
@@ -2082,10 +2237,25 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       }
 
       const requestContextData = get(accountSelectorContextDataAtom());
-      const confirmRequestKey = `${requestContextData?.sceneName ?? ''}__${
-        requestContextData?.sceneUrl ?? ''
-      }__${num}`;
       const confirmRequestId = (this.confirmAccountSelectRequestSequence += 1);
+      // The bucket is resolved once per store and then reused for the store's
+      // whole lifetime. Scene identity only exists after AccountSelectorEffects
+      // mounts, so re-deriving the key on every call would put requests sent
+      // before the mount in a different bucket from the ones sent after: the
+      // newer request could no longer supersede the older one and both would
+      // commit. Keying on the empty scene name instead is not an option either -
+      // that collapses every not-yet-mounted store into one shared bucket where
+      // unrelated selectors cancel each other.
+      let confirmRequestScopeKey = get(accountSelectorStoreScopeIdAtom());
+      if (!confirmRequestScopeKey) {
+        confirmRequestScopeKey = requestContextData?.sceneName
+          ? `${requestContextData.sceneName}__${
+              requestContextData.sceneUrl ?? ''
+            }`
+          : `unscoped-${(this.storeScopeIdSequence += 1)}`;
+        set(accountSelectorStoreScopeIdAtom(), confirmRequestScopeKey);
+      }
+      const confirmRequestKey = `${confirmRequestScopeKey}__${num}`;
       this.confirmAccountSelectLatestRequestIdMap.set(
         confirmRequestKey,
         confirmRequestId,
@@ -2335,6 +2505,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           return false;
         }
 
+        // Fire-and-forget is fine here: the in-memory snapshot write lands
+        // synchronously before the first await, and the cold-start snapshot is
+        // only a best-effort fast path (simpleDb stays the source of truth).
         void this.flushCurrentAccountSelectorColdStartSnapshot
           .call(set, {
             sceneName: sceneInfo?.sceneName,
@@ -2343,6 +2516,20 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           .catch(() => undefined);
 
         if (sceneInfo?.sceneName) {
+          // Awaited on purpose (upstream used fire-and-forget). Three reasons:
+          // 1. A rejected persist must reject confirmAccountSelect so the caller
+          //    never reaches resetAccountManagerStacksModal() and the selector
+          //    stays open instead of closing over a lost selection.
+          // 2. saveToStorage is a UI-runtime sequence spanning several
+          //    background round-trips (primary write, global derive type, home
+          //    sync). On the extension popup the whole UI runtime dies on
+          //    dismissal - no beforeunload, no coldStartFlushTrigger - so a
+          //    non-awaited sequence can be truncated between round-trips and
+          //    persist only part of itself. Awaiting keeps the modal open, and
+          //    thus the popup alive, until the sequence finishes.
+          // 3. It keeps the order persist -> emit ConfirmAccountSelected ->
+          //    close modal. The AddressInput selector listener bails out once
+          //    the selector is closed, so emitting after the close would be lost.
           phase = 'storage';
           await this.saveToStorage.call(set, {
             selectedAccount,
@@ -4028,6 +4215,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             set,
             () => mergedRecentSelectionCacheSelectedAccountsMap,
             'initFromRecentSelectionCache',
+            'bumped',
             operationId,
           );
           set(accountSelectorUpdateMetaAtom(), (v) => ({
@@ -4104,6 +4292,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               set,
               () => mergedSelectedAccountsMap,
               'initFromStorageFillEmptyNumsFromDB',
+              'untracked',
               operationId,
             );
           }
@@ -4130,6 +4319,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               return r;
             },
             'initFromStorage',
+            'untracked',
             operationId,
           );
           storageApplied = true;
@@ -4189,6 +4379,17 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
   saveToStorageCompletedRevisionMap = new WeakMap<
     IAccountSelectorSelectedAccount,
     Map<string, { trigger: string }>
+  >();
+
+  // A selection can reach the disk and then lose its side effects (global derive
+  // type, home sync, change event) to a stale guard. Without this record the next
+  // save of the same selection short circuits on noop-already-saved and the change
+  // event is never emitted at all, leaving dapp and swap consumers on the old
+  // account. Keyed by scene scope, holding the selection whose side effects still
+  // need to be replayed.
+  saveToStoragePendingSideEffectMap = new Map<
+    string,
+    IAccountSelectorSelectedAccount
   >();
 
   saveToStorage = contextAtomMethod(
@@ -4279,6 +4480,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             const startedAt = getAccountSelectorPerfTimestamp();
             const { sceneName, sceneUrl, num } = payload;
             let { selectedAccount } = payload;
+            const sideEffectScopeKey = `storage__${sceneName ?? ''}__${
+              sceneUrl ?? ''
+            }__${num}`;
             const logStorageResult = ({
               eventEmitted = false,
               eventEmitDisabled,
@@ -4290,6 +4494,27 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               outcome: string;
               syncedHome?: boolean;
             }) => {
+              if (STORAGE_SIDE_EFFECT_STALE_OUTCOMES.has(outcome)) {
+                this.saveToStoragePendingSideEffectMap.set(
+                  sideEffectScopeKey,
+                  selectedAccount,
+                );
+                const suppressedSinceLastLog =
+                  takeStaleDropLogSlot(sideEffectScopeKey);
+                if (suppressedSinceLastLog !== undefined) {
+                  defaultLogger.accountSelector.staleDrop.storageSideEffectDropped(
+                    {
+                      num,
+                      outcome,
+                      primaryPersisted,
+                      reason: transitionMeta?.reason,
+                      sceneName,
+                      suppressedSinceLastLog,
+                      syncedHome,
+                    },
+                  );
+                }
+              }
               if (!perfEnabled) {
                 return;
               }
@@ -4409,7 +4634,14 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 sceneUrl,
                 num,
               });
-            if (isEqual(currentSaved, selectedAccount)) {
+            const primaryAlreadySaved = isEqual(currentSaved, selectedAccount);
+            const pendingSideEffectSelection =
+              this.saveToStoragePendingSideEffectMap.get(sideEffectScopeKey);
+            const shouldReplaySideEffects = isEqual(
+              pendingSideEffectSelection,
+              selectedAccount,
+            );
+            if (primaryAlreadySaved && !shouldReplaySideEffects) {
               // console.log(
               //   'AccountSelector.saveToStorage skip, selectedAccount not changed',
               // );
@@ -4425,9 +4657,13 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             // **** saveSelectedAccount
             // skip discover account selector persist here
             storagePhase = 'write-primary';
-            const primarySaveResult =
-              await simpleDb.accountSelector.saveSelectedAccount(fixedPayload);
-            primaryPersisted = Boolean(primarySaveResult?.persisted);
+            if (!primaryAlreadySaved) {
+              const primarySaveResult =
+                await simpleDb.accountSelector.saveSelectedAccount(
+                  fixedPayload,
+                );
+              primaryPersisted = Boolean(primarySaveResult?.persisted);
+            }
             if (!isPayloadStillCurrent()) {
               logStorageResult({ outcome: 'stale-after-write' });
               return;
@@ -4520,13 +4756,18 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 fixedPayload,
               );
             }
+            this.saveToStoragePendingSideEffectMap.delete(sideEffectScopeKey);
             storageRevisionHandled = true;
+            let successOutcome = 'processed-nonpersistent';
+            if (primaryPersisted) {
+              successOutcome = 'persisted';
+            } else if (shouldReplaySideEffects) {
+              successOutcome = 'replayed-side-effects';
+            }
             logStorageResult({
               eventEmitted: !eventEmitDisabled,
               eventEmitDisabled,
-              outcome: primaryPersisted
-                ? 'persisted'
-                : 'processed-nonpersistent',
+              outcome: successOutcome,
               syncedHome,
             });
           })
@@ -4719,14 +4960,18 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       const operationId = perfEnabled
         ? getNextAccountSelectorPerfOperationId()
         : undefined;
-      const expectedSelection = this.getSelectedAccount.call(set, { num });
-      const expectedUpdatedAt = get(accountSelectorUpdateMetaAtom())[num]
-        ?.updatedAt;
       let phase = 'wait-auto-select';
-      let deriveResolution: ISceneSyncPreparationResult['deriveResolution'] =
-        'none';
-      let networkResolution: ISceneSyncPreparationResult['networkResolution'] =
-        'none';
+      // Filled in by the `builder` below, which updateSelectedAccount runs
+      // exactly once inside its mutex. That contract is what makes this capture
+      // safe: the values always describe the selection the builder produced for
+      // the update reported alongside them.
+      const sceneSyncResolution: {
+        deriveResolution: ISceneSyncPreparationResult['deriveResolution'];
+        networkResolution: ISceneSyncPreparationResult['networkResolution'];
+      } = {
+        deriveResolution: 'none',
+        networkResolution: 'none',
+      };
       let resolvedTargetSceneName = targetSceneName;
       const availableNetworksResolution = availableNetworks?.networkIds?.length
         ? 'provided'
@@ -4766,39 +5011,37 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           await backgroundApiProxy.simpleDb.accountSelector.getRawData()
         )?.globalDeriveTypesMap?.[EGlobalDeriveTypesScopes.global];
 
-        let preparedSelectedAccount:
-          | IAccountSelectorSelectedAccount
-          | undefined;
-        if (sourceSelectedAccount) {
-          const prepared = prepareSceneSyncSelectedAccount({
-            availableNetworks,
-            currentSelectedAccount: expectedSelection,
-            globalDeriveTypesMap,
-            sourceSelectedAccount,
-            targetSceneName: resolvedTargetSceneName,
-            withNetworkSync: Boolean(withNetworkSync),
-          });
-          preparedSelectedAccount = prepared.selectedAccount;
-          deriveResolution = prepared.deriveResolution;
-          networkResolution = prepared.networkResolution;
-        }
-
         phase = 'selection-update';
         const selectionResult = await this.updateSelectedAccount.call(set, {
-          expectedSelection,
-          expectedUpdatedAt: expectedUpdatedAt ?? null,
           num,
           parentOperationId: operationId,
           reason: 'syncFromScene',
+          // Resolved inside the mutex against the latest selection. Computing it
+          // before the awaits above would need a staleness guard, and that guard
+          // discards the whole sync whenever the target scene's own auto-select
+          // commits first — this call has no retry, so the update would be lost.
           builder: (v) => {
-            return preparedSelectedAccount || v;
+            if (!sourceSelectedAccount) {
+              return v;
+            }
+            const prepared = prepareSceneSyncSelectedAccount({
+              availableNetworks,
+              currentSelectedAccount: v,
+              globalDeriveTypesMap,
+              sourceSelectedAccount,
+              targetSceneName: resolvedTargetSceneName,
+              withNetworkSync: Boolean(withNetworkSync),
+            });
+            sceneSyncResolution.deriveResolution = prepared.deriveResolution;
+            sceneSyncResolution.networkResolution = prepared.networkResolution;
+            return prepared.selectedAccount;
           },
         });
         if (perfEnabled) {
           defaultLogger.accountSelector.perf.trace('manualSceneSyncResult', {
             num,
-            deriveResolution,
-            networkResolution,
+            deriveResolution: sceneSyncResolution.deriveResolution,
+            networkResolution: sceneSyncResolution.networkResolution,
             availableNetworkCount: availableNetworks?.networkIds?.length || 0,
             availableNetworksResolution,
             operationId,
@@ -4819,8 +5062,8 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           defaultLogger.accountSelector.perf.trace('manualSceneSyncResult', {
             failedPhase: phase,
             num,
-            deriveResolution,
-            networkResolution,
+            deriveResolution: sceneSyncResolution.deriveResolution,
+            networkResolution: sceneSyncResolution.networkResolution,
             availableNetworksResolution,
             operationId,
             outcome: 'error',

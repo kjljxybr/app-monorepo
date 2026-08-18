@@ -1,10 +1,13 @@
 import { useCallback, useMemo } from 'react';
 
+import { useIntl } from 'react-intl';
+
 import type { IButtonProps } from '@onekeyhq/components';
 import {
   IconButton,
   SizableText,
   Stack,
+  Toast,
   XStack,
   resetAccountManagerStacksModal,
 } from '@onekeyhq/components';
@@ -29,6 +32,7 @@ import {
   useIndexedAccountAddressCreationStateAtom,
 } from '@onekeyhq/kit-bg/src/states/jotai/atoms';
 import type { INetworkDeriveInfo } from '@onekeyhq/kit-bg/src/vaults/types';
+import { ETranslations } from '@onekeyhq/shared/src/locale';
 import platformEnv from '@onekeyhq/shared/src/platformEnv';
 import accountUtils from '@onekeyhq/shared/src/utils/accountUtils';
 import networkUtils from '@onekeyhq/shared/src/utils/networkUtils';
@@ -96,6 +100,7 @@ export function AccountSelectorAccountListItem({
   enabledNetworksCompatibleWithWalletId: IServerNetwork[];
   networkInfoMap: Record<string, INetworkDeriveInfo>;
 }) {
+  const intl = useIntl();
   const actions = useAccountSelectorActions();
   const {
     activeAccount: { network },
@@ -412,38 +417,56 @@ export function AccountSelectorAccountListItem({
             if (!allowSelectEmptyAccount && shouldShowCreateAddressButton) {
               return;
             }
-            if (isOthersUniversal) {
-              let autoChangeToAccountMatchedNetworkId = avatarNetworkId;
-              if (
-                selectedAccount?.networkId &&
-                networkUtils.isAllNetwork({
-                  networkId: selectedAccount?.networkId,
-                })
-              ) {
-                autoChangeToAccountMatchedNetworkId =
-                  selectedAccount?.networkId;
+            try {
+              if (isOthersUniversal) {
+                let autoChangeToAccountMatchedNetworkId = avatarNetworkId;
+                if (
+                  selectedAccount?.networkId &&
+                  networkUtils.isAllNetwork({
+                    networkId: selectedAccount?.networkId,
+                  })
+                ) {
+                  autoChangeToAccountMatchedNetworkId =
+                    selectedAccount?.networkId;
+                }
+                const confirmed = await actions.current.confirmAccountSelect({
+                  num,
+                  indexedAccount: undefined,
+                  othersWalletAccount: account,
+                  autoChangeToAccountMatchedNetworkId,
+                  reason: 'userSelectAccount',
+                });
+                if (!confirmed) {
+                  return;
+                }
+              } else if (focusedWalletInfo) {
+                const confirmed = await actions.current.confirmAccountSelect({
+                  num,
+                  indexedAccount,
+                  othersWalletAccount: undefined,
+                  autoChangeToAccountMatchedNetworkId: undefined,
+                  reason: 'userSelectAccount',
+                });
+                if (!confirmed) {
+                  return;
+                }
               }
-              const confirmed = await actions.current.confirmAccountSelect({
-                num,
-                indexedAccount: undefined,
-                othersWalletAccount: account,
-                autoChangeToAccountMatchedNetworkId,
-                reason: 'userSelectAccount',
+            } catch {
+              // confirmAccountSelect rejects when persisting the selection
+              // fails. Keep the selector open - the selection is not saved
+              // yet, and on the extension popup a selection that never
+              // reached storage is lost once the popup is dismissed - and
+              // surface the failure instead of leaving an unhandled
+              // rejection behind a stuck modal.
+              Toast.error({
+                title: intl.formatMessage({
+                  id: ETranslations.global_an_error_occurred,
+                }),
+                message: intl.formatMessage({
+                  id: ETranslations.global_an_error_occurred_desc,
+                }),
               });
-              if (!confirmed) {
-                return;
-              }
-            } else if (focusedWalletInfo) {
-              const confirmed = await actions.current.confirmAccountSelect({
-                num,
-                indexedAccount,
-                othersWalletAccount: undefined,
-                autoChangeToAccountMatchedNetworkId: undefined,
-                reason: 'userSelectAccount',
-              });
-              if (!confirmed) {
-                return;
-              }
+              return;
             }
             resetAccountManagerStacksModal();
           },

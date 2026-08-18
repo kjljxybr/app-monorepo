@@ -219,10 +219,18 @@ export function JotaiContextStoreMirrorTracker({
             enabledNumCounts?.set(num, nextCount);
           }
         });
-        value.accountSelectorInfo = {
-          ...value.accountSelectorInfo,
-          enabledNum: [...enabledNumCounts.keys()].toSorted((a, b) => a - b),
-        };
+        // The counts only cover mounts of this runtime, while the map they are
+        // written into is shared across runtimes. On single UI runtime targets
+        // that is the whole picture, so a shrink is accurate. An extension can
+        // run several UI runtimes (popup, side panel, expand tab) at once, and
+        // shrinking there would tear down effects another runtime still needs,
+        // so keep the union semantics on removal like the shared map expects.
+        if (action === 'add' || !platformEnv.isExtension) {
+          value.accountSelectorInfo = {
+            ...value.accountSelectorInfo,
+            enabledNum: [...enabledNumCounts.keys()].toSorted((a, b) => a - b),
+          };
+        }
       }
       if (value.count <= 0) {
         delete mapCache[key];

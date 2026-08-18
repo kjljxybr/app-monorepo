@@ -5,6 +5,7 @@ import { AccountSelectorAutoSelectScene } from './scenes/autoSelect';
 import { AccountSelectorListDataScene } from './scenes/listData';
 import { AccountSelectorPerfScene } from './scenes/perf';
 import { AccountSelectorRenderScene } from './scenes/render';
+import { AccountSelectorStaleDropScene } from './scenes/staleDrop';
 import { AccountSelectorStorageScene } from './scenes/storage';
 
 export class AccountSelectorScope extends BaseScope {
@@ -19,4 +20,6 @@ export class AccountSelectorScope extends BaseScope {
   autoSelect = this.createScene('autoSelect', AccountSelectorAutoSelectScene);
 
   listData = this.createScene('listData', AccountSelectorListDataScene);
+
+  staleDrop = this.createScene('staleDrop', AccountSelectorStaleDropScene);
 }

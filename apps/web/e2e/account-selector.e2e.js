@@ -196,6 +196,99 @@ const dappConnectionProviderCommitLimit = readPositiveNumberEnv(
   22,
 );
 
+// The Perps scenario drives real Hyperliquid endpoints, which rate-limit (429)
+// after repeated local runs and then fail the cycle on the uncaught-error check.
+// This scenario asserts account-selector synchronization, not market data, so the
+// responses are stubbed by default. Set to 0 to exercise the live API.
+const stubHyperliquidApi = readBooleanEnv(
+  'ACCOUNT_SELECTOR_E2E_STUB_HYPERLIQUID',
+  true,
+);
+
+const seenHyperliquidActions = new Set();
+
+function buildHyperliquidStubResponse(action) {
+  switch (action) {
+    case 'meta':
+      return { universe: [] };
+    case 'spotMeta':
+      return { tokens: [], universe: [] };
+    case 'metaAndAssetCtxs':
+      return [{ universe: [] }, []];
+    case 'spotMetaAndAssetCtxs':
+      return [{ tokens: [], universe: [] }, []];
+    case 'clearinghouseState':
+      return {
+        assetPositions: [],
+        crossMaintenanceMarginUsed: '0',
+        crossMarginSummary: {
+          accountValue: '0',
+          totalMarginUsed: '0',
+          totalNtlPos: '0',
+          totalRawUsd: '0',
+        },
+        marginSummary: {
+          accountValue: '0',
+          totalMarginUsed: '0',
+          totalNtlPos: '0',
+          totalRawUsd: '0',
+        },
+        time: 0,
+        withdrawable: '0',
+      };
+    case 'spotClearinghouseState':
+      return { balances: [] };
+    case 'allMids':
+      return {};
+    case 'userFees':
+      return {
+        activeReferralDiscount: '0',
+        activeStakingDiscount: { bpsOfMaxSupply: '0', discount: '0' },
+        dailyUserVlm: [],
+        feeSchedule: {
+          add: '0',
+          cross: '0',
+          referralDiscount: '0',
+          spotAdd: '0',
+          spotCross: '0',
+          tiers: { mm: [], vip: [] },
+        },
+        userAddRate: '0',
+        userCrossRate: '0',
+        userSpotAddRate: '0',
+        userSpotCrossRate: '0',
+      };
+    default:
+      // Every remaining info action this app calls returns a list.
+      return [];
+  }
+}
+
+async function routeHyperliquidStub(context) {
+  await context.route(/https:\/\/[^/]*hyperliquid\.xyz\//, async (route) => {
+    let action;
+    try {
+      action = JSON.parse(route.request().postData() || '{}').type;
+    } catch {
+      action = undefined;
+    }
+    seenHyperliquidActions.add(action || route.request().url());
+    await route.fulfill({
+      body: JSON.stringify(buildHyperliquidStubResponse(action)),
+      contentType: 'application/json',
+      status: 200,
+    });
+  });
+}
+
+function readBooleanEnv(name, fallbackValue) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') {
+    return fallbackValue;
+  }
+  return ['1', 'true', 'yes'].includes(raw.toLowerCase());
+}
+
 function readPositiveNumberEnv(name, fallbackValue) {
   const rawValue = process.env[name];
   if (rawValue === undefined) return fallbackValue;
@@ -2130,6 +2223,27 @@ function assertDAppAccountSelectorMirrorLifecycle(trace) {
   );
 }
 
+// Every count in assertSelectionOperationBudget is derived from transitionId /
+// scheduleId attribution, which is recorded against the selection object's
+// identity. When a count is off, the useful question is always which concrete
+// events were matched — so each assertion carries them in its message.
+function describeBudgetEvents(events) {
+  return JSON.stringify(
+    events.map((event) => ({
+      activeScheduleId: event.activeScheduleId,
+      changedChannels: event.changedChannels,
+      coalescedCount: event.coalescedCount,
+      coalescedTriggers: event.coalescedTriggers,
+      effectInstanceId: event.effectInstanceId,
+      outcome: event.outcome,
+      reason: event.reason,
+      scheduleId: event.scheduleId,
+      transitionId: event.transitionId,
+      trigger: event.trigger,
+    })),
+  );
+}
+
 function assertSelectionOperationBudget(
   trace,
   {
@@ -2155,7 +2269,7 @@ function assertSelectionOperationBudget(
     assert.equal(
       rawSelectionUpdates.length,
       0,
-      `${label} must not commit a no-op selection update`,
+      `${label} must not commit a no-op selection update: ${describeBudgetEvents(rawSelectionUpdates)}`,
     );
   }
   const storageRequests = trace.events.filter(
@@ -2179,7 +2293,7 @@ function assertSelectionOperationBudget(
   assert.equal(
     selectionUpdates.length,
     expectedSelectionUpdates,
-    `${label} must commit ${expectedSelectionUpdates} effective selection update(s)`,
+    `${label} must commit ${expectedSelectionUpdates} effective selection update(s): ${describeBudgetEvents(selectionUpdates)}`,
   );
   const activeSchedules = trace.events.filter(
     (event) =>
@@ -2191,7 +2305,9 @@ function assertSelectionOperationBudget(
   assert.equal(
     activeSchedules.length,
     expectedActiveReloads,
-    `${label} must schedule ${expectedActiveReloads} active reload(s)`,
+    `${label} must schedule ${expectedActiveReloads} active reload(s): ${describeBudgetEvents(
+      activeSchedules,
+    )}`,
   );
   const completedReloads = trace.events.filter(
     (event) =>
@@ -2222,7 +2338,7 @@ function assertSelectionOperationBudget(
   assert.equal(
     selectedObservations.length,
     expectedSelectionUpdates,
-    `${label} must expose each selection update to Effects once`,
+    `${label} must expose each selection update to Effects once: ${describeBudgetEvents(selectedObservations)}`,
   );
   const activeObservations = trace.events.filter(
     (event) =>
@@ -2235,12 +2351,12 @@ function assertSelectionOperationBudget(
   assert.equal(
     activeObservations.length,
     committedScheduleIds.size,
-    `${label} must expose each committed active account result to Effects once`,
+    `${label} must expose each committed active account result to Effects once: ${describeBudgetEvents(activeObservations)}`,
   );
   assert.equal(
     storageRequests.length,
     expectedSelectionUpdates,
-    `${label} must persist each selection update once`,
+    `${label} must persist each selection update once: ${describeBudgetEvents(storageRequests)}`,
   );
   const storageOperationIds = new Set(
     storageRequests.map((event) => event.operationId),
@@ -2500,6 +2616,27 @@ async function openAndApproveSimulatedDAppConnection(
       accountObservations.length <= 2,
       `DApp connection modal observed ${accountObservations.length} account states (limit 2)`,
     );
+    const sceneSyncResults = initializationTrace.events.filter(
+      (event) =>
+        event.event === 'manualSceneSyncResult' &&
+        event.num === 0 &&
+        event.sourceSceneName === 'home',
+    );
+    assert.ok(
+      sceneSyncResults.length >= 1,
+      'DApp connection initialization must run a scene sync from home',
+    );
+    for (const syncResult of sceneSyncResults) {
+      // A dropped sync leaves the modal on its own previously persisted account
+      // while Home shows another one, and the sync has no retry. Asserted
+      // directly so a regression names the cause instead of only showing an
+      // unexpected selection-update count below.
+      assert.notEqual(
+        syncResult.outcome,
+        'stale',
+        'DApp connection scene sync must not be dropped as stale',
+      );
+    }
     const initializationSelectionUpdates = initializationTrace.events.filter(
       (event) =>
         event.event === 'selectionStateUpdated' &&
@@ -3891,6 +4028,9 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     0,
     `cycle#${cycle}: a new E2E context must start without tabs`,
   );
+  if (stubHyperliquidApi) {
+    await routeHyperliquidStub(context);
+  }
   await context.addInitScript(
     ({ key }) => {
       globalThis.localStorage.setItem(key, 'wallet');
@@ -3973,7 +4113,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     );
 
     log(`cycle#${cycle}: verify Perps account synchronization`);
-    const perpsScenarioTrace = await runPerpsAccountSyncScenario(
+    const perpsTrace = await runPerpsAccountSyncScenario(
       page,
       devOnlyPassword,
       fixture,
@@ -3995,7 +4135,6 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       page,
       findFixtureTarget(fixture, postPerpsSelection),
     );
-    const perpsTrace = perpsScenarioTrace;
     log(`cycle#${cycle}: verify Swap multi-num and custom-network refresh`);
     const multiNumResult = await runMultiNumAndCustomNetworkScenario(
       page,
@@ -4128,6 +4267,20 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     ];
     assertTraceRequestResultPairs(allEvents);
     assertStaleReloadPostProcessPairs(allEvents);
+    // A run of stale drops with no commit in between means a caller kept losing
+    // its update. The app reports it instead of throwing, so assert it here.
+    assert.deepEqual(
+      allEvents
+        .filter((event) => event.event === 'repeatedStaleDropsDetected')
+        .map((event) => ({
+          consecutiveCount: event.consecutiveCount,
+          num: event.num,
+          reason: event.reason,
+          sceneName: event.sceneName,
+        })),
+      [],
+      'Selection updates must not be dropped as stale repeatedly without a commit',
+    );
     const summary = buildTraceSummary(allEvents);
     const performanceBudgets = evaluatePerformanceBudgets(summary);
     assert.deepEqual(
@@ -4193,6 +4346,13 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       cdpExceptions,
       [],
       'CDP Runtime emitted uncaught exceptions',
+    );
+    log(
+      `cycle#${cycle}: stubbed Hyperliquid actions: ${
+        seenHyperliquidActions.size
+          ? [...seenHyperliquidActions].toSorted().join(', ')
+          : 'none'
+      }`,
     );
     log(
       `cycle#${cycle}: passed (${summary.totalEvents} trace events, ` +

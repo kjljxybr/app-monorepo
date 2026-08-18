@@ -1,6 +1,5 @@
-import { LogToLocalDevOnly } from '../../../base/decorators';
-
-import { AccountSelectorDevOnlyScene } from './devOnlyScene';
+import { BaseScene } from '../../../base/baseScene';
+import { LogToLocal } from '../../../base/decorators';
 
 type ISelectedAccountLike = {
   deriveType?: string;
@@ -43,8 +42,12 @@ function buildSelectionMapSummary(
   };
 }
 
-export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
-  @LogToLocalDevOnly()
+// Deliberately NOT dev-only. The account list is built in the background and the
+// bugs that matter (empty list, wrong derive type, dropped wallet) only surface on
+// real user data, so these entries are the only trace production has to work from.
+// Payloads stay identifier-free: counts and shape flags, never account ids.
+export class AccountSelectorListDataScene extends BaseScene {
+  @LogToLocal()
   public listDataMissingParams(params: {
     focusedWallet: string | undefined;
     deriveType: string | undefined;
@@ -57,7 +60,7 @@ export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
     };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public buildAccountsListData(params: {
     focusedWallet: string | undefined;
     othersNetworkId: string | undefined;
@@ -76,12 +79,12 @@ export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
     };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public focusedWalletMissing(params: { focusedWallet: string | undefined }) {
     return { hasFocusedWallet: Boolean(params.focusedWallet) };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public getIndexedAccountsOfWallet(params: {
     accountsLength: number;
     walletId: string;
@@ -92,7 +95,7 @@ export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
     };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public buildAccountsData(params: {
     accountsLength: number;
     walletId: string;
@@ -105,7 +108,7 @@ export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
     };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public dbGetWalletSafe(params: {
     isDbWalletFromParams: boolean;
     walletId: string;
@@ -118,7 +121,7 @@ export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
     };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public dbGetAllIndexedAccounts(params: {
     indexedAccountsLength: number;
     isFromCache: boolean;
@@ -126,7 +129,7 @@ export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
     return params;
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public dbFilterAllIndexedAccounts(params: {
     indexedAccountsLength: number;
     walletIdFilter: string;
@@ -139,7 +142,7 @@ export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
     };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public dbGetIndexedAccountsOfWallet(params: {
     allIndexedAccountsFromParamsLength: number | undefined;
     isDbWalletFromParams: boolean;
@@ -155,28 +158,28 @@ export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
     };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public simpleDbSelectedAccountsMap(params: {
     selectedAccountsMap: ISelectedAccountsMapLike | undefined;
   }) {
     return buildSelectionMapSummary(params.selectedAccountsMap);
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public simpleDbDappConnectionSelectedAccountsMap(params: {
     connectionMap: Partial<Record<number, unknown>> | undefined;
   }) {
     return { connectionCount: Object.keys(params.connectionMap || {}).length };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public initFromStorageDiscoverySelectedAccountsMapMerged(params: {
     selectedAccountsMap: ISelectedAccountsMapLike | undefined;
   }) {
     return buildSelectionMapSummary(params.selectedAccountsMap);
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public fixDeriveTypesForInitAccountSelectorMap(params: {
     selectedAccount: ISelectedAccountLike;
     globalDeriveType: string | undefined;
@@ -189,14 +192,14 @@ export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
     };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public fixDeriveTypesForInitAccountSelectorMapResult(params: {
     selectedAccountsMap: ISelectedAccountsMapLike | undefined;
   }) {
     return buildSelectionMapSummary(params.selectedAccountsMap);
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public fixOthersWalletAccountNetworkPair(params: {
     source: string | undefined;
     walletId: string | undefined;
@@ -217,7 +220,7 @@ export class AccountSelectorListDataScene extends AccountSelectorDevOnlyScene {
     };
   }
 
-  @LogToLocalDevOnly()
+  @LogToLocal()
   public initFromStorageSelectedAccountsMapResult(params: {
     selectedAccountsMap: ISelectedAccountsMapLike | undefined;
   }) {

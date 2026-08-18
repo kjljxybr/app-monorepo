@@ -40,6 +40,7 @@ import {
   getNextAccountSelectorPerfOperationId,
   getSelectedAccountPerfCommitMeta,
   isAccountSelectorPerfDebugEnabled,
+  takeSelectedAccountReloadAttribution,
 } from '../../states/jotai/contexts/accountSelector/perfDebug';
 
 import { useAutoSelectAccount } from './hooks/useAutoSelectAccount';
@@ -594,9 +595,15 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
     (trigger: string) => {
       const perfEnabled = isAccountSelectorPerfDebugEnabled();
       const selectedAccountForReload = selectedAccountRef.current;
+      // Claimed, not just read: an effect re-run over the same selection object
+      // would otherwise re-attribute this schedule to a transition that was
+      // already accounted for.
       const transitionMeta =
         perfEnabled && trigger === 'selection-change'
-          ? getSelectedAccountPerfCommitMeta(selectedAccountForReload)
+          ? takeSelectedAccountReloadAttribution({
+              num,
+              selectedAccount: selectedAccountForReload,
+            })
           : undefined;
       const scheduleId = perfEnabled
         ? getNextAccountSelectorPerfOperationId()

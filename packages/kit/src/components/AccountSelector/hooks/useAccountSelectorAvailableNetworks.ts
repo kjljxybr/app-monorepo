@@ -20,7 +20,13 @@ import {
 
 import type { IAccountSelectorAvailableNetworks } from '../../../states/jotai/contexts/accountSelector';
 
+// Align with the bg-side memoizee maxAge of serviceNetwork.getAllNetworks, so a
+// runtime without a mounted AccountSelector (which is where the custom network
+// event listener lives) still recovers from a stale list on its own.
+const ALL_NETWORK_IDS_CACHE_MAX_AGE = 5 * 60 * 1000;
+
 let allNetworkIdsCache: string[] | undefined;
+let allNetworkIdsCacheLoadedAt = 0;
 let allNetworkIdsRequest:
   | Promise<{ changed: boolean; networkIds: string[] }>
   | undefined;
@@ -28,6 +34,13 @@ let allNetworkIdsRequestTargetForceEpoch = 0;
 let allNetworkIdsForceEpoch = 0;
 let allNetworkIdsLoadedForceEpoch = 0;
 let isForceEpochQueued = false;
+
+function isAllNetworkIdsCacheFresh() {
+  return (
+    Boolean(allNetworkIdsCache) &&
+    Date.now() - allNetworkIdsCacheLoadedAt < ALL_NETWORK_IDS_CACHE_MAX_AGE
+  );
+}
 
 function areNetworkIdsEqual(previous: string[] | undefined, next: string[]) {
   return (
@@ -66,6 +79,7 @@ function startAllNetworkIdsRequest({
       if (requestChanged || !allNetworkIdsCache) {
         allNetworkIdsCache = networkIds;
       }
+      allNetworkIdsCacheLoadedAt = Date.now();
       allNetworkIdsLoadedForceEpoch = Math.max(
         allNetworkIdsLoadedForceEpoch,
         targetForceEpoch,
@@ -96,6 +110,7 @@ async function loadAllNetworkIds({
   if (
     !force &&
     allNetworkIdsCache &&
+    isAllNetworkIdsCacheFresh() &&
     !allNetworkIdsRequest &&
     allNetworkIdsLoadedForceEpoch >= requestedForceEpoch
   ) {
@@ -113,6 +128,7 @@ async function loadAllNetworkIds({
   for (;;) {
     const needsLoad =
       !allNetworkIdsCache ||
+      !isAllNetworkIdsCacheFresh() ||
       allNetworkIdsLoadedForceEpoch < requestedForceEpoch;
     if (!needsLoad) {
       break;

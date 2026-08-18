@@ -428,10 +428,11 @@ export class SimpleDbEntityCustomTokens extends SimpleDbEntityBase<ICustomTokenD
   }): Promise<IAccountTokenWithAccountId[]> {
     if (!accountXpubOrAddress) {
       // eslint-disable-next-line no-param-reassign
-      accountXpubOrAddress = await this.getAccountXpubOrAddressIfAvailable({
-        networkId,
-        accountId,
-      });
+      accountXpubOrAddress =
+        (await this.getAccountXpubOrAddressIfAvailable({
+          networkId,
+          accountId,
+        })) ?? null;
     }
     const tokens = await this.getTokensByStatus({
       customTokensRawData,
@@ -459,10 +460,11 @@ export class SimpleDbEntityCustomTokens extends SimpleDbEntityBase<ICustomTokenD
   }): Promise<IAccountTokenWithAccountId[]> {
     if (!accountXpubOrAddress) {
       // eslint-disable-next-line no-param-reassign
-      accountXpubOrAddress = await this.getAccountXpubOrAddressIfAvailable({
-        networkId,
-        accountId,
-      });
+      accountXpubOrAddress =
+        (await this.getAccountXpubOrAddressIfAvailable({
+          networkId,
+          accountId,
+        })) ?? null;
     }
     const tokens = await this.getTokensByStatus({
       customTokensRawData,

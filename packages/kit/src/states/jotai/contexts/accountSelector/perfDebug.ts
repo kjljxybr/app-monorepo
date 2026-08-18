@@ -5,6 +5,20 @@ import platformEnv from '@onekeyhq/shared/src/platformEnv';
 
 import type { IAccountSelectorActiveAccountInfo } from './atoms';
 
+// Diagnostics only — never branch on these entries.
+//
+// Both maps are keyed by object identity, so a lookup only succeeds for the exact
+// object this module recorded. Any selection or active account that came back
+// through backgroundApiProxy — storage init, a cross-runtime read — is a freshly
+// deserialized object and has no entry, even though it is value-equal. That holds
+// on every target, not just the split-runtime ones (iOS/Android/extension), since
+// desktop and web reach the same data through the same proxy.
+//
+// Writes are additionally gated on isAccountSelectorPerfDebugEnabled(), so in
+// production these maps stay empty and every lookup returns undefined. Callers
+// therefore must treat a miss as normal and use the result for labelling only:
+// making control flow depend on it would fail exactly where it is hardest to
+// reproduce — after a cold start, and worst on split-runtime targets.
 const selectedAccountCommitMeta = new WeakMap<
   IAccountSelectorSelectedAccount,
   IAccountSelectorPerfCommitMeta
@@ -33,6 +47,9 @@ export type IAccountSelectorPerfCommitMeta = {
   num: number;
   parentOperationId?: number;
   reason: string;
+  // Set once this commit has been used to attribute an active-account reload.
+  // See takeSelectedAccountReloadAttribution.
+  reloadAttributionConsumed?: boolean;
 };
 
 export type IAccountSelectorActiveAccountPerfCommitMeta = {
@@ -151,12 +168,16 @@ export function recordSelectedAccountPerfStateUpdate({
   parentOperationId,
   previous,
   reason,
+  revisionPolicy,
 }: {
   current: IAccountSelectorSelectedAccount | undefined;
   num: number;
   parentOperationId?: number;
   previous: IAccountSelectorSelectedAccount | undefined;
   reason: string;
+  // Surfaced in the trace so a selection change that never advanced the revision
+  // is visible when diagnosing an update that was dropped as stale.
+  revisionPolicy?: string;
 }) {
   if (!isAccountSelectorPerfDebugEnabled()) {
     return undefined;
@@ -175,11 +196,40 @@ export function recordSelectedAccountPerfStateUpdate({
   }
   defaultLogger.accountSelector.perf.trace('selectionStateUpdated', {
     ...meta,
+    revisionPolicy,
     selection: buildSelectedAccountPerfSummary(current),
   });
   return meta;
 }
 
+// Claims this commit as the cause of one active-account reload.
+//
+// A reload is scheduled from an effect that can re-run while the selection object
+// stays the same — a no-op re-selection, a host remount. Reading the commit meta
+// directly would then attribute those extra schedules to the previous real
+// selection, making a reload look like it belonged to a transition that had
+// already been accounted for. Claiming it once, and only for the matching num,
+// leaves later schedules unattributed, which is the honest answer.
+export function takeSelectedAccountReloadAttribution({
+  num,
+  selectedAccount,
+}: {
+  num: number;
+  selectedAccount: IAccountSelectorSelectedAccount | undefined;
+}) {
+  const meta = selectedAccount
+    ? selectedAccountCommitMeta.get(selectedAccount)
+    : undefined;
+  if (!meta || meta.num !== num || meta.reloadAttributionConsumed) {
+    return undefined;
+  }
+  meta.reloadAttributionConsumed = true;
+  return meta;
+}
+
+// Returns undefined whenever perf debugging is off, or when the selection did not
+// originate from this runtime's own commit. Both are expected — see the note on
+// selectedAccountCommitMeta. Use for labelling, not for decisions.
 export function getSelectedAccountPerfCommitMeta(
   selectedAccount: IAccountSelectorSelectedAccount | undefined,
 ) {

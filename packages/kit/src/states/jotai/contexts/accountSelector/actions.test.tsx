@@ -12,6 +12,11 @@ import type {
 import type { IAccountDeriveTypes } from '@onekeyhq/kit-bg/src/vaults/types';
 import { getNetworkIdsMap } from '@onekeyhq/shared/src/config/networkIds';
 import { WALLET_TYPE_IMPORTED } from '@onekeyhq/shared/src/consts/dbConsts';
+import {
+  EAppEventBusNames,
+  appEventBus,
+} from '@onekeyhq/shared/src/eventBus/appEventBus';
+import platformEnv from '@onekeyhq/shared/src/platformEnv';
 import { EAppSyncStorageKeys } from '@onekeyhq/shared/src/storage/syncStorageKeys';
 import timerUtils from '@onekeyhq/shared/src/utils/timerUtils';
 import type { IServerNetwork } from '@onekeyhq/shared/types';
@@ -282,6 +287,7 @@ jest.mock('@onekeyhq/shared/src/platformEnv', () => ({
   __esModule: true,
   default: {
     isDesktop: true,
+    isDev: false,
     isExtensionBackgroundServiceWorker: false,
     isJest: true,
     isNative: false,
@@ -584,6 +590,91 @@ describe('useAccountSelectorActions', () => {
     expect(store.get(selectedAccountsAtom())[0]).toBe(previous);
   });
 
+  it('only alerts on stale drops that are truly consecutive', async () => {
+    // The alert throws off production (E2E included), so counting drops that are
+    // merely frequent rather than consecutive would abort unrelated callers.
+    jest.replaceProperty(platformEnv, 'isDev', true);
+    // Silences the alert's own console.error; the throw is what is asserted.
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const { store, Wrapper } = createWrapper();
+    store.set(accountSelectorContextDataAtom(), {
+      sceneName: EAccountSelectorSceneName.home,
+      sceneUrl: 'https://consecutive-stale-drop.test',
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const dropUpdate = () =>
+      result.current.updateSelectedAccount({
+        num: 0,
+        reason: 'consecutive-stale-drop-test',
+        shouldCommit: () => false,
+        builder: (current) => ({ ...current, networkId: 'evm--1' }),
+      });
+    const noopUpdate = () =>
+      result.current.updateSelectedAccount({
+        num: 0,
+        reason: 'consecutive-stale-drop-test',
+        builder: (current) => ({ ...current }),
+      });
+
+    // A noop interrupts the run, so the two drops after it are only a run of 2.
+    await act(async () => {
+      expect((await dropUpdate()).outcome).toBe('stale');
+      expect((await noopUpdate()).outcome).toBe('noop');
+      expect((await dropUpdate()).outcome).toBe('stale');
+      expect((await dropUpdate()).outcome).toBe('stale');
+    });
+
+    // The alert is still armed: one more drop closes an unbroken run of 3.
+    await act(async () => {
+      await expect(dropUpdate()).rejects.toThrow(
+        /3 consecutive stale selection drops/,
+      );
+    });
+  });
+
+  it('bounds the stale drop counter map rather than growing it per scene url', async () => {
+    // The discover scene keys on the dapp origin and an entry whose run never
+    // ends is never removed, so the map is capped instead of left unbounded.
+    const { store, Wrapper } = createWrapper();
+    store.set(accountSelectorContextDataAtom(), {
+      sceneName: EAccountSelectorSceneName.discover,
+      sceneUrl: 'https://bounded-stale-drop.test',
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    // The map lives on the actions singleton, not on the hook's method facade.
+    const counts = getAccountSelectorActions().consecutiveStaleDropCountMap;
+    counts.clear();
+    try {
+      for (let i = 0; i < 1000; i += 1) {
+        counts.set(`discover__https://dapp-${i}.test__0`, 1);
+      }
+      expect(counts.size).toBe(1000);
+
+      await act(async () => {
+        const dropped = await result.current.updateSelectedAccount({
+          num: 0,
+          reason: 'bounded-stale-drop-test',
+          shouldCommit: () => false,
+          builder: (current) => ({ ...current, networkId: 'evm--1' }),
+        });
+        expect(dropped.outcome).toBe('stale');
+      });
+
+      // Cleared wholesale, then the run counted by this very drop is written
+      // back - reaching the cap must not lose the run currently being tracked.
+      expect(counts.size).toBe(1);
+      expect([...counts.values()]).toEqual([1]);
+    } finally {
+      // The actions instance is a module-level singleton shared across tests.
+      counts.clear();
+    }
+  });
+
   it('syncs account, available network, and derive type in one atom update', async () => {
     const sceneUrl = 'https://example.test';
     const sourceSelectedAccount: ISelectedAccount = {
@@ -682,6 +773,181 @@ describe('useAccountSelectorActions', () => {
       ...sourceSelectedAccount,
       networkId: 'btc--0',
       deriveType: 'BIP86',
+    });
+  });
+
+  it('invokes the selection builder exactly once per update', async () => {
+    const { store, Wrapper } = createWrapper();
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const builder = jest.fn((current: ISelectedAccount) => ({
+      ...current,
+      networkId: 'evm--1',
+    }));
+
+    await act(async () => {
+      await result.current.updateSelectedAccount({
+        num: 0,
+        reason: 'builder-invocation-count-test',
+        builder,
+      });
+    });
+
+    // syncFromScene resolves the scene sync inside its builder and reports the
+    // derive/network resolution through closure variables. A second invocation
+    // would overwrite those with a resolution that was never committed, so the
+    // single-call contract is load-bearing rather than incidental.
+    expect(builder).toHaveBeenCalledTimes(1);
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      networkId: 'evm--1',
+    });
+  });
+
+  it('applies a scene sync that raced with a concurrent selection commit', async () => {
+    const sourceSelectedAccount: ISelectedAccount = {
+      ...defaultSelectedAccount(),
+      walletId: 'hd-1',
+      indexedAccountId: 'hd-1--0',
+      networkId: 'evm--1',
+      deriveType: 'default',
+      focusedWallet: 'hd-1',
+    };
+    const sourceDeferred = createDeferred<ISelectedAccount | undefined>();
+    mockGetSelectedAccount.mockReturnValueOnce(sourceDeferred.promise);
+
+    const { store, Wrapper } = createWrapper();
+    store.set(accountSelectorContextDataAtom(), {
+      sceneName: EAccountSelectorSceneName.home,
+    });
+    store.set(selectedAccountsAtom(), {
+      0: {
+        ...defaultSelectedAccount(),
+        networkId: 'btc--0',
+        deriveType: 'BIP86',
+      },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    await act(async () => {
+      const syncPromise = result.current.syncFromScene({
+        from: {
+          sceneName: EAccountSelectorSceneName.swap,
+          sceneNum: 0,
+        },
+        num: 0,
+      });
+      await waitFor(() => {
+        expect(mockGetSelectedAccount).toHaveBeenCalled();
+      });
+      // A commit lands while the sync is still waiting on storage reads.
+      await result.current.updateSelectedAccount({
+        num: 0,
+        reason: 'concurrent-commit-test',
+        builder: (v) => ({
+          ...v,
+          networkId: 'evm--137',
+          deriveType: 'default',
+        }),
+      });
+      sourceDeferred.resolve(sourceSelectedAccount);
+      await syncPromise;
+    });
+
+    // The sync must still apply, and must resolve against the committed value:
+    // resolving against a snapshot taken before the awaits would have written
+    // btc--0 back over the concurrent commit, or dropped the sync entirely.
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      walletId: 'hd-1',
+      indexedAccountId: 'hd-1--0',
+      networkId: 'evm--137',
+      deriveType: 'default',
+    });
+  });
+
+  it('applies a derive type resolved for the still-current network after an account switch', async () => {
+    const { store, Wrapper } = createWrapper();
+    // Resolution starts for this account on btc--0.
+    store.set(selectedAccountsAtom(), {
+      0: {
+        ...defaultSelectedAccount(),
+        walletId: 'hd-1',
+        indexedAccountId: 'hd-1--0',
+        networkId: 'btc--0',
+      },
+    });
+    const resolvedForNetworkId = 'btc--0';
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    // The user switches account while the derive type is still being resolved.
+    store.set(selectedAccountsAtom(), {
+      0: {
+        ...defaultSelectedAccount(),
+        walletId: 'hd-1',
+        indexedAccountId: 'hd-1--1',
+        networkId: 'btc--0',
+      },
+    });
+
+    await act(async () => {
+      await result.current.updateSelectedAccountDeriveType({
+        num: 0,
+        deriveType: 'BIP86',
+        expectedNetworkId: resolvedForNetworkId,
+        reason: 'autoDeriveFallback',
+      });
+    });
+
+    // The derive type belongs to the network, not the account, so the switch
+    // must not discard it — the effect that resolved it does not re-run on an
+    // account change, and the account would be left without a derive type.
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+      networkId: 'btc--0',
+      deriveType: 'BIP86',
+    });
+  });
+
+  it('does not apply a derive type resolved for a network the user has left', async () => {
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: {
+        ...defaultSelectedAccount(),
+        walletId: 'hd-1',
+        indexedAccountId: 'hd-1--0',
+        networkId: 'btc--0',
+      },
+    });
+    const resolvedForNetworkId = 'btc--0';
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    // The user leaves the network the derive type was resolved for.
+    store.set(selectedAccountsAtom(), {
+      0: {
+        ...defaultSelectedAccount(),
+        walletId: 'hd-1',
+        indexedAccountId: 'hd-1--0',
+        networkId: 'evm--1',
+        deriveType: 'default',
+      },
+    });
+
+    await act(async () => {
+      await result.current.updateSelectedAccountDeriveType({
+        num: 0,
+        deriveType: 'BIP86',
+        expectedNetworkId: resolvedForNetworkId,
+        reason: 'autoDeriveFallback',
+      });
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      networkId: 'evm--1',
+      deriveType: 'default',
     });
   });
 
@@ -1409,6 +1675,60 @@ describe('useAccountSelectorActions', () => {
         networkId: 'sol--101',
       });
     });
+
+    it('supersedes a selection started before the scene identity arrived', async () => {
+      // AccountSelectorEffects publishes the scene identity after mount, so a
+      // selection can start without it. Both requests belong to the same store
+      // and must share one bucket, otherwise the earlier one still sees itself
+      // as current and overwrites the user's later choice.
+      const resolvers = new Map<string, (value: string | undefined) => void>();
+      mockGetAllNetworksFallbackNetworkId.mockImplementation(
+        ({ walletId }) =>
+          new Promise<string | undefined>((resolve) => {
+            resolvers.set(walletId, resolve);
+          }),
+      );
+
+      const { store, Wrapper } = createWrapper();
+      seedSelection(store, getNetworkIdsMap().onekeyall);
+      expect(store.get(accountSelectorContextDataAtom())).toBeUndefined();
+      const { result } = renderHook(() => useAccountSelectorActions().current, {
+        wrapper: Wrapper,
+      });
+
+      await act(async () => {
+        const beforeSceneReady = result.current.confirmAccountSelect({
+          indexedAccount: {
+            id: 'hd-2--0',
+            walletId: 'hd-2',
+          } as IIndexedAccount,
+          othersWalletAccount: undefined,
+          num: 0,
+        });
+        await waitFor(() => expect(resolvers.has('hd-2')).toBe(true));
+
+        store.set(accountSelectorContextDataAtom(), {
+          sceneName: EAccountSelectorSceneName.home,
+        });
+        const afterSceneReady = result.current.confirmAccountSelect({
+          indexedAccount: qrIndexedAccount,
+          othersWalletAccount: undefined,
+          num: 0,
+        });
+        await waitFor(() => expect(resolvers.has('qr-1')).toBe(true));
+
+        resolvers.get('qr-1')?.('btc--0');
+        expect(await afterSceneReady).toBe(true);
+        resolvers.get('hd-2')?.('evm--1');
+        expect(await beforeSceneReady).toBe(false);
+      });
+
+      expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+        walletId: 'qr-1',
+        indexedAccountId: 'qr-1--0',
+        networkId: 'btc--0',
+      });
+    });
   });
 
   it('normalizes imported account network pairs before saving to storage', async () => {
@@ -1656,6 +1976,101 @@ describe('useAccountSelectorActions', () => {
 
     expect(mockSaveSelectedAccount).toHaveBeenCalledTimes(1);
     expect(mockSaveGlobalDeriveType).toHaveBeenCalledTimes(1);
+  });
+
+  it('replays a dropped change event when the same selection is saved again', async () => {
+    const selectedAccount = createHdSelectedAccount('hd-1--0');
+    const otherAccount = createHdSelectedAccount('hd-1--1');
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 1000 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const emitSpy = jest.spyOn(appEventBus, 'emit').mockReturnValue(true);
+
+    const writeDeferred = createDeferred<{ persisted: boolean }>();
+    mockSaveSelectedAccount.mockReturnValueOnce(writeDeferred.promise);
+    let droppedSave: Promise<void> | undefined;
+    await act(async () => {
+      droppedSave = result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount,
+        selectedAccountUpdatedAt: 1000,
+        trigger: 'confirm-explicit',
+      });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      // the selection moves away while the record is being written
+      store.set(selectedAccountsAtom(), { 0: otherAccount });
+      store.set(accountSelectorUpdateMetaAtom(), {
+        0: { eventEmitDisabled: false, updatedAt: 1001 },
+      });
+      writeDeferred.resolve({ persisted: true });
+      await droppedSave;
+    });
+
+    expect(mockSaveSelectedAccount).toHaveBeenCalledTimes(1);
+    expect(emitSpy).not.toHaveBeenCalledWith(
+      EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+      expect.anything(),
+    );
+
+    // the selection comes back, so the record is already on disk
+    mockGetSelectedAccount.mockResolvedValue(selectedAccount);
+    await act(async () => {
+      store.set(selectedAccountsAtom(), { 0: selectedAccount });
+      store.set(accountSelectorUpdateMetaAtom(), {
+        0: { eventEmitDisabled: false, updatedAt: 1002 },
+      });
+      await result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount,
+        selectedAccountUpdatedAt: 1002,
+        trigger: 'selection-effect',
+      });
+    });
+
+    expect(emitSpy).toHaveBeenCalledWith(
+      EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+      expect.objectContaining({ selectedAccount }),
+    );
+    expect(mockSaveGlobalDeriveType).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps short circuiting a saved selection that lost no side effects', async () => {
+    const selectedAccount = createHdSelectedAccount('hd-1--0');
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 1000 },
+    });
+    mockGetSelectedAccount.mockResolvedValue(selectedAccount);
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const emitSpy = jest.spyOn(appEventBus, 'emit').mockReturnValue(true);
+
+    await act(async () => {
+      await result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount,
+        selectedAccountUpdatedAt: 1000,
+        trigger: 'selection-effect',
+      });
+    });
+
+    expect(mockSaveSelectedAccount).not.toHaveBeenCalled();
+    expect(emitSpy).not.toHaveBeenCalledWith(
+      EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+      expect.anything(),
+    );
   });
 
   it('does not apply a global derive type resolved for a stale selection', async () => {

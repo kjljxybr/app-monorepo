@@ -38,7 +38,8 @@ type IServiceAccountMock = {
 };
 
 function getServiceAccountMock() {
-  return appGlobals.$backgroundApiProxy.serviceAccount as IServiceAccountMock;
+  return appGlobals.$backgroundApiProxy
+    .serviceAccount as unknown as IServiceAccountMock;
 }
 
 describe('SimpleDbEntityCustomTokens account-removal races', () => {

@@ -26,6 +26,7 @@ import {
 import { isAccountIdDeactivatedBotWallet } from '../../../utils/botWalletAccountUtils';
 import { shouldWarnBotWalletInteract } from '../../../utils/botWalletStatusUtils';
 import { showBotWalletDeactivatedWarningDialog } from '../../../utils/botWalletWarningDialog';
+import { isApprovalAccountSuperseded } from '../approvalGuard';
 import { DAppAccountListStandAloneItem } from '../components/DAppAccountList';
 import { DAppRequestedPermissionContent } from '../components/DAppRequestContent';
 import { DAppRequestedDappList } from '../components/DAppRequestContent/DAppRequestedDappList';
@@ -77,10 +78,15 @@ function ConnectionModal() {
     observedAt: number;
     rawSelectedAccount: IAccountSelectorSelectedAccount;
   }>(undefined);
+  // Tracks the newest observation even when it cannot be shown yet, so approval
+  // can verify the modal is not about to authorize a superseded account.
+  const latestActiveAccountRef =
+    useRef<IAccountSelectorActiveAccountInfo | null>(null);
 
   const handleAccountChanged = useCallback<IHandleAccountChanged>(
     ({ activeAccount, selectedAccount: rawSelectedAccountData }, num) => {
-      const appliedToModal = Boolean(activeAccount.account);
+      latestActiveAccountRef.current = activeAccount;
+      const hasUsableAccount = Boolean(activeAccount.account);
       if (isAccountSelectorPerfDebugEnabled()) {
         const observedAt = getAccountSelectorPerfTimestamp();
         const previous = accountObservationRef.current;
@@ -91,7 +97,7 @@ function ConnectionModal() {
             activeAccountChanged:
               previous?.activeAccount !== activeAccount || !previous,
             activeReady: activeAccount.ready,
-            appliedToModal,
+            appliedToModal: hasUsableAccount,
             hasAccount: Boolean(activeAccount.account),
             hasAddress: Boolean(
               activeAccount.account?.address ||
@@ -115,9 +121,9 @@ function ConnectionModal() {
           rawSelectedAccount: rawSelectedAccountData,
         };
       }
-      if (!appliedToModal) {
-        return;
-      }
+      // Applies even when the account has no address yet: keeping the previous
+      // account in state would render one account while approving another, and
+      // confirmDisabled already blocks an account that cannot be connected.
       setSelectedAccount(activeAccount);
       setRawSelectedAccount(rawSelectedAccountData);
     },
@@ -177,8 +183,34 @@ function ConnectionModal() {
         });
         return;
       }
+      const approvingAccountId = selectedAccount.account.id;
+      // Re-checked after every await below. The modal approves the account held
+      // in state, so a switch that lands mid-approval would authorize an account
+      // the user is no longer looking at.
+      const rejectIfAccountSuperseded = () => {
+        if (
+          !isApprovalAccountSuperseded({
+            approvingAccountId,
+            latestAccountId: latestActiveAccountRef.current?.account?.id,
+          })
+        ) {
+          return false;
+        }
+        Toast.error({ title: 'account changed, please try again' });
+        defaultLogger.discovery.dapp.dappUse({
+          dappName: $sourceInfo?.hostname,
+          dappDomain: $sourceInfo?.origin,
+          action: 'ConnectWallet',
+          network: selectedAccount?.network?.name,
+          failReason: 'account changed during approval',
+        });
+        return true;
+      };
+      if (rejectIfAccountSuperseded()) {
+        return;
+      }
       const isDeactivatedBotWallet = await isAccountIdDeactivatedBotWallet({
-        accountId: selectedAccount.account.id,
+        accountId: approvingAccountId,
       });
       if (
         shouldWarnBotWalletInteract({
@@ -190,6 +222,9 @@ function ConnectionModal() {
         if (!confirmed) {
           return;
         }
+      }
+      if (rejectIfAccountSuperseded()) {
+        return;
       }
       const {
         wallet,

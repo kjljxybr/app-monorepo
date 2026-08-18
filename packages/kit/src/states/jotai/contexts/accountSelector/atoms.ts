@@ -47,6 +47,17 @@ export const {
   use: useAccountSelectorContextDataAtom,
 } = contextAtom<IAccountSelectorContextData | undefined>(undefined);
 
+// Stable scope identity for request bookkeeping that must stay per-store.
+// accountSelectorContextDataAtom is only populated once AccountSelectorEffects
+// mounts, so anything keyed on sceneName alone collapses into one shared bucket
+// during that window and lets unrelated selectors cancel each other. Assigned on
+// first use (from the scene identity when it is already known) and then never
+// reassigned, so a store keeps one bucket across the mount boundary.
+export const {
+  atom: accountSelectorStoreScopeIdAtom,
+  use: useAccountSelectorStoreScopeIdAtom,
+} = contextAtom<string>('');
+
 export const defaultSelectedAccount: () => IAccountSelectorSelectedAccount =
   () => ({
     walletId: undefined,
