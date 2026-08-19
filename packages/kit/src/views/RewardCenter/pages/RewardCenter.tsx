@@ -1019,6 +1019,7 @@ function RewardCenterAccountSelectorSync({
               num: 0,
               indexedAccount: undefined,
               othersWalletAccount: initAccount,
+              entry: 'rewardCenter:othersWallet',
               forceSelectToNetworkId: networkId,
             });
           } catch (error) {

@@ -14,6 +14,7 @@ import {
 import { AccountAvatar } from '@onekeyhq/kit/src/components/AccountAvatar';
 import { AccountSelectorCreateAddressButton } from '@onekeyhq/kit/src/components/AccountSelector/AccountSelectorCreateAddressButton';
 import { ListItem } from '@onekeyhq/kit/src/components/ListItem';
+import type { IListItemTextProps } from '@onekeyhq/kit/src/components/ListItem';
 import { useActiveAccount } from '@onekeyhq/kit/src/states/jotai/contexts/accountSelector';
 import { useAccountSelectorActions } from '@onekeyhq/kit/src/states/jotai/contexts/accountSelector/actions';
 import type {
@@ -365,6 +366,52 @@ export function AccountSelectorAccountListItem({
     subTitleInfo.linkedNetworkId,
   ]);
 
+  // ListItem renders this prop as a component, so an inline arrow would be a
+  // new element type on every render and React would remount the whole text
+  // subtree instead of updating it in place.
+  const renderItemText = useCallback(
+    (textProps: IListItemTextProps) => (
+      <ListItem.Text
+        {...textProps}
+        flex={1}
+        // Without minWidth={0} the flex column keeps Yoga's default
+        // `min-width: auto`, so it can't shrink below the intrinsic width of
+        // its widest line (the value + address subtitle). On Android that
+        // forces the column to overflow and the name's numberOfLines={1}
+        // gets truncated against that inflated width — even short "Account #XX"
+        // names get cut off (OK-56318). iOS lays this out without the issue.
+        // Mirrors the working WebAccountPanelListItem pattern.
+        minWidth={0}
+        overflow="hidden"
+        pr="$8"
+        primary={
+          <SizableText size="$bodyLg" numberOfLines={1}>
+            {item.name}
+          </SizableText>
+        }
+        secondary={
+          <XStack
+            key={`${focusedWalletInfo?.wallet?.id || ''}-${item.id}-${
+              subTitleInfo.address
+            }`}
+            alignItems="center"
+          >
+            {renderAccountValue()}
+            {renderAccountAddress()}
+          </XStack>
+        }
+      />
+    ),
+    [
+      focusedWalletInfo?.wallet?.id,
+      item.id,
+      item.name,
+      renderAccountAddress,
+      renderAccountValue,
+      subTitleInfo.address,
+    ],
+  );
+
   return (
     <Stack>
       <ListItem
@@ -379,38 +426,7 @@ export function AccountSelectorAccountListItem({
             networkId={avatarNetworkId}
           />
         }
-        renderItemText={(textProps) => (
-          <ListItem.Text
-            {...textProps}
-            flex={1}
-            // Without minWidth={0} the flex column keeps Yoga's default
-            // `min-width: auto`, so it can't shrink below the intrinsic width of
-            // its widest line (the value + address subtitle). On Android that
-            // forces the column to overflow and the name's numberOfLines={1}
-            // gets truncated against that inflated width — even short "Account #XX"
-            // names get cut off (OK-56318). iOS lays this out without the issue.
-            // Mirrors the working WebAccountPanelListItem pattern.
-            minWidth={0}
-            overflow="hidden"
-            pr="$8"
-            primary={
-              <SizableText size="$bodyLg" numberOfLines={1}>
-                {item.name}
-              </SizableText>
-            }
-            secondary={
-              <XStack
-                key={`${focusedWalletInfo?.wallet?.id || ''}-${item.id}-${
-                  subTitleInfo.address
-                }`}
-                alignItems="center"
-              >
-                {renderAccountValue()}
-                {renderAccountAddress()}
-              </XStack>
-            }
-          />
-        )}
+        renderItemText={renderItemText}
         {...(canConfirmAccountSelectPress && {
           onPress: async () => {
             // show CreateAddress Button here, disabled confirmAccountSelect()
@@ -434,6 +450,7 @@ export function AccountSelectorAccountListItem({
                   indexedAccount: undefined,
                   othersWalletAccount: account,
                   autoChangeToAccountMatchedNetworkId,
+                  entry: 'accountList:othersWallet',
                   reason: 'userSelectAccount',
                 });
                 if (!confirmed) {
@@ -445,6 +462,7 @@ export function AccountSelectorAccountListItem({
                   indexedAccount,
                   othersWalletAccount: undefined,
                   autoChangeToAccountMatchedNetworkId: undefined,
+                  entry: 'accountList:indexedAccount',
                   reason: 'userSelectAccount',
                 });
                 if (!confirmed) {

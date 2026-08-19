@@ -81,12 +81,14 @@ export function WebAccountPanelAccountList({
             indexedAccount: undefined,
             othersWalletAccount: item as IDBAccount,
             autoChangeToAccountMatchedNetworkId: networkId,
+            entry: 'webAccountPanel:othersWallet',
           });
         } else {
           await actions.current.confirmAccountSelect({
             num: 0,
             indexedAccount: item as IDBIndexedAccount,
             othersWalletAccount: undefined,
+            entry: 'webAccountPanel:indexedAccount',
           });
         }
       } catch {

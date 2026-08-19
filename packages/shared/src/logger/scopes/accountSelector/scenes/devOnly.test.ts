@@ -1,6 +1,7 @@
 import platformEnv from '@onekeyhq/shared/src/platformEnv';
 
 import { AccountSelectorAutoSelectScene } from './autoSelect';
+import { AccountSelectorFailureScene } from './failure';
 import { AccountSelectorListDataScene } from './listData';
 import { AccountSelectorPerfScene } from './perf';
 import { AccountSelectorRenderScene } from './render';
@@ -105,6 +106,8 @@ describe('account selector development-only logger scenes', () => {
       });
       staleDropScene.storageSideEffectDropped({
         num: 0,
+        eventEmitDisabled: false,
+        eventEmitted: false,
         outcome: 'stale-before-event',
         primaryPersisted: true,
         reason: 'confirmAccountSelect',
@@ -162,6 +165,56 @@ describe('account selector development-only logger scenes', () => {
     expect(JSON.stringify(staleDropScene.selectionUpdateDropped(args))).toEqual(
       JSON.stringify(staleDropScene.selectionUpdateDropped(args)),
     );
+  });
+
+  it('still emits failure logs in production', () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const failureScene = new AccountSelectorFailureScene();
+      const failureEmit = jest.spyOn(failureScene, '_emitLog');
+
+      failureScene.activationFailed({
+        connectionKind: 'evmEIP6963',
+        errorMessage: 'provider not found',
+        errorName: 'Error',
+        num: 0,
+        phase: 'activate-connector',
+        sceneName: 'home',
+      });
+      failureScene.accountSelectRejected({
+        entry: 'accountList:indexedAccount',
+        num: 0,
+        outcome: 'unavailable-wallet',
+        reason: 'userSelectAccount',
+        sceneName: 'home',
+        walletKind: 'hw',
+      });
+
+      // These are the only trace a support report has for "I tapped an account
+      // and nothing happened" — the app cannot show a toast from the state
+      // layer, so silencing them in production would leave nothing at all.
+      expect(failureEmit).toHaveBeenCalledTimes(2);
+    } finally {
+      process.env.NODE_ENV = previousNodeEnv;
+    }
+  });
+
+  it('keeps identifiers out of failure payloads', () => {
+    const failureScene = new AccountSelectorFailureScene();
+
+    expect(
+      JSON.stringify(
+        failureScene.accountSelectRejected({
+          entry: 'accountList:indexedAccount',
+          num: 0,
+          outcome: 'unavailable-wallet',
+          reason: 'userSelectAccount',
+          sceneName: 'home',
+          walletKind: 'hw',
+        }),
+      ),
+    ).not.toContain('hd-1');
   });
 
   it('formats performance traces as one structured record', () => {

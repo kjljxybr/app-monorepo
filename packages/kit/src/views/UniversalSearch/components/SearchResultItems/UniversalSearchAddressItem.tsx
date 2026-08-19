@@ -6,6 +6,7 @@ import { SizableText, Toast, XStack } from '@onekeyhq/components';
 import backgroundApiProxy from '@onekeyhq/kit/src/background/instance/backgroundApiProxy';
 import { AccountAvatar } from '@onekeyhq/kit/src/components/AccountAvatar';
 import { ListItem } from '@onekeyhq/kit/src/components/ListItem';
+import type { IListItemTextProps } from '@onekeyhq/kit/src/components/ListItem';
 import { NetworkAvatar } from '@onekeyhq/kit/src/components/NetworkAvatar';
 import { useAccountData } from '@onekeyhq/kit/src/hooks/useAccountData';
 import { useEnabledNetworksCompatibleWithWalletIdInAllNetworks } from '@onekeyhq/kit/src/hooks/useAllNetwork';
@@ -101,6 +102,7 @@ export function UniversalSearchAddressItem({
           num: 0,
           indexedAccount: undefined,
           othersWalletAccount: item.payload.account,
+          entry: 'universalSearch:othersWallet',
           forceSelectToNetworkId: item.payload.network?.id,
         });
       } else {
@@ -108,6 +110,7 @@ export function UniversalSearchAddressItem({
           num: 0,
           indexedAccount: item.payload.indexedAccount,
           othersWalletAccount: undefined,
+          entry: 'universalSearch:indexedAccount',
           forceSelectToNetworkId: item.payload.network?.id,
         });
       }
@@ -270,6 +273,43 @@ export function UniversalSearchAddressItem({
     networkInfoMap,
   ]);
 
+  // ListItem renders this prop as a component, so an inline arrow would be a
+  // new element type on every render and React would remount the whole text
+  // subtree instead of updating it in place.
+  const renderItemText = useCallback(
+    (textProps: IListItemTextProps) => (
+      <ListItem.Text
+        {...textProps}
+        flex={1}
+        primary={
+          <SizableText size="$bodyLgMedium" numberOfLines={1}>
+            {item.payload.accountInfo?.formattedName}
+          </SizableText>
+        }
+        secondary={
+          <XStack alignItems="center">
+            {renderAccountValue()}
+            <AccountAddress
+              num={0}
+              linkedNetworkId={item.payload.network?.id}
+              address={accountUtils.shortenAddress({
+                address: item.payload.addressInfo?.displayAddress,
+              })}
+              isEmptyAddress={false}
+              showSplitter={!(platformEnv.isWebDappMode || platformEnv.isE2E)}
+            />
+          </XStack>
+        }
+      />
+    ),
+    [
+      item.payload.accountInfo?.formattedName,
+      item.payload.addressInfo?.displayAddress,
+      item.payload.network?.id,
+      renderAccountValue,
+    ],
+  );
+
   if (item.payload.account || item.payload.isSearchedByAccountName) {
     return (
       <ListItem
@@ -284,33 +324,7 @@ export function UniversalSearchAddressItem({
           />
         }
         title={item.payload.accountInfo?.formattedName}
-        renderItemText={(textProps) => (
-          <ListItem.Text
-            {...textProps}
-            flex={1}
-            primary={
-              <SizableText size="$bodyLgMedium" numberOfLines={1}>
-                {item.payload.accountInfo?.formattedName}
-              </SizableText>
-            }
-            secondary={
-              <XStack alignItems="center">
-                {renderAccountValue()}
-                <AccountAddress
-                  num={0}
-                  linkedNetworkId={item.payload.network?.id}
-                  address={accountUtils.shortenAddress({
-                    address: item.payload.addressInfo?.displayAddress,
-                  })}
-                  isEmptyAddress={false}
-                  showSplitter={
-                    !(platformEnv.isWebDappMode || platformEnv.isE2E)
-                  }
-                />
-              </XStack>
-            }
-          />
-        )}
+        renderItemText={renderItemText}
         subtitle={item.payload.addressInfo?.displayAddress}
       />
     );

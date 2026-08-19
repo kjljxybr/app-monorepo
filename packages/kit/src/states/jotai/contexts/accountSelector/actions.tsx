@@ -132,6 +132,33 @@ const ACCOUNT_SELECTOR_RECENT_SELECTION_CACHE_VERSION = 2;
 // commit means the caller keeps losing its update, so fail loudly off production.
 const CONSECUTIVE_STALE_DROP_ALERT_THRESHOLD = 3;
 
+// Wallet category for diagnostics. Never the id itself: the category is what
+// changes the investigation, the id only identifies the user.
+function describeWalletKind(walletId: string | undefined): string {
+  if (!walletId) {
+    return 'none';
+  }
+  if (accountUtils.isHwWallet({ walletId })) {
+    return 'hw';
+  }
+  if (accountUtils.isQrWallet({ walletId })) {
+    return 'qr';
+  }
+  if (accountUtils.isHdWallet({ walletId })) {
+    return 'hd';
+  }
+  if (accountUtils.isImportedWallet({ walletId })) {
+    return 'imported';
+  }
+  if (accountUtils.isWatchingWallet({ walletId })) {
+    return 'watching';
+  }
+  if (accountUtils.isExternalWallet({ walletId })) {
+    return 'external';
+  }
+  return 'other';
+}
+
 // Upper bound for the run counter below. Entries are keyed per scene, and the
 // discover scene keys on the dapp origin, so the key space grows with the number
 // of dapps visited while nothing removes an entry whose run never ended.
@@ -2206,6 +2233,10 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         num: number;
         autoChangeToAccountMatchedNetworkId?: string;
         forceSelectToNetworkId?: string;
+        // Which UI path asked for this selection. Diagnostics only — kept
+        // separate from `reason`, whose values feed perf traces and the E2E
+        // budget assertions and therefore cannot carry a caller suffix.
+        entry?: string;
         reason?: string;
       },
     ) => {
@@ -2215,6 +2246,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         indexedAccount,
         autoChangeToAccountMatchedNetworkId,
         forceSelectToNetworkId,
+        entry = 'unspecified',
         reason = 'confirmAccountSelect',
       } = params;
       if (othersWalletAccount && indexedAccount) {
@@ -2256,6 +2288,25 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         set(accountSelectorStoreScopeIdAtom(), confirmRequestScopeKey);
       }
       const confirmRequestKey = `${confirmRequestScopeKey}__${num}`;
+      // Every path that returns false goes through here, so a selection that
+      // visibly does nothing always leaves one entry saying which check
+      // rejected it and which UI asked. No toast: this layer must not reach for
+      // locale strings (onekey/no-app-locale-main-thread), and the caller that
+      // wants to surface it owns the wording.
+      const rejectAccountSelect = (outcome: string) => {
+        const rejectedWalletId = accountUtils.getWalletIdFromAccountId({
+          accountId: indexedAccount?.id || othersWalletAccount?.id || '',
+        });
+        defaultLogger.accountSelector.failure.accountSelectRejected({
+          entry,
+          num,
+          outcome,
+          reason,
+          sceneName: requestContextData?.sceneName,
+          walletKind: describeWalletKind(rejectedWalletId),
+        });
+        return false;
+      };
       this.confirmAccountSelectLatestRequestIdMap.set(
         confirmRequestKey,
         confirmRequestId,
@@ -2302,7 +2353,10 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               ),
             });
           }
-          return false;
+          // Unlike a stale drop, this is not a superseded request: the user
+          // tapped an account and nothing will happen. Say so instead of
+          // returning a bare false that every caller ignores.
+          return rejectAccountSelect('wallet-check-error');
         }
         if (!wallet || wallet.isMocked) {
           if (perfEnabled) {
@@ -2319,7 +2373,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               ),
             });
           }
-          return false;
+          return rejectAccountSelect('unavailable-wallet');
         }
         if (
           this.confirmAccountSelectLatestRequestIdMap.get(confirmRequestKey) !==
@@ -2339,7 +2393,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               ),
             });
           }
-          return false;
+          return rejectAccountSelect('stale');
         }
 
         phase = 'resolve-network';
@@ -2416,7 +2470,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               ),
             });
           }
-          return false;
+          return rejectAccountSelect('stale');
         }
 
         const shouldUseFastConfirm =
@@ -2460,7 +2514,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               ),
             });
           }
-          return false;
+          return rejectAccountSelect('stale');
         }
 
         const stateCommittedAt = perfEnabled
@@ -2502,7 +2556,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               transitionId,
             });
           }
-          return false;
+          return rejectAccountSelect('stale-after-commit');
         }
 
         // Fire-and-forget is fine here: the in-memory snapshot write lands
@@ -2546,7 +2600,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           this.confirmAccountSelectLatestRequestIdMap.get(confirmRequestKey) !==
           confirmRequestId
         ) {
-          return false;
+          return rejectAccountSelect('stale-superseded-request');
         }
 
         appEventBus.emit(EAppEventBusNames.ConfirmAccountSelected, {
@@ -4466,6 +4520,11 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               num: payload.num,
               operationId,
               reason: transitionMeta?.reason,
+              // Coalescing is keyed by revision, attribution by selection
+              // identity. Two saves of one transition therefore mean the
+              // revisions disagreed — record it, or the trace shows a duplicate
+              // persist with no way to tell which caller drifted.
+              revision: payload.selectedAccountUpdatedAt,
               sceneName: payload.sceneName,
               transitionId: transitionMeta?.transitionId,
               trigger: payload.trigger || 'unspecified',
@@ -4504,6 +4563,8 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 if (suppressedSinceLastLog !== undefined) {
                   defaultLogger.accountSelector.staleDrop.storageSideEffectDropped(
                     {
+                      eventEmitDisabled,
+                      eventEmitted,
                       num,
                       outcome,
                       primaryPersisted,

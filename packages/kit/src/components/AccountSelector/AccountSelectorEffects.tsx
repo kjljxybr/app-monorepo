@@ -17,6 +17,7 @@ import { useDebugComponentRemountLog } from '@onekeyhq/shared/src/utils/debug/de
 import { noopObject } from '@onekeyhq/shared/src/utils/miscUtils';
 import timerUtils from '@onekeyhq/shared/src/utils/timerUtils';
 import { EAccountSelectorSceneName } from '@onekeyhq/shared/types';
+import type { IExternalConnectionInfo } from '@onekeyhq/shared/types/externalWallet.types';
 
 import backgroundApiProxy from '../../background/instance/backgroundApiProxy';
 import {
@@ -219,6 +220,23 @@ const AccountSelectorEffectsPerfObserver = memo(
   },
 );
 
+// Which transport the external account connects over. Only the discriminator —
+// the payloads underneath carry session topics and peer metadata.
+function describeConnectionKind(
+  connectionInfo: IExternalConnectionInfo | undefined,
+): string {
+  if (connectionInfo?.walletConnect) {
+    return 'walletConnect';
+  }
+  if (connectionInfo?.evmEIP6963) {
+    return 'evmEIP6963';
+  }
+  if (connectionInfo?.evmInjected) {
+    return 'evmInjected';
+  }
+  return 'unknown';
+}
+
 function useExternalAccountActivate({
   effectInstanceId,
   num,
@@ -290,6 +308,7 @@ function useExternalAccountActivate({
         sceneName,
       });
     }
+    let activationPhase = 'activate-connector';
     void (async () => {
       try {
         // activate connector will register account events
@@ -312,14 +331,29 @@ function useExternalAccountActivate({
             logResult('cancelled');
             return;
           }
+          activationPhase = 'sync-from-peer-wallet';
           await backgroundApiProxy.serviceDappSide.syncAccountFromPeerWallet({
             accountId,
             networkId,
           });
         }
         logResult('synced');
-      } catch {
+      } catch (error) {
         logResult(cancelled ? 'cancelled' : 'error');
+        if (!cancelled) {
+          // The effect only re-runs when accountId/networkId change, so a
+          // failure here means this account stops syncing with its peer wallet
+          // until the user switches away and back or reloads. Recorded in
+          // production because the cause is always on the user's machine.
+          defaultLogger.accountSelector.failure.activationFailed({
+            connectionKind: describeConnectionKind(connectionInfo),
+            errorMessage: (error as Error | undefined)?.message,
+            errorName: (error as Error | undefined)?.name,
+            num,
+            phase: activationPhase,
+            sceneName,
+          });
+        }
       }
     })();
     return () => {
@@ -664,16 +698,22 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
       }
       pendingActiveReloadRequestRef.current = request;
       if (perfEnabled) {
+        // Report the transition only when this schedule claimed it. An
+        // inherited attribution belongs to the pending request being coalesced
+        // into, which already announced it; re-announcing here would count one
+        // transition as two scheduled reloads. The request itself still carries
+        // the inherited attribution so the dispatch that finally runs stays
+        // correlated with the transition that caused it.
         defaultLogger.accountSelector.perf.trace('activeReloadScheduled', {
           changedFields: transitionMeta?.changedFields,
           coalescedCount: request.coalescedCount,
           coalescedTriggers,
           effectInstanceId,
           num,
-          reason: request.selectionReason,
+          reason: transitionMeta?.reason,
           scheduleId,
           sceneName,
-          transitionId: request.selectionTransitionId,
+          transitionId: transitionMeta?.transitionId,
           trigger,
         });
       }

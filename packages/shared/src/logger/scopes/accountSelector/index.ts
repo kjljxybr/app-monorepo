@@ -2,6 +2,7 @@ import { BaseScope } from '../../base/baseScope';
 import { EScopeName } from '../../types';
 
 import { AccountSelectorAutoSelectScene } from './scenes/autoSelect';
+import { AccountSelectorFailureScene } from './scenes/failure';
 import { AccountSelectorListDataScene } from './scenes/listData';
 import { AccountSelectorPerfScene } from './scenes/perf';
 import { AccountSelectorRenderScene } from './scenes/render';
@@ -20,6 +21,8 @@ export class AccountSelectorScope extends BaseScope {
   autoSelect = this.createScene('autoSelect', AccountSelectorAutoSelectScene);
 
   listData = this.createScene('listData', AccountSelectorListDataScene);
+
+  failure = this.createScene('failure', AccountSelectorFailureScene);
 
   staleDrop = this.createScene('staleDrop', AccountSelectorStaleDropScene);
 }

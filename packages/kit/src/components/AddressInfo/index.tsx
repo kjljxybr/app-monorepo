@@ -97,6 +97,7 @@ function SwitchHomeAccountButton({
                 await actions.current.confirmAccountSelect({
                   num: 0,
                   othersWalletAccount: indexedAccount ? undefined : account,
+                  entry: 'addressInfo',
                   indexedAccount,
                 });
               } catch {

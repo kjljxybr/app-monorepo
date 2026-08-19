@@ -196,6 +196,24 @@ const dappConnectionProviderCommitLimit = readPositiveNumberEnv(
   22,
 );
 
+// This suite asserts account-selector synchronization, never balances or fiat
+// values, yet every account, network and derive switch loads them again over
+// the real wallet API - where a 30s timeout surfaces as an uncaught page error
+// and fails the cycle. Serving them locally removes that variable.
+// Answer with latency, though: a reply in the same tick as the request lands
+// state updates inside windows the real backend never lands them in, which
+// pushed the DApp initialization commit budget from 5 to 7. See the knob below.
+// Set ACCOUNT_SELECTOR_E2E_STUB_WALLET_TOKENS=0 to use the live endpoint.
+const stubWalletTokenApi = readBooleanEnv(
+  'ACCOUNT_SELECTOR_E2E_STUB_WALLET_TOKENS',
+  true,
+);
+const seenWalletTokenRequests = new Set();
+const walletTokenStubLatencyMs = readPositiveNumberEnv(
+  'ACCOUNT_SELECTOR_E2E_STUB_WALLET_TOKENS_LATENCY_MS',
+  150,
+);
+
 // The Perps scenario drives real Hyperliquid endpoints, which rate-limit (429)
 // after repeated local runs and then fail the cycle on the uncaught-error check.
 // This scenario asserts account-selector synchronization, not market data, so the
@@ -275,6 +293,41 @@ async function routeHyperliquidStub(context) {
     seenHyperliquidActions.add(action || route.request().url());
     await route.fulfill({
       body: JSON.stringify(buildHyperliquidStubResponse(action)),
+      contentType: 'application/json',
+      status: 200,
+    });
+  });
+}
+
+const EMPTY_TOKEN_LIST = { data: [], keys: '', map: {} };
+
+// The account selector e2e never asserts balances or fiat values, but every
+// account, network and derive switch loads them again over the real wallet API.
+// Serving them locally keeps a timing-sensitive perf run from inheriting the
+// network's latency and failures. Set ACCOUNT_SELECTOR_E2E_STUB_WALLET_TOKENS=0
+// to exercise the real endpoint.
+async function routeWalletTokenStub(context) {
+  await context.route(/\/wallet\/v1\/account\/token\/list/, async (route) => {
+    seenWalletTokenRequests.add(new URL(route.request().url()).pathname);
+    // Answer on the same order of latency as the real endpoint. Returning
+    // instantly is not a faithful stand-in here: this suite budgets render
+    // scheduling, and a reply that lands in the same tick as the request moves
+    // state updates into windows the real backend never lands them in. Fixed,
+    // so the determinism the stub exists for is preserved.
+    await new Promise((resolve) => {
+      setTimeout(resolve, walletTokenStubLatencyMs);
+    });
+    await route.fulfill({
+      body: JSON.stringify({
+        code: 0,
+        data: {
+          allTokens: EMPTY_TOKEN_LIST,
+          riskTokens: EMPTY_TOKEN_LIST,
+          smallBalanceTokens: EMPTY_TOKEN_LIST,
+          tokens: EMPTY_TOKEN_LIST,
+        },
+        message: '',
+      }),
       contentType: 'application/json',
       status: 200,
     });
@@ -651,21 +704,39 @@ function assertTraceHealth({ droppedCount, events, phase }) {
   );
 }
 
-function assertTraceRequestResultPairs(events) {
-  const pairs = [
-    ['accountSelectRequested', 'accountSelectResult', 'operationId'],
-    ['activeReloadStart', 'activeReloadResult', 'reloadId'],
-    ['autoDeriveRequested', 'autoDeriveResult', 'operationId'],
-    ['autoDeriveSyncRequested', 'autoDeriveSyncResult', 'operationId'],
-    ['autoSelectAccountRequested', 'autoSelectAccountResult', 'operationId'],
-    ['availableNetworksRequested', 'availableNetworksResult', 'operationId'],
-    ['crossSceneSyncRequested', 'crossSceneSyncResult', 'operationId'],
-    ['manualSceneSyncRequested', 'manualSceneSyncResult', 'operationId'],
-    ['selectionUpdateRequested', 'selectionUpdateResult', 'attemptId'],
-    ['storageInitRequested', 'storageInitResult', 'operationId'],
-  ];
+const requestResultPairs = [
+  ['accountSelectRequested', 'accountSelectResult', 'operationId'],
+  ['activeReloadStart', 'activeReloadResult', 'reloadId'],
+  ['autoDeriveRequested', 'autoDeriveResult', 'operationId'],
+  ['autoDeriveSyncRequested', 'autoDeriveSyncResult', 'operationId'],
+  ['autoSelectAccountRequested', 'autoSelectAccountResult', 'operationId'],
+  ['availableNetworksRequested', 'availableNetworksResult', 'operationId'],
+  ['crossSceneSyncRequested', 'crossSceneSyncResult', 'operationId'],
+  ['manualSceneSyncRequested', 'manualSceneSyncResult', 'operationId'],
+  ['selectionUpdateRequested', 'selectionUpdateResult', 'attemptId'],
+  ['storageInitRequested', 'storageInitResult', 'operationId'],
+];
 
-  for (const [requestEvent, resultEvent, key] of pairs) {
+function countUnsettledRequests(events) {
+  let unsettled = 0;
+  for (const [requestEvent, resultEvent, key] of requestResultPairs) {
+    const resultCounts = new Map();
+    for (const event of events) {
+      if (event.event === resultEvent) {
+        resultCounts.set(event[key], (resultCounts.get(event[key]) || 0) + 1);
+      }
+    }
+    for (const event of events) {
+      if (event.event === requestEvent && resultCounts.get(event[key]) !== 1) {
+        unsettled += 1;
+      }
+    }
+  }
+  return unsettled;
+}
+
+function assertTraceRequestResultPairs(events) {
+  for (const [requestEvent, resultEvent, key] of requestResultPairs) {
     const requests = events.filter((event) => event.event === requestEvent);
     const results = events.filter((event) => event.event === resultEvent);
     const requestCounts = new Map();
@@ -782,6 +853,60 @@ async function drainPerfTrace(page, devOnlyPassword) {
       ),
     { password: devOnlyPassword },
   );
+}
+
+// Draining is destructive. The drains that only exist to isolate the next
+// assertion window still delete whatever else was buffered, so a request kept
+// in one window can have its result dropped with an unread one and read as a
+// missing result. Retain those events instead; the per-window budget assertions
+// keep their narrow window, and the whole-run pair check gets the full picture.
+// Reset per page load: the operation id counter restarts with the runtime, so
+// residuals from two runtimes must never be merged.
+let residualTraceEvents = [];
+let residualTraceDroppedCount = 0;
+
+async function drainResidualPerfTrace(page, devOnlyPassword) {
+  const trace = await drainPerfTrace(page, devOnlyPassword);
+  residualTraceEvents.push(...trace.events);
+  residualTraceDroppedCount += trace.droppedCount;
+  return trace;
+}
+
+function takeResidualTrace() {
+  const trace = {
+    droppedCount: residualTraceDroppedCount,
+    events: residualTraceEvents,
+  };
+  residualTraceEvents = [];
+  residualTraceDroppedCount = 0;
+  return trace;
+}
+
+// A reload started just before the last window closes reports its result a
+// background round trip later. Wait for the operations already seen to report
+// before asserting the pairs, so the assertion measures the app lifecycle and
+// not where the final drain landed. A result that never arrives still fails:
+// the loop gives up at the deadline and the assertion runs on what it has.
+async function drainUntilRequestsSettled(
+  page,
+  devOnlyPassword,
+  events,
+  timeoutMs = 5000,
+) {
+  const collected = { droppedCount: 0, events: [] };
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const next = await drainPerfTrace(page, devOnlyPassword);
+    collected.droppedCount += next.droppedCount;
+    collected.events.push(...next.events);
+    if (!countUnsettledRequests([...events, ...collected.events])) {
+      return collected;
+    }
+    if (Date.now() >= deadline) {
+      return collected;
+    }
+    await page.waitForTimeout(100);
+  }
 }
 
 async function collectPerfTraceUntil(
@@ -1486,7 +1611,79 @@ async function selectWalletAccount(
   );
 }
 
-async function selectNetwork(page, networkId, { waitForCommit = true } = {}) {
+// A press that never reaches the app leaves no trace in the perf log, so the
+// only way to tell a swallowed press from a dismissal failure is to watch the
+// DOM events themselves. Capture phase, no MutationObserver: the failure is a
+// sub-millisecond timing window, and observing the subtree would perturb the
+// very scheduling under investigation.
+async function installPressProbe(page) {
+  await page.evaluate(() => {
+    if (globalThis.$$pressProbe) {
+      return;
+    }
+    const entries = [];
+    const record = (event) => {
+      if (entries.length >= 400) {
+        return;
+      }
+      const target =
+        event.target instanceof globalThis.Element ? event.target : undefined;
+      const holder = target?.closest?.('[data-testid]');
+      entries.push({
+        connected: target ? target.isConnected : undefined,
+        testID: holder?.getAttribute('data-testid') ?? undefined,
+        tMs: Math.round(globalThis.performance.now()),
+        type: event.type,
+      });
+    };
+    for (const type of [
+      'pointerdown',
+      'mousedown',
+      'pointerup',
+      'mouseup',
+      'click',
+    ]) {
+      globalThis.document.addEventListener(type, record, true);
+    }
+    globalThis.$$pressProbe = {
+      entries,
+      reset: () => {
+        entries.length = 0;
+      },
+    };
+  });
+}
+
+async function resetPressProbe(page) {
+  await page.evaluate(() => globalThis.$$pressProbe?.reset?.());
+}
+
+async function readPressProbe(page) {
+  return page.evaluate(
+    () => globalThis.$$pressProbe?.entries?.slice(-24) ?? [],
+  );
+}
+
+// Playwright's default click is a zero-length press: down and up land in the
+// same frame, so a row whose DOM node is replaced mid-press is never exercised.
+// A human press is 50-150ms wide, which straddles the list's post-open settling
+// burst. pressHoldMs reproduces that width so the suite can see what users see.
+async function pressWithHold(page, locator, holdMs) {
+  await locator.scrollIntoViewIfNeeded({ timeout: pageTimeoutMs });
+  const box = await locator.boundingBox({ timeout: pageTimeoutMs });
+  assert.ok(box, 'Press target must have a layout box');
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(holdMs);
+  await page.mouse.up();
+}
+
+async function selectNetwork(
+  page,
+  networkId,
+  { waitForCommit = true, pressHoldMs = 0 } = {},
+) {
+  await installPressProbe(page);
   const trigger = await getUniqueVisibleByTestIDs(page, [
     AccountSelectorTestIDs.networkTrigger,
     AccountSelectorTestIDs.allNetworksTrigger,
@@ -1503,8 +1700,31 @@ async function selectNetwork(page, networkId, { waitForCommit = true } = {}) {
     networkId,
     `select-item-${networkId}`,
   ]);
-  await networkItem.click({ timeout: pageTimeoutMs });
-  await waitForNoVisibleTestID(page, 'unified-network-selector-network-tab');
+  await resetPressProbe(page);
+  if (pressHoldMs > 0) {
+    await pressWithHold(page, networkItem, pressHoldMs);
+  } else {
+    await networkItem.click({ timeout: pageTimeoutMs });
+  }
+  // A selector that stays open means the press never reached the app. Report
+  // what the app actually holds and which DOM events the row saw, so a
+  // swallowed press is distinguishable from a selection that landed but failed
+  // to dismiss — and, when swallowed, whether the row moved mid-press.
+  try {
+    await waitForNoVisibleTestID(page, 'unified-network-selector-network-tab');
+  } catch (error) {
+    const persisted = await readPersistedSelection(page).catch(() => undefined);
+    const pressEvents = await readPressProbe(page).catch(() => []);
+    assert.fail(
+      `Network selector stayed open after clicking ${networkId}; persisted networkId=${
+        persisted?.networkId ?? 'unknown'
+      } (${
+        persisted?.networkId === networkId
+          ? 'press landed, dismissal failed'
+          : 'press was swallowed'
+      }); press events: ${JSON.stringify(pressEvents)}: ${error.message}`,
+    );
+  }
   if (waitForCommit) {
     await waitForPersistedSelection(page, { networkId });
   } else {
@@ -1613,7 +1833,7 @@ async function verifyAllNetworkDeriveAddresses(
   for (const deriveType of orderedDeriveTypes) {
     if (settings) {
       const previous = await readPersistedSelection(page);
-      await drainPerfTrace(page, devOnlyPassword);
+      await drainResidualPerfTrace(page, devOnlyPassword);
       await selectDeriveTypeViaUI(page, { ...settings, deriveType });
       await waitForPersistedSelection(page, { deriveType, networkId });
       await assertAccountSelectorStateConsistent(page, target, {
@@ -1645,7 +1865,7 @@ async function verifyAllNetworkDeriveAddresses(
       currentSelection?.deriveType,
       `${networkId} must keep a derive type before the no-op selection`,
     );
-    await drainPerfTrace(page, devOnlyPassword);
+    await drainResidualPerfTrace(page, devOnlyPassword);
     await selectDeriveTypeViaUI(page, {
       ...settings,
       deriveType: currentSelection.deriveType,
@@ -1712,7 +1932,9 @@ async function runRapidSelectionBursts(page, fixture) {
     networkId: networkTargets[networkTargets.length - 1],
   });
 
-  await selectNetwork(page, 'btc--0');
+  // A human-length press, issued right after the list opens, is the shape that
+  // exposes rows whose DOM identity is destroyed by a re-render mid-press.
+  await selectNetwork(page, 'btc--0', { pressHoldMs: 100 });
   const deriveBurst = await page.evaluate(async () => {
     const api = globalThis.$$appGlobals.$backgroundApiProxy;
     const selected = await api.simpleDb.accountSelector.getSelectedAccount({
@@ -1844,7 +2066,7 @@ async function assertPerpsAccountConsumer(page, devOnlyPassword, target) {
 async function runPerpsAccountSyncScenario(page, devOnlyPassword, fixture) {
   const initialSelection = await readPersistedSelection(page);
   const initialTarget = findFixtureTarget(fixture, initialSelection);
-  await drainPerfTrace(page, devOnlyPassword);
+  await drainResidualPerfTrace(page, devOnlyPassword);
   await switchAppTab(page, 'Perp');
   await assertAccountSelectorStateConsistent(page, initialTarget, {
     assertUI: false,
@@ -1870,7 +2092,7 @@ async function runPerpsAccountSyncScenario(page, devOnlyPassword, fixture) {
 
   await switchDesktopSidebarTab(page, 'Wallet', 'Home');
   await waitForHomeShell(page);
-  await drainPerfTrace(page, devOnlyPassword);
+  await drainResidualPerfTrace(page, devOnlyPassword);
   await selectWalletAccount(page, target);
   const selectionTrace = await collectSelectionOperationTrace(
     page,
@@ -2164,7 +2386,16 @@ function assertDAppAccountSelectorInitializationRefreshBudget(trace) {
   );
   assert.ok(
     effectsHostCommits.length <= 5,
-    `DApp AccountSelectorEffects host committed ${effectsHostCommits.length} times during initialization (limit 5)`,
+    `DApp AccountSelectorEffects host committed ${
+      effectsHostCommits.length
+    } times during initialization (limit 5): ${JSON.stringify(
+      effectsStateObservations.map((event) => ({
+        changedChannels: event.changedChannels,
+        observationCount: event.observationCount,
+        selectionReason: event.selectionReason,
+        selectionTransitionId: event.selectionTransitionId,
+      })),
+    )}`,
   );
   assert.ok(
     effectsStateObservations.length <= 4,
@@ -2241,6 +2472,58 @@ function describeBudgetEvents(events) {
       transitionId: event.transitionId,
       trigger: event.trigger,
     })),
+  );
+}
+
+// The saveToStorage outcomes where the call did NOT take responsibility for
+// persisting this selection, so counting them would misreport how many times a
+// selection was persisted. Everything else concluded: it wrote (persisted), ran
+// the sequence for a scene that cannot persist (processed-nonpersistent), or
+// determined there was nothing to write (skip-no-identity,
+// skip-default-selection, skip-incompatible).
+//   noop-already-saved — the record was already on disk, written by another
+//     call. confirmAccountSelect awaits its own save so it can only close the
+//     selector once the record is on disk, so a selection the selection-effect
+//     already wrote legitimately lands here.
+//   skip-not-ready     — storage was not ready yet.
+//   stale-*            — a newer selection superseded this one mid-flight.
+const storageNonPersistOutcomes = new Set([
+  'noop-already-saved',
+  'skip-not-ready',
+  'stale-after-fix',
+  'stale-after-write',
+  'stale-before-fix',
+  'stale-before-read',
+  'stale-before-write',
+]);
+
+// A duplicated persist is only readable next to the coalescing decisions that
+// were supposed to prevent it, so the storage assertion carries the whole
+// selectionStorage timeline for the transitions it counted.
+function describeStorageTimeline(events, transitionIds, num) {
+  return JSON.stringify(
+    events
+      .filter(
+        (event) =>
+          typeof event.event === 'string' &&
+          event.event.startsWith('selectionStorage') &&
+          event.num === num &&
+          (transitionIds.has(event.transitionId) ||
+            event.event === 'selectionStorageCoalesced' ||
+            event.event === 'selectionStorageSkipped'),
+      )
+      .map((event) => ({
+        event: event.event,
+        operationId: event.operationId,
+        originalTrigger: event.originalTrigger,
+        outcome: event.outcome,
+        primaryPersisted: event.primaryPersisted,
+        reason: event.reason,
+        revision: event.revision,
+        sceneName: event.sceneName,
+        transitionId: event.transitionId,
+        trigger: event.trigger,
+      })),
   );
 }
 
@@ -2353,11 +2636,6 @@ function assertSelectionOperationBudget(
     committedScheduleIds.size,
     `${label} must expose each committed active account result to Effects once: ${describeBudgetEvents(activeObservations)}`,
   );
-  assert.equal(
-    storageRequests.length,
-    expectedSelectionUpdates,
-    `${label} must persist each selection update once: ${describeBudgetEvents(storageRequests)}`,
-  );
   const storageOperationIds = new Set(
     storageRequests.map((event) => event.operationId),
   );
@@ -2370,6 +2648,23 @@ function assertSelectionOperationBudget(
     storageResults.length,
     storageRequests.length,
     `${label} must complete each causally related storage request once`,
+  );
+  // Count the saves that took responsibility for persisting this selection, not
+  // the calls that entered saveToStorage. A genuine double write still fails;
+  // a read-back that finds the record already on disk no longer does.
+  const storagePersists = storageResults.filter(
+    (event) => !storageNonPersistOutcomes.has(event.outcome),
+  );
+  assert.equal(
+    storagePersists.length,
+    expectedSelectionUpdates,
+    `${label} must persist each selection update once: ${describeBudgetEvents(
+      storagePersists,
+    )} | timeline: ${describeStorageTimeline(
+      trace.events,
+      rawTransitionIds,
+      num,
+    )}`,
   );
   const longLivedMirrorCommits = trace.events.filter(
     (event) =>
@@ -2963,7 +3258,7 @@ async function runMultiOriginDAppScenario(page, devOnlyPassword, fixture) {
     },
   );
 
-  await drainPerfTrace(page, devOnlyPassword);
+  await drainResidualPerfTrace(page, devOnlyPassword);
   const connectionList = await openDAppConnectionList(page);
   const connectionItems = connectionList.locator(
     visibleTestIDSelector(DAppConnectionTestIDs.ConnectionListItem),
@@ -3071,7 +3366,7 @@ async function runMultiOriginDAppScenario(page, devOnlyPassword, fixture) {
     },
     { origin: simulatedDAppSecondaryOrigin },
   );
-  await drainPerfTrace(page, devOnlyPassword);
+  await drainResidualPerfTrace(page, devOnlyPassword);
   await secondaryAccountCards
     .nth(1)
     .locator(visibleTestIDSelector(AccountSelectorTestIDs.dappAccountName))
@@ -3224,7 +3519,7 @@ async function runSimulatedDAppScenario(page, devOnlyPassword, fixture) {
     devOnlyPassword,
     { expectedSelection: target },
   );
-  await drainPerfTrace(page, devOnlyPassword);
+  await drainResidualPerfTrace(page, devOnlyPassword);
   await openSimulatedDAppAccountSelector(page);
 
   const initializationTrace = await collectPerfTraceUntil(
@@ -3513,7 +3808,7 @@ async function runSendAddressInputScenario(page, devOnlyPassword, fixture) {
   await selectWalletAccount(page, senderTarget);
   await selectNetwork(page, 'evm--1');
   await assertAccountSelectorStateConsistent(page, senderTarget);
-  await drainPerfTrace(page, devOnlyPassword);
+  await drainResidualPerfTrace(page, devOnlyPassword);
   await openSendAddressInput(page, senderTarget);
   const initializationTrace = await drainPerfTrace(page, devOnlyPassword);
   assertTraceHealth({
@@ -3592,7 +3887,7 @@ async function runBulkSendAccountRemovalScenario(
   await selectWalletAccount(page, removedTarget);
   await selectNetwork(page, 'evm--1');
   await assertAccountSelectorStateConsistent(page, removedTarget);
-  await drainPerfTrace(page, devOnlyPassword);
+  await drainResidualPerfTrace(page, devOnlyPassword);
   await openBulkSendAddressInput(page, removedTarget);
   const initialTrace = await drainPerfTrace(page, devOnlyPassword);
   assertTraceHealth({
@@ -3621,7 +3916,7 @@ async function runBulkSendAccountRemovalScenario(
     );
   }
 
-  await drainPerfTrace(page, devOnlyPassword);
+  await drainResidualPerfTrace(page, devOnlyPassword);
   const selectorButton = await getUniqueVisibleByTestID(
     page,
     AddressInputTestIDs.accountSelectorButton,
@@ -3664,7 +3959,7 @@ async function runBulkSendAccountRemovalScenario(
     sceneName: 'addressInput',
   });
 
-  await drainPerfTrace(page, devOnlyPassword);
+  await drainResidualPerfTrace(page, devOnlyPassword);
   await page.evaluate(
     async ({ indexedAccountId }) => {
       const serviceAccount =
@@ -3881,7 +4176,7 @@ async function runStressInteractions(page, fixture, devOnlyPassword) {
   for (let index = 0; index < iterations; index += 1) {
     const target = targets[index % targets.length];
     const previousAccount = await readPersistedSelection(page);
-    await drainPerfTrace(page, devOnlyPassword);
+    await drainResidualPerfTrace(page, devOnlyPassword);
     await selectWalletAccount(page, target);
     await assertAccountSelectorStateConsistent(page, target);
     const accountChanged =
@@ -3909,7 +4204,7 @@ async function runStressInteractions(page, fixture, devOnlyPassword) {
       reason: 'userSelectWallet',
     });
     traces.push(accountTrace);
-    await drainPerfTrace(page, devOnlyPassword);
+    await drainResidualPerfTrace(page, devOnlyPassword);
     await selectWalletAccount(page, target);
     await assertAccountSelectorStateConsistent(page, target);
     const noOpAccountTrace = await collectSelectionOperationTrace(
@@ -3947,7 +4242,7 @@ async function runStressInteractions(page, fixture, devOnlyPassword) {
     );
     const networkId = expectedNetworks[index % expectedNetworks.length];
     const previousNetwork = await readPersistedSelection(page);
-    await drainPerfTrace(page, devOnlyPassword);
+    await drainResidualPerfTrace(page, devOnlyPassword);
     await selectNetwork(page, networkId);
     await assertAccountSelectorStateConsistent(page, target);
     const networkChanged = previousNetwork?.networkId !== networkId;
@@ -3966,7 +4261,7 @@ async function runStressInteractions(page, fixture, devOnlyPassword) {
       reason: 'userSelectNetwork',
     });
     traces.push(networkTrace);
-    await drainPerfTrace(page, devOnlyPassword);
+    await drainResidualPerfTrace(page, devOnlyPassword);
     await selectNetwork(page, networkId);
     await assertAccountSelectorStateConsistent(page, target);
     const noOpNetworkTrace = await collectSelectionOperationTrace(
@@ -4028,6 +4323,9 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     0,
     `cycle#${cycle}: a new E2E context must start without tabs`,
   );
+  if (stubWalletTokenApi) {
+    await routeWalletTokenStub(context);
+  }
   if (stubHyperliquidApi) {
     await routeHyperliquidStub(context);
   }
@@ -4070,7 +4368,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     });
     await waitForAppReady(page);
     await configurePerfTrace(page, devOnlyPassword);
-    await drainPerfTrace(page, devOnlyPassword);
+    await drainResidualPerfTrace(page, devOnlyPassword);
 
     log(`cycle#${cycle}: create isolated HD wallet fixture`);
     const fixture = await createFixture(page, devOnlyPassword);
@@ -4091,6 +4389,8 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     });
     await waitForAppReady(page);
     await waitForHomeShell(page);
+    // The reload replaced the runtime that produced them, and its ids restart.
+    takeResidualTrace();
     const initTrace = await collectPerfTraceUntil(
       page,
       devOnlyPassword,
@@ -4125,6 +4425,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     await waitForAppReady(page);
     await waitForHomeShell(page);
     await configurePerfTrace(page, devOnlyPassword);
+    const preReloadResidualTrace = takeResidualTrace();
     const perpsResetTrace = await collectPerfTraceUntil(
       page,
       devOnlyPassword,
@@ -4165,7 +4466,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       devOnlyPassword,
     );
     log(`cycle#${cycle}: run latest-wins account/network/derive bursts`);
-    await drainPerfTrace(page, devOnlyPassword);
+    await drainResidualPerfTrace(page, devOnlyPassword);
     await runRapidSelectionBursts(page, fixture);
     await page.waitForTimeout(1000);
     const burstTrace = await drainPerfTrace(page, devOnlyPassword);
@@ -4237,10 +4538,16 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       'Wallet removal must complete wallet-update auto-selection',
     );
 
+    assert.equal(
+      preReloadResidualTrace.droppedCount,
+      0,
+      'pre-reload residual: trace buffer dropped events',
+    );
     const preReloadEvents = [
       ...initTrace.events,
       ...sendAddressInputTrace.events,
       ...perpsTrace.events,
+      ...preReloadResidualTrace.events,
     ];
     assertTraceRequestResultPairs(preReloadEvents);
     assertStaleReloadPostProcessPairs(preReloadEvents);
@@ -4256,7 +4563,13 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       'A pre-reload active reload must not commit twice in the same consumer',
     );
 
-    const allEvents = [
+    const residualTrace = takeResidualTrace();
+    assert.equal(
+      residualTrace.droppedCount,
+      0,
+      'residual: trace buffer dropped events',
+    );
+    const collectedEvents = [
       ...perpsResetTrace.events,
       ...multiNumResult.trace.events,
       ...dappTrace.events,
@@ -4264,7 +4577,14 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       ...stressTrace.events,
       ...bulkSendRemovalTrace.events,
       ...autoSelectTrace.events,
+      ...residualTrace.events,
     ];
+    const settleTrace = await drainUntilRequestsSettled(
+      page,
+      devOnlyPassword,
+      collectedEvents,
+    );
+    const allEvents = [...collectedEvents, ...settleTrace.events];
     assertTraceRequestResultPairs(allEvents);
     assertStaleReloadPostProcessPairs(allEvents);
     // A run of stale drops with no commit in between means a caller kept losing
@@ -4346,6 +4666,13 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       cdpExceptions,
       [],
       'CDP Runtime emitted uncaught exceptions',
+    );
+    log(
+      `cycle#${cycle}: stubbed wallet token requests: ${
+        seenWalletTokenRequests.size
+          ? [...seenWalletTokenRequests].toSorted().join(', ')
+          : 'none'
+      }`,
     );
     log(
       `cycle#${cycle}: stubbed Hyperliquid actions: ${

@@ -74,6 +74,8 @@ export class AccountSelectorStaleDropScene extends BaseScene {
 
   @LogToLocal({ level: 'warn' })
   public storageSideEffectDropped({
+    eventEmitDisabled,
+    eventEmitted,
     num,
     outcome,
     primaryPersisted,
@@ -82,8 +84,17 @@ export class AccountSelectorStaleDropScene extends BaseScene {
     suppressedSinceLastLog,
     syncedHome,
   }: {
+    // The selection was disabled from emitting by its caller, so a missing
+    // event here is intended rather than lost.
+    eventEmitDisabled: boolean | undefined;
+    // The consequence that matters. The record on disk is taken over by the
+    // newer save, but a change event that never fired leaves dapp and swap
+    // consumers on the previous account with nothing to correct them.
+    eventEmitted: boolean;
     num: number;
     outcome: string;
+    // Whether this attempt had already written the primary record before it
+    // aborted — tells a partial write apart from one that never started.
     primaryPersisted: boolean;
     reason: string | undefined;
     sceneName: string | undefined;
@@ -94,6 +105,8 @@ export class AccountSelectorStaleDropScene extends BaseScene {
     return [
       'accountSelector storage side effect dropped as stale',
       {
+        eventEmitDisabled,
+        eventEmitted,
         num,
         outcome,
         primaryPersisted,

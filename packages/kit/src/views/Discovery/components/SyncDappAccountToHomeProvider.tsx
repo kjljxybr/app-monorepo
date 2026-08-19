@@ -57,6 +57,7 @@ export function useSyncDappAccountToHomeAccount() {
                 indexedAccount: undefined,
                 othersWalletAccount: account,
                 autoChangeToAccountMatchedNetworkId: networkId,
+                entry: 'syncDappAccountToHome:othersWallet',
               })
               .catch((error: unknown) => {
                 defaultLogger.app.error.log(
@@ -83,6 +84,7 @@ export function useSyncDappAccountToHomeAccount() {
                 indexedAccount,
                 othersWalletAccount: undefined,
                 autoChangeToAccountMatchedNetworkId: undefined,
+                entry: 'syncDappAccountToHome:indexedAccount',
                 forceSelectToNetworkId: networkId,
               })
               .catch((error: unknown) => {
