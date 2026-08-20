@@ -16,10 +16,16 @@ import {
 } from '../../../states/jotai/contexts/accountSelector';
 import { useAccountSelectorActions } from '../../../states/jotai/contexts/accountSelector/actions';
 import {
+  EAutoSelectDeriveTypeOutcome,
+  ESelectionUpdateOutcome,
+} from '../../../states/jotai/contexts/accountSelector/outcomes';
+import {
   getAccountSelectorPerfTimestamp,
   getNextAccountSelectorPerfOperationId,
   isAccountSelectorPerfDebugEnabled,
 } from '../../../states/jotai/contexts/accountSelector/perfDebug';
+
+import type { IAutoSelectDeriveTypeOutcome } from '../../../states/jotai/contexts/accountSelector/outcomes';
 
 export function useAutoSelectDeriveType({ num }: { num: number }) {
   const {
@@ -51,7 +57,10 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
       const stageMs: Record<string, number> = {};
       let phase = 'sync-global';
       let resultLogged = false;
-      const logResult = (outcome: string, transitionId?: number) => {
+      const logResult = (
+        outcome: IAutoSelectDeriveTypeOutcome,
+        transitionId?: number,
+      ) => {
         if (!perfEnabled || resultLogged) {
           return;
         }
@@ -94,7 +103,7 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
           );
         }
         if (cancelled) {
-          logResult('cancelled');
+          logResult(EAutoSelectDeriveTypeOutcome.Cancelled);
           return;
         }
         if (globalSyncResult.globalDeriveType) {
@@ -102,7 +111,10 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
           const currentDeriveType = actions.current.getSelectedAccount({
             num,
           }).deriveType;
-          if (globalOutcome !== 'stale' || currentDeriveType) {
+          if (
+            globalOutcome !== ESelectionUpdateOutcome.Stale ||
+            currentDeriveType
+          ) {
             logResult(
               `global-${globalOutcome || 'resolved'}`,
               globalSyncResult.selectionResult?.transitionId,
@@ -115,12 +127,12 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
           // newer derive type is left alone by the check above.
         }
         if (deriveInfo) {
-          logResult('skip-existing-derive');
+          logResult(EAutoSelectDeriveTypeOutcome.SkipExistingDerive);
           return;
         }
         const expectedSelection = actions.current.getSelectedAccount({ num });
         if (expectedSelection.networkId !== networkId) {
-          logResult('stale-network');
+          logResult(EAutoSelectDeriveTypeOutcome.StaleNetwork);
           return;
         }
         phase = 'get-derive-options';
@@ -135,7 +147,7 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
           );
         }
         if (!deriveInfoItems.length) {
-          logResult('no-derive-options');
+          logResult(EAutoSelectDeriveTypeOutcome.NoDeriveOptions);
           return;
         }
         phase = 'resolve-fallback';
@@ -156,7 +168,7 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
           (deriveInfoItems[0]?.value as IAccountDeriveTypes) ||
           'default';
         if (cancelled) {
-          logResult('cancelled');
+          logResult(EAutoSelectDeriveTypeOutcome.Cancelled);
           return;
         }
         phase = 'update-selection';
@@ -173,7 +185,11 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
           });
         logResult(selectionResult.outcome, selectionResult.transitionId);
       } catch (error) {
-        logResult(cancelled ? 'cancelled' : 'error');
+        logResult(
+          cancelled
+            ? EAutoSelectDeriveTypeOutcome.Cancelled
+            : EAutoSelectDeriveTypeOutcome.Error,
+        );
         if (!cancelled) {
           // logResult is perf-debug gated, so in production a failure here
           // leaves no trace while the account keeps no derive type until the

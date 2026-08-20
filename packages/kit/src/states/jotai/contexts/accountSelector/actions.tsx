@@ -107,6 +107,22 @@ import {
   selectedAccountsAtom,
 } from './atoms';
 import {
+  EAccountSelectOutcome,
+  EActiveReloadOutcome,
+  EAutoDeriveSyncOutcome,
+  EAutoSelectOutcome,
+  EBuildActiveAccountOutcome,
+  ECrossSceneSyncOutcome,
+  ESceneSyncOutcome,
+  ESelectionStaleGuard,
+  ESelectionUpdateOutcome,
+  EStorageInitOutcomeBase,
+  EStorageInitPhase,
+  EStorageSaveOutcome,
+  EUnavailableSelectionStorageOutcome,
+  EWalletDeprecatedStatusUpdateOutcome,
+} from './outcomes';
+import {
   buildActiveAccountPerfSummary,
   getAccountSelectorPerfTimestamp,
   getNextAccountSelectorPerfOperationId,
@@ -130,6 +146,12 @@ import type {
   IAccountSelectorUpdateMeta,
   ISelectedAccountsAtomMap,
 } from './atoms';
+import type {
+  IAutoDeriveSyncOutcome,
+  IAutoSelectOutcome,
+  ICrossSceneSyncOutcome,
+  IStorageInitOutcome,
+} from './outcomes';
 
 const { serviceAccount } = backgroundApiProxy;
 
@@ -201,26 +223,14 @@ type ISelectionWriteRevisionPolicy = 'bumped' | 'untracked';
 // timestamps: the values differ on every drop, which would defeat the log
 // transport's identical-message collapsing, and the useful signal is only
 // whether the revision moved or the selection itself changed.
-type ISelectionStaleGuard = 'revision' | 'selection' | 'commit-guard';
-
-type ISelectionUpdateOutcome = 'commit' | 'noop' | 'skip-empty' | 'stale';
-
 type ISelectionUpdateResult = {
-  outcome: ISelectionUpdateOutcome;
+  outcome: ESelectionUpdateOutcome;
   transitionId?: number;
 };
 
-type IActiveAccountReloadOutcome =
-  | 'commit'
-  | 'noop'
-  | 'skip-incomplete'
-  | 'stale-after-build'
-  | 'stale-before-build'
-  | 'stale-schedule-before-build';
-
 type IActiveAccountReloadResult = {
   activeAccount: IAccountSelectorActiveAccountInfo;
-  outcome: IActiveAccountReloadOutcome;
+  outcome: EActiveReloadOutcome;
 };
 
 const getNextSelectionUpdatedAt = ({
@@ -988,7 +998,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               coalescedTriggers: perfContext?.coalescedTriggers,
               effectInstanceId: perfContext?.effectInstanceId,
               num,
-              outcome: 'stale-schedule-before-build',
+              outcome: EActiveReloadOutcome.StaleScheduleBeforeBuild,
               reason: traceReason,
               reloadId,
               scheduleId: perfContext?.scheduleId,
@@ -999,7 +1009,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           }
           return {
             activeAccount: currentActiveAccount,
-            outcome: 'stale-schedule-before-build',
+            outcome: EActiveReloadOutcome.StaleScheduleBeforeBuild,
           };
         }
         const selectedAccountBeforeBuild =
@@ -1019,7 +1029,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               coalescedTriggers: perfContext?.coalescedTriggers,
               effectInstanceId: perfContext?.effectInstanceId,
               num,
-              outcome: 'stale-before-build',
+              outcome: EActiveReloadOutcome.StaleBeforeBuild,
               reason: traceReason,
               reloadId,
               scheduleId: perfContext?.scheduleId,
@@ -1030,7 +1040,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           }
           return {
             activeAccount: currentActiveAccount,
-            outcome: 'stale-before-build',
+            outcome: EActiveReloadOutcome.StaleBeforeBuild,
           };
         }
         if (
@@ -1049,7 +1059,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               coalescedTriggers: perfContext?.coalescedTriggers,
               effectInstanceId: perfContext?.effectInstanceId,
               num,
-              outcome: 'skip-incomplete',
+              outcome: EActiveReloadOutcome.SkipIncomplete,
               reason: traceReason,
               reloadId,
               scheduleId: perfContext?.scheduleId,
@@ -1060,11 +1070,12 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           }
           return {
             activeAccount: currentActiveAccount,
-            outcome: 'skip-incomplete',
+            outcome: EActiveReloadOutcome.SkipIncomplete,
           };
         }
         let activeAccount: IAccountSelectorActiveAccountInfo | undefined;
-        let buildOutcome: 'error-fallback' | 'partial' | 'success' = 'success';
+        let buildOutcome: EBuildActiveAccountOutcome =
+          EBuildActiveAccountOutcome.Success;
         try {
           const bgRpcStartedAt = perfEnabled
             ? getAccountSelectorPerfTimestamp()
@@ -1088,7 +1099,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               : undefined;
           activeAccount = buildResult.activeAccount;
           if (perfTiming?.errorStages.length) {
-            buildOutcome = 'partial';
+            buildOutcome = EBuildActiveAccountOutcome.Partial;
           }
           if (perfEnabled && perfTiming) {
             const bgRpcMs = Math.round(
@@ -1108,7 +1119,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             });
           }
         } catch (error) {
-          buildOutcome = 'error-fallback';
+          buildOutcome = EBuildActiveAccountOutcome.ErrorFallback;
           // The fallback below is indistinguishable from a wallet with no
           // account: empty fields and ready:true, so the UI shows a finished
           // load rather than a failure. Without this entry a support report has
@@ -1177,7 +1188,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               coalescedTriggers: perfContext?.coalescedTriggers,
               effectInstanceId: perfContext?.effectInstanceId,
               num,
-              outcome: 'stale-after-build',
+              outcome: EActiveReloadOutcome.StaleAfterBuild,
               reason: traceReason,
               reloadId,
               scheduleId: perfContext?.scheduleId,
@@ -1188,7 +1199,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           }
           return {
             activeAccount: currentActiveAccount,
-            outcome: 'stale-after-build',
+            outcome: EActiveReloadOutcome.StaleAfterBuild,
           };
         }
         const latestActiveAccount =
@@ -1204,7 +1215,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               coalescedTriggers: perfContext?.coalescedTriggers,
               effectInstanceId: perfContext?.effectInstanceId,
               num,
-              outcome: 'noop',
+              outcome: EActiveReloadOutcome.Noop,
               reason: traceReason,
               reloadId,
               scheduleId: perfContext?.scheduleId,
@@ -1215,7 +1226,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           }
           return {
             activeAccount: latestActiveAccount,
-            outcome: 'noop',
+            outcome: EActiveReloadOutcome.Noop,
           };
         }
         const newActiveAccounts = {
@@ -1242,7 +1253,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             coalescedTriggers: perfContext?.coalescedTriggers,
             effectInstanceId: perfContext?.effectInstanceId,
             num,
-            outcome: 'commit',
+            outcome: EActiveReloadOutcome.Commit,
             reason: traceReason,
             reloadId,
             scheduleId: perfContext?.scheduleId,
@@ -1252,7 +1263,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           });
         }
         // contextAtom snapshot saving is now automatic via coldStartCache.
-        return { activeAccount, outcome: 'commit' };
+        return { activeAccount, outcome: EActiveReloadOutcome.Commit };
       });
     },
   );
@@ -1658,11 +1669,12 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       });
       if (perfEnabled) {
         const completedAt = getAccountSelectorPerfTimestamp();
-        let outcome = 'noop-already-saved';
+        let outcome: EUnavailableSelectionStorageOutcome =
+          EUnavailableSelectionStorageOutcome.NoopAlreadySaved;
         if (primaryPersisted || syncedHome) {
-          outcome = 'persisted';
+          outcome = EUnavailableSelectionStorageOutcome.Persisted;
         } else if (primaryWriteAttempted || homeWriteAttempted) {
-          outcome = 'processed-nonpersistent';
+          outcome = EUnavailableSelectionStorageOutcome.ProcessedNonpersistent;
         }
         defaultLogger.accountSelector.perf.trace(
           'unavailableSelectionStorageResult',
@@ -1904,9 +1916,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             selectedAccount,
             staleGuard,
           }: {
-            outcome: ISelectionUpdateOutcome;
+            outcome: ESelectionUpdateOutcome;
             selectedAccount: IAccountSelectorSelectedAccount;
-            staleGuard?: ISelectionStaleGuard;
+            staleGuard?: ESelectionStaleGuard;
           }): ISelectionUpdateResult => {
             const transitionMeta =
               getSelectedAccountPerfCommitMeta(selectedAccount);
@@ -1928,7 +1940,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                   sceneName: sceneInfo?.sceneName,
                   totalMs: Math.round(completedAt - requestedAt),
                   transitionId:
-                    outcome === 'commit'
+                    outcome === ESelectionUpdateOutcome.Commit
                       ? transitionMeta?.transitionId
                       : undefined,
                   workMs: Math.round(completedAt - startedAt),
@@ -1949,7 +1961,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             // the resetting outcomes instead would let a new outcome fall through
             // both branches and turn the counter into "stale drops since the last
             // commit", which trips the alert on unrelated drops spread over time.
-            if (outcome !== 'stale') {
+            if (outcome !== ESelectionUpdateOutcome.Stale) {
               this.consecutiveStaleDropCountMap.delete(staleCountKey);
             } else {
               const suppressedSinceLastLog = takeStaleDropLogSlot(
@@ -2025,7 +2037,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             return {
               outcome,
               transitionId:
-                outcome === 'commit' ? transitionMeta?.transitionId : undefined,
+                outcome === ESelectionUpdateOutcome.Commit
+                  ? transitionMeta?.transitionId
+                  : undefined,
             };
           };
           if (perfEnabled) {
@@ -2044,9 +2058,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               (expectedUpdatedAt ?? undefined)
           ) {
             return logSelectionUpdateResult({
-              outcome: 'stale',
+              outcome: ESelectionUpdateOutcome.Stale,
               selectedAccount: oldSelectedAccount,
-              staleGuard: 'revision',
+              staleGuard: ESelectionStaleGuard.Revision,
             });
           }
           if (
@@ -2054,9 +2068,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             !isSameSelectedAccount(oldSelectedAccount, expectedSelection)
           ) {
             return logSelectionUpdateResult({
-              outcome: 'stale',
+              outcome: ESelectionUpdateOutcome.Stale,
               selectedAccount: oldSelectedAccount,
-              staleGuard: 'selection',
+              staleGuard: ESelectionStaleGuard.Selection,
             });
           }
 
@@ -2085,14 +2099,14 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
 
           if (isSameSelectedAccount(oldSelectedAccount, newSelectedAccount)) {
             return logSelectionUpdateResult({
-              outcome: 'noop',
+              outcome: ESelectionUpdateOutcome.Noop,
               selectedAccount: oldSelectedAccount,
             });
           }
 
           if (isEmpty(newSelectedAccount)) {
             return logSelectionUpdateResult({
-              outcome: 'skip-empty',
+              outcome: ESelectionUpdateOutcome.SkipEmpty,
               selectedAccount: newSelectedAccount,
             });
           }
@@ -2200,14 +2214,14 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           }
           if (shouldCommit && !shouldCommit()) {
             return logSelectionUpdateResult({
-              outcome: 'stale',
+              outcome: ESelectionUpdateOutcome.Stale,
               selectedAccount: oldSelectedAccount,
-              staleGuard: 'commit-guard',
+              staleGuard: ESelectionStaleGuard.CommitGuard,
             });
           }
           if (isSameSelectedAccount(oldSelectedAccount, newSelectedAccount)) {
             return logSelectionUpdateResult({
-              outcome: 'noop',
+              outcome: ESelectionUpdateOutcome.Noop,
               selectedAccount: oldSelectedAccount,
             });
           }
@@ -2232,7 +2246,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             },
           }));
           return logSelectionUpdateResult({
-            outcome: 'commit',
+            outcome: ESelectionUpdateOutcome.Commit,
             selectedAccount: newSelectedAccount,
           });
         })
@@ -2241,7 +2255,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             defaultLogger.accountSelector.perf.trace('selectionUpdateResult', {
               attemptId,
               num: payload.num,
-              outcome: 'error',
+              outcome: ESelectionUpdateOutcome.Error,
               parentOperationId: payload.parentOperationId,
               reason: requestReason,
               totalMs: Math.round(
@@ -2400,7 +2414,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       let fallbackMs = 0;
       let fallbackOutcome: 'error' | 'not-needed' | 'success' = 'not-needed';
       let phase = 'validate-wallet';
-      let stateOutcome: ISelectionUpdateOutcome | undefined;
+      let stateOutcome: ESelectionUpdateOutcome | undefined;
       let transitionId: number | undefined;
       try {
         let wallet: IDBWallet | undefined;
@@ -2412,7 +2426,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               accountKind: indexedAccount ? 'indexed' : 'others',
               num,
               operationId: accountSelectOperationId,
-              outcome: 'wallet-check-error',
+              outcome: EAccountSelectOutcome.WalletCheckError,
               phase,
               reason,
               requestId: confirmRequestId,
@@ -2432,7 +2446,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               accountKind: indexedAccount ? 'indexed' : 'others',
               num,
               operationId: accountSelectOperationId,
-              outcome: 'unavailable-wallet',
+              outcome: EAccountSelectOutcome.UnavailableWallet,
               phase,
               reason,
               requestId: confirmRequestId,
@@ -2452,7 +2466,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               accountKind: indexedAccount ? 'indexed' : 'others',
               num,
               operationId: accountSelectOperationId,
-              outcome: 'stale',
+              outcome: EAccountSelectOutcome.Stale,
               phase,
               reason,
               requestId: confirmRequestId,
@@ -2530,7 +2544,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               fallbackMs,
               num,
               operationId: accountSelectOperationId,
-              outcome: 'stale',
+              outcome: EAccountSelectOutcome.Stale,
               reason,
               requestId: confirmRequestId,
               totalMs: Math.round(
@@ -2572,7 +2586,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               fallbackOutcome,
               num,
               operationId: accountSelectOperationId,
-              outcome: 'stale',
+              outcome: EAccountSelectOutcome.Stale,
               phase,
               reason,
               requestId: confirmRequestId,
@@ -2613,7 +2627,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               fallbackOutcome,
               num,
               operationId: accountSelectOperationId,
-              outcome: 'stale-after-commit',
+              outcome: EAccountSelectOutcome.StaleAfterCommit,
               phase: 'recent-cache',
               reason,
               requestId: confirmRequestId,
@@ -2703,7 +2717,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             fallbackOutcome,
             num,
             operationId: accountSelectOperationId,
-            outcome: 'error',
+            outcome: EAccountSelectOutcome.Error,
             phase,
             reason,
             requestId: confirmRequestId,
@@ -3615,7 +3629,10 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       } catch {
         defaultLogger.accountSelector.perf.trace(
           'walletDeprecatedStatusUpdateResult',
-          { outcome: 'error', walletType: 'onekey-hardware' },
+          {
+            outcome: EWalletDeprecatedStatusUpdateOutcome.Error,
+            walletType: 'onekey-hardware',
+          },
         );
       }
     },
@@ -3673,7 +3690,10 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       } catch {
         defaultLogger.accountSelector.perf.trace(
           'walletDeprecatedStatusUpdateResult',
-          { outcome: 'error', walletType: 'trezor' },
+          {
+            outcome: EWalletDeprecatedStatusUpdateOutcome.Error,
+            walletType: 'trezor',
+          },
         );
       }
     },
@@ -3797,7 +3817,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             outcome,
             transitionId,
           }: {
-            outcome: string;
+            outcome: ICrossSceneSyncOutcome;
             transitionId?: number;
           }) => {
             if (!perfEnabled) {
@@ -3834,8 +3854,10 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               scene2: eventPayload,
             })
           ) {
-            logCrossSceneResult({ outcome: 'skip-same-scene' });
-            return { outcome: 'skip-same-scene' };
+            logCrossSceneResult({
+              outcome: ECrossSceneSyncOutcome.SkipSameScene,
+            });
+            return { outcome: ECrossSceneSyncOutcome.SkipSameScene };
           }
 
           phase = 'sync-policy';
@@ -3850,8 +3872,8 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             });
 
           if (!shouldSync) {
-            logCrossSceneResult({ outcome: 'skip-policy' });
-            return { outcome: 'skip-policy' };
+            logCrossSceneResult({ outcome: ECrossSceneSyncOutcome.SkipPolicy });
+            return { outcome: ECrossSceneSyncOutcome.SkipPolicy };
           }
           if (shouldSync) {
             // Drop stale cross-scene sync events: a slow swap<->home event must
@@ -3864,8 +3886,10 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               currentUpdatedAt &&
               currentUpdatedAt > eventPayloadUpdatedAt
             ) {
-              logCrossSceneResult({ outcome: 'stale-before-fix' });
-              return { outcome: 'stale-before-fix' };
+              logCrossSceneResult({
+                outcome: ECrossSceneSyncOutcome.StaleBeforeFix,
+              });
+              return { outcome: ECrossSceneSyncOutcome.StaleBeforeFix };
             }
             const current = this.getSelectedAccount.call(set, { num });
             let newSelectedAccount =
@@ -3900,15 +3924,15 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             });
             return selectionResult;
           }
-          logCrossSceneResult({ outcome: 'skip-policy' });
-          return { outcome: 'skip-policy' };
+          logCrossSceneResult({ outcome: ECrossSceneSyncOutcome.SkipPolicy });
+          return { outcome: ECrossSceneSyncOutcome.SkipPolicy };
         })
         .catch((error: unknown) => {
           if (perfEnabled) {
             defaultLogger.accountSelector.perf.trace('crossSceneSyncResult', {
               num: params.num,
               operationId,
-              outcome: 'error',
+              outcome: ECrossSceneSyncOutcome.Error,
               phase,
               sourceNum: params.eventPayload.num,
               sourceOperationId: params.eventPayload.sourceOperationId,
@@ -3970,7 +3994,10 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         : undefined;
       let phase = 'mutex-wait';
       let startedAt: number | undefined;
-      const logResult = (outcome: string, transitionId?: number) => {
+      const logResult = (
+        outcome: IAutoDeriveSyncOutcome,
+        transitionId?: number,
+      ) => {
         if (!perfEnabled) {
           return;
         }
@@ -4021,15 +4048,15 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               },
             );
           if (!globalDeriveType) {
-            logResult('no-global-derive');
+            logResult(EAutoDeriveSyncOutcome.NoGlobalDerive);
             return { globalDeriveType: undefined, selectionResult: undefined };
           }
           if (selectedAccount.deriveType === globalDeriveType) {
             const selectionResult: ISelectionUpdateResult = {
-              outcome: 'noop',
+              outcome: ESelectionUpdateOutcome.Noop,
             };
             phase = 'skip-already-selected';
-            logResult('noop-already-selected');
+            logResult(EAutoDeriveSyncOutcome.NoopAlreadySelected);
             return { globalDeriveType, selectionResult };
           }
           phase = 'update-selection';
@@ -4049,7 +4076,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           return { globalDeriveType, selectionResult };
         })
         .catch((error: unknown) => {
-          logResult('error');
+          logResult(EAutoDeriveSyncOutcome.Error);
           throw error;
         });
     },
@@ -4089,13 +4116,13 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         ? Object.keys(initialSelectedAccountsMap).length
         : 0;
       const stageMs: Record<string, number> = {};
-      let phase = 'read-primary';
+      let phase: EStorageInitPhase = EStorageInitPhase.ReadPrimary;
       let phaseStartedAt = requestedAt;
       let resultLogged = false;
       let storageApplied = false;
       let storageSelectionCount: number | undefined;
       let recentSelectionCount: number | undefined;
-      const startPhase = (nextPhase: string) => {
+      const startPhase = (nextPhase: EStorageInitPhase) => {
         if (perfEnabled) {
           const now = getAccountSelectorPerfTimestamp();
           stageMs[phase] = Math.round(now - phaseStartedAt);
@@ -4103,7 +4130,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         }
         phase = nextPhase;
       };
-      const logResult = (outcome: string) => {
+      const logResult = (outcome: IStorageInitOutcome) => {
         if (!perfEnabled || resultLogged) {
           return;
         }
@@ -4192,7 +4219,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
 
         // fix discover account from dappConnection
         if (sceneUrl && sceneName === EAccountSelectorSceneName.discover) {
-          startPhase('discover-connection');
+          startPhase(EStorageInitPhase.DiscoverConnection);
           const connectionMap =
             await backgroundApiProxy.simpleDb.dappConnection.getAccountSelectorMap(
               {
@@ -4235,7 +4262,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
 
         // fix swap account from home
         if (sceneName === EAccountSelectorSceneName.swap) {
-          startPhase('swap-merge');
+          startPhase(EStorageInitPhase.SwapMerge);
           selectedAccountsMapInDB =
             await serviceAccountSelector.mergeHomeDataToSwapMap({
               swapMap: selectedAccountsMapInDB,
@@ -4247,7 +4274,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
 
         // fix derive type from global
         if (selectedAccountsMapInDB) {
-          startPhase('normalize-storage');
+          startPhase(EStorageInitPhase.NormalizeStorage);
           selectedAccountsMapInDB =
             await backgroundApiProxy.serviceAccountSelector.fixDeriveTypesForInitAccountSelectorMap(
               {
@@ -4298,7 +4325,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             sceneName,
             sceneUrl,
           });
-        startPhase('recent-selection');
+        startPhase(EStorageInitPhase.RecentSelection);
         let recentSelectionCacheSelectedAccountsMap:
           | IAccountSelectorSelectedAccountsMap
           | undefined;
@@ -4374,11 +4401,11 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               }
             },
           );
-          logResult('restored-recent-cache');
+          logResult(EStorageInitOutcomeBase.RestoredRecentCache);
           return;
         }
 
-        startPhase('current-selection');
+        startPhase(EStorageInitPhase.CurrentSelection);
         const currentSelectedAccountsMap = get(selectedAccountsAtom());
         const repairedSelectedAccountsMap =
           await this.repairOthersWalletNetworkPairsInSelectedAccountsMap({
@@ -4428,11 +4455,11 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           }
           set(accountSelectorStorageReadyAtom(), () => true);
           set(accountSelectorStorageInitDoneAtom(), () => true);
-          logResult('kept-current-selection');
+          logResult(EStorageInitOutcomeBase.KeptCurrentSelection);
           return;
         }
 
-        startPhase('apply-storage');
+        startPhase(EStorageInitPhase.ApplyStorage);
         if (
           selectedAccountsMapInDB &&
           !isSameSelectedAccountsMap(
@@ -4459,11 +4486,12 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         }
         set(accountSelectorStorageReadyAtom(), () => true);
         set(accountSelectorStorageInitDoneAtom(), () => true);
-        let outcome = 'ready-no-storage';
+        let outcome: IStorageInitOutcome =
+          EStorageInitOutcomeBase.ReadyNoStorage;
         if (storageApplied) {
-          outcome = 'restored-storage';
+          outcome = EStorageInitOutcomeBase.RestoredStorage;
         } else if (selectedAccountsMapInDB) {
-          outcome = 'storage-already-current';
+          outcome = EStorageInitOutcomeBase.StorageAlreadyCurrent;
         }
         logResult(outcome);
       } catch (error) {
@@ -4471,7 +4499,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           logResult(`stale-${phase}`);
           return;
         }
-        logResult('error-finalized');
+        logResult(EStorageInitOutcomeBase.ErrorFinalized);
         defaultLogger.app.error.log(
           `initFromStorage failed: ${
             (error as Error)?.message || String(error)
@@ -4492,7 +4520,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             });
             return next;
           });
-          logResult('ready-finalized');
+          logResult(EStorageInitOutcomeBase.ReadyFinalized);
         } else {
           logResult(`stale-${phase}`);
         }
@@ -4560,7 +4588,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             {
               num: payload.num,
               originalTrigger: completedRevision.trigger,
-              outcome: 'skip-completed-revision',
+              outcome: EStorageSaveOutcome.SkipCompletedRevision,
               sceneName: payload.sceneName,
               trigger: payload.trigger || 'unspecified',
             },
@@ -4579,7 +4607,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               num: payload.num,
               operationId: existingInflight.operationId,
               originalTrigger: existingInflight.trigger,
-              outcome: 'join-inflight',
+              outcome: EStorageSaveOutcome.JoinInflight,
               sceneName: payload.sceneName,
               trigger: payload.trigger || 'unspecified',
             },
@@ -4634,7 +4662,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             }: {
               eventEmitted?: boolean;
               eventEmitDisabled?: boolean;
-              outcome: string;
+              outcome: EStorageSaveOutcome;
               syncedHome?: boolean;
             }) => {
               if (STORAGE_SIDE_EFFECT_STALE_OUTCOMES.has(outcome)) {
@@ -4703,7 +4731,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             };
             const isReady = get(accountSelectorStorageReadyAtom());
             if (!isReady) {
-              logStorageResult({ outcome: 'skip-not-ready' });
+              logStorageResult({ outcome: EStorageSaveOutcome.SkipNotReady });
               return;
             }
             if (sceneName === EAccountSelectorSceneName.homeUrlAccount) {
@@ -4719,7 +4747,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             if (
               isSameSelectedAccount(selectedAccount, defaultSelectedAccount())
             ) {
-              logStorageResult({ outcome: 'skip-default-selection' });
+              logStorageResult({
+                outcome: EStorageSaveOutcome.SkipDefaultSelection,
+              });
               return;
             }
             // Identity-less selections (e.g. network-only cold-start snapshots)
@@ -4733,13 +4763,13 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 selectedAccount.othersWalletAccountId),
             );
             if (!hasAccountIdentityForStorage) {
-              logStorageResult({ outcome: 'skip-no-identity' });
+              logStorageResult({ outcome: EStorageSaveOutcome.SkipNoIdentity });
               return;
             }
             // Skip stale async saves: the in-memory selection may have moved on
             // while this payload was waiting on the mutex.
             if (!isPayloadStillCurrent()) {
-              logStorageResult({ outcome: 'stale-before-fix' });
+              logStorageResult({ outcome: EStorageSaveOutcome.StaleBeforeFix });
               return;
             }
             storagePhase = 'fix-selection';
@@ -4749,7 +4779,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 source: `saveToStorage:${sceneName}:${num}`,
               });
             if (!isPayloadStillCurrent()) {
-              logStorageResult({ outcome: 'stale-after-fix' });
+              logStorageResult({ outcome: EStorageSaveOutcome.StaleAfterFix });
               return;
             }
             // If the pair is still broken after the fix (e.g. the account row was
@@ -4760,11 +4790,15 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 selectedAccount,
               })
             ) {
-              logStorageResult({ outcome: 'skip-incompatible' });
+              logStorageResult({
+                outcome: EStorageSaveOutcome.SkipIncompatible,
+              });
               return;
             }
             if (!isPayloadStillCurrent()) {
-              logStorageResult({ outcome: 'stale-before-read' });
+              logStorageResult({
+                outcome: EStorageSaveOutcome.StaleBeforeRead,
+              });
               return;
             }
             const fixedPayload = {
@@ -4796,11 +4830,15 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               //   'AccountSelector.saveToStorage skip, selectedAccount not changed',
               // );
               storageRevisionHandled = true;
-              logStorageResult({ outcome: 'noop-already-saved' });
+              logStorageResult({
+                outcome: EStorageSaveOutcome.NoopAlreadySaved,
+              });
               return;
             }
             if (!isPayloadStillCurrent()) {
-              logStorageResult({ outcome: 'stale-before-write' });
+              logStorageResult({
+                outcome: EStorageSaveOutcome.StaleBeforeWrite,
+              });
               return;
             }
 
@@ -4815,7 +4853,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               primaryPersisted = Boolean(primarySaveResult?.persisted);
             }
             if (!isPayloadStillCurrent()) {
-              logStorageResult({ outcome: 'stale-after-write' });
+              logStorageResult({
+                outcome: EStorageSaveOutcome.StaleAfterWrite,
+              });
               return;
             }
 
@@ -4836,7 +4876,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             if (!isPayloadStillCurrent()) {
               logStorageResult({
                 eventEmitDisabled,
-                outcome: 'stale-after-global-derive',
+                outcome: EStorageSaveOutcome.StaleAfterGlobalDerive,
               });
               return;
             }
@@ -4879,7 +4919,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             if (!isPayloadStillCurrent()) {
               logStorageResult({
                 eventEmitDisabled,
-                outcome: 'stale-before-event',
+                outcome: EStorageSaveOutcome.StaleBeforeEvent,
                 syncedHome,
               });
               return;
@@ -4908,11 +4948,12 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             }
             this.saveToStoragePendingSideEffectMap.delete(sideEffectScopeKey);
             storageRevisionHandled = true;
-            let successOutcome = 'processed-nonpersistent';
+            let successOutcome: EStorageSaveOutcome =
+              EStorageSaveOutcome.ProcessedNonpersistent;
             if (primaryPersisted) {
-              successOutcome = 'persisted';
+              successOutcome = EStorageSaveOutcome.Persisted;
             } else if (shouldReplaySideEffects) {
-              successOutcome = 'replayed-side-effects';
+              successOutcome = EStorageSaveOutcome.ReplayedSideEffects;
             }
             logStorageResult({
               eventEmitted: !eventEmitDisabled,
@@ -4928,7 +4969,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 {
                   num: payload.num,
                   operationId,
-                  outcome: primaryPersisted ? 'partial' : 'error',
+                  outcome: primaryPersisted
+                    ? EStorageSaveOutcome.Partial
+                    : EStorageSaveOutcome.Error,
                   failedPhase: storagePhase,
                   primaryPersisted,
                   reason: transitionMeta?.reason,
@@ -5211,7 +5254,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             networkResolution: sceneSyncResolution.networkResolution,
             availableNetworksResolution,
             operationId,
-            outcome: 'error',
+            outcome: ESceneSyncOutcome.Error,
             sourceNum: from.sceneNum,
             sourceSceneName: from.sceneName,
             targetSceneName: resolvedTargetSceneName,
@@ -5430,7 +5473,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         outcome,
         transitionId,
       }: {
-        outcome: string;
+        outcome: IAutoSelectOutcome;
         transitionId?: number;
       }) => {
         if (!perfEnabled) {
@@ -5508,8 +5551,8 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             });
             logAutoSelectResult({
               outcome:
-                selectionResult.outcome === 'commit'
-                  ? 'cleared-removed-account'
+                selectionResult.outcome === ESelectionUpdateOutcome.Commit
+                  ? EAutoSelectOutcome.ClearedRemovedAccount
                   : selectionResult.outcome,
               transitionId: selectionResult.transitionId,
             });
@@ -5530,7 +5573,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             return selectionResult;
           }
         }
-        logAutoSelectResult({ outcome: 'skip-scene' });
+        logAutoSelectResult({ outcome: EAutoSelectOutcome.SkipScene });
         return;
       }
 
@@ -5570,7 +5613,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             activeAccount && activeAccount?.ready && storageReady,
           );
           if (!isActiveAccountReady) {
-            logAutoSelectResult({ outcome: 'skip-not-ready' });
+            logAutoSelectResult({ outcome: EAutoSelectOutcome.SkipNotReady });
             return;
           }
           defaultLogger.accountSelector.storage.autoSelectNextAccount({
@@ -5898,7 +5941,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               builder: () => selectedAccountNew,
             });
             if (selectionResult.outcome === 'stale') {
-              logAutoSelectResult({ outcome: 'stale-user-selection' });
+              logAutoSelectResult({
+                outcome: EAutoSelectOutcome.StaleUserSelection,
+              });
               return selectionResult;
             }
             await this.saveClearedSelectedAccountToStorage.call(set, {
@@ -5949,7 +5994,8 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             });
           }
           logAutoSelectResult({
-            outcome: selectionResult?.outcome || 'noop-not-needed',
+            outcome:
+              selectionResult?.outcome || EAutoSelectOutcome.NoopNotNeeded,
             transitionId: selectionResult?.transitionId,
           });
           return selectionResult;
@@ -5961,7 +6007,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               {
                 num,
                 operationId,
-                outcome: 'error',
+                outcome: EAutoSelectOutcome.Error,
                 phase,
                 sceneName,
                 source,

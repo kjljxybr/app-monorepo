@@ -12,6 +12,7 @@ import {
   useAccountSelectorAvailableNetworksByNum,
   useAccountSelectorSceneInfo,
 } from '../../../states/jotai/contexts/accountSelector';
+import { EAvailableNetworksOutcome } from '../../../states/jotai/contexts/accountSelector/outcomes';
 import {
   getAccountSelectorPerfTimestamp,
   getNextAccountSelectorPerfOperationId,
@@ -215,7 +216,7 @@ export function useAccountSelectorAvailableNetworks({
             networkCount: availableNetworksInfo.networkIds.length,
             num,
             operationId,
-            outcome: 'success',
+            outcome: EAvailableNetworksOutcome.Success,
             sceneName,
             source: 'configured',
             totalMs: Math.round(
@@ -238,7 +239,7 @@ export function useAccountSelectorAvailableNetworks({
             networkCount: result.networkIds.length,
             num,
             operationId,
-            outcome: 'success',
+            outcome: EAvailableNetworksOutcome.Success,
             sceneName,
             source: result.source,
             totalMs: Math.round(
@@ -254,7 +255,7 @@ export function useAccountSelectorAvailableNetworks({
             consumer,
             num,
             operationId,
-            outcome: 'error',
+            outcome: EAvailableNetworksOutcome.Error,
             sceneName,
             totalMs: Math.round(
               getAccountSelectorPerfTimestamp() - requestedAt,

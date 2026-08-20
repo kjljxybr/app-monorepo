@@ -39,6 +39,13 @@ import {
   takeActiveReloadRecoveryLogSlot,
 } from '../../states/jotai/contexts/accountSelector/activeReloadFailureLog';
 import {
+  EActiveReloadDispatchOutcome,
+  EActiveReloadOutcome,
+  EActiveReloadPostProcessOutcome,
+  EExternalActivateOutcome,
+  ESelectionStorageEffectOutcome,
+} from '../../states/jotai/contexts/accountSelector/outcomes';
+import {
   buildActiveAccountPerfSummary,
   buildSelectedAccountPerfSummary,
   getAccountSelectorPerfTimestamp,
@@ -294,7 +301,7 @@ function useExternalAccountActivate({
       : undefined;
     let cancelled = false;
     let resultLogged = false;
-    const logResult = (outcome: 'cancelled' | 'error' | 'synced') => {
+    const logResult = (outcome: EExternalActivateOutcome) => {
       if (!perfEnabled || resultLogged) {
         return;
       }
@@ -331,7 +338,7 @@ function useExternalAccountActivate({
           connectionInfo,
         });
         if (cancelled) {
-          logResult('cancelled');
+          logResult(EExternalActivateOutcome.Cancelled);
           return;
         }
         if (accountId && networkId) {
@@ -341,7 +348,7 @@ function useExternalAccountActivate({
           const activeNetworkMoved =
             activeAccountRef.current.network?.id !== networkId;
           if (cancelled || activeAccountMoved || activeNetworkMoved) {
-            logResult('cancelled');
+            logResult(EExternalActivateOutcome.Cancelled);
             // A cancelled effect re-runs with the new ids, so it recovers on its
             // own. This branch is the one that does not: the ids this effect
             // depends on are unchanged, so nothing retries the sync and the
@@ -364,9 +371,13 @@ function useExternalAccountActivate({
             networkId,
           });
         }
-        logResult('synced');
+        logResult(EExternalActivateOutcome.Synced);
       } catch (error) {
-        logResult(cancelled ? 'cancelled' : 'error');
+        logResult(
+          cancelled
+            ? EExternalActivateOutcome.Cancelled
+            : EExternalActivateOutcome.Error,
+        );
         if (!cancelled) {
           // The effect only re-runs when accountId/networkId change, so a
           // failure here means this account stops syncing with its peer wallet
@@ -385,7 +396,7 @@ function useExternalAccountActivate({
     })();
     return () => {
       cancelled = true;
-      logResult('cancelled');
+      logResult(EExternalActivateOutcome.Cancelled);
     };
   }, [accountId, effectInstanceId, num, networkId, sceneName]);
 }
@@ -538,12 +549,14 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
             });
           };
           if (request.generation !== activeReloadGenerationRef.current) {
-            logDispatch({ outcome: 'cancelled-stale-scheduler' });
+            logDispatch({
+              outcome: EActiveReloadDispatchOutcome.CancelledStaleScheduler,
+            });
             return;
           }
           if (!isReady) {
             logDispatch({
-              outcome: 'skip-not-ready',
+              outcome: EActiveReloadDispatchOutcome.SkipNotReady,
               throttleWaitMs: getElapsedMs(request.scheduledAt),
             });
             return;
@@ -558,7 +571,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
           } catch (error) {
             logDispatch({
               gateMs: getElapsedMs(gateStartedAt),
-              outcome: 'error',
+              outcome: EActiveReloadDispatchOutcome.Error,
               phase: 'transfer-gate',
             });
             logActiveReloadFailure({ error, phase: 'transfer-gate' });
@@ -568,7 +581,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
           if (request.generation !== activeReloadGenerationRef.current) {
             logDispatch({
               gateMs: getElapsedMs(gateStartedAt),
-              outcome: 'cancelled-stale-scheduler',
+              outcome: EActiveReloadDispatchOutcome.CancelledStaleScheduler,
               phase: 'after-transfer-gate',
             });
             return;
@@ -581,18 +594,18 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
             // reload is re-issued once the flow ends.
             logDispatch({
               gateMs: getElapsedMs(gateStartedAt),
-              outcome: 'skip-transfer-flow',
+              outcome: EActiveReloadDispatchOutcome.SkipTransferFlow,
               throttleWaitMs: getElapsedMs(request.scheduledAt, gateStartedAt),
             });
             return;
           }
           logDispatch({
             gateMs: getElapsedMs(gateStartedAt),
-            outcome: 'dispatch',
+            outcome: EActiveReloadDispatchOutcome.Dispatch,
             throttleWaitMs: getElapsedMs(request.scheduledAt, gateStartedAt),
           });
           let activeAccount: IAccountSelectorActiveAccountInfo;
-          let reloadOutcome: string;
+          let reloadOutcome: EActiveReloadOutcome;
           try {
             const reloadResult = await actions.current.reloadActiveAccountInfo({
               num,
@@ -615,15 +628,18 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
             activeAccount = reloadResult.activeAccount;
             reloadOutcome = reloadResult.outcome;
           } catch (error) {
-            logDispatch({ outcome: 'error', phase: 'reload-action' });
+            logDispatch({
+              outcome: EActiveReloadDispatchOutcome.Error,
+              phase: 'reload-action',
+            });
             logActiveReloadFailure({ error, phase: 'reload-action' });
             return;
           }
           logActiveReloadRecovery('reload-action');
           if (
-            reloadOutcome === 'stale-schedule-before-build' ||
-            reloadOutcome === 'stale-before-build' ||
-            reloadOutcome === 'stale-after-build'
+            reloadOutcome === EActiveReloadOutcome.StaleScheduleBeforeBuild ||
+            reloadOutcome === EActiveReloadOutcome.StaleBeforeBuild ||
+            reloadOutcome === EActiveReloadOutcome.StaleAfterBuild
           ) {
             if (request.perfEnabled) {
               defaultLogger.accountSelector.perf.trace(
@@ -632,7 +648,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
                   actionOutcome: reloadOutcome,
                   effectInstanceId,
                   num,
-                  outcome: 'skip-stale-action',
+                  outcome: EActiveReloadPostProcessOutcome.SkipStaleAction,
                   scheduleId: request.scheduleId,
                   sceneName,
                   trigger: request.trigger,
@@ -651,7 +667,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
                 {
                   effectInstanceId,
                   num,
-                  outcome: 'skip-stale-scheduler',
+                  outcome: EActiveReloadPostProcessOutcome.SkipStaleScheduler,
                   scheduleId: request.scheduleId,
                   sceneName,
                   trigger: request.trigger,
@@ -820,7 +836,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
         defaultLogger.accountSelector.perf.trace('activeReloadCancelled', {
           effectInstanceId,
           num,
-          outcome: 'cancelled-cleanup',
+          outcome: ESelectionStorageEffectOutcome.CancelledCleanup,
           sceneName,
           scheduleId: pendingRequest.scheduleId,
           trigger: pendingRequest.trigger,
@@ -841,7 +857,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
         defaultLogger.accountSelector.perf.trace('selectionStorageSkipped', {
           effectInstanceId,
           num,
-          outcome: 'skip-not-ready',
+          outcome: ESelectionStorageEffectOutcome.SkipNotReady,
           sceneName,
           trigger: 'selection-effect',
         });
@@ -862,7 +878,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
         defaultLogger.accountSelector.perf.trace('selectionStorageSkipped', {
           effectInstanceId,
           num,
-          outcome: 'skip-duplicate-revision',
+          outcome: ESelectionStorageEffectOutcome.SkipDuplicateRevision,
           sceneName,
           trigger: 'selection-effect',
         });
@@ -924,7 +940,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
         defaultLogger.accountSelector.perf.trace('selectionStorageSkipped', {
           effectInstanceId,
           num,
-          outcome: 'skip-default-selection',
+          outcome: ESelectionStorageEffectOutcome.SkipDefaultSelection,
           sceneName,
           trigger: 'selection-effect',
         });
