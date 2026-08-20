@@ -180,4 +180,34 @@ describe('useAccountData account-removal races', () => {
     });
     expect(serviceAccount.getAccountAddressType).not.toHaveBeenCalled();
   });
+
+  it('rethrows errors that are not caused by account removal', async () => {
+    const { serviceAccount, serviceNetwork } = getServiceMocks();
+    serviceAccount.getAccount.mockRejectedValue(
+      new Error('network unreachable'),
+    );
+    // The account is still there, so the removal fallback must not swallow it.
+    serviceAccount.getDBAccountSafe.mockResolvedValue({ id: 'account-1' });
+
+    const { result } = renderHook(() =>
+      useAccountData({
+        accountId: 'account-1',
+        networkId: 'evm--1',
+        walletId: 'wallet-1',
+        // undefinedResultIfError keeps the rethrown error inside
+        // usePromiseResult instead of leaking an unhandled rejection.
+        options: { watchLoading: true, undefinedResultIfError: true },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+
+    expect(serviceNetwork.getNetwork).toHaveBeenCalled();
+    expect(result.current.account).toBeUndefined();
+    expect(result.current.network).toBeUndefined();
+    expect(result.current.wallet).toBeUndefined();
+    expect(result.current.vaultSettings).toBeUndefined();
+  });
 });

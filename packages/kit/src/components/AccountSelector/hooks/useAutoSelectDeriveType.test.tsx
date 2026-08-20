@@ -9,8 +9,16 @@ type IGlobalSyncResult = {
   selectionResult: { outcome: string } | undefined;
 };
 
+type IGlobalDeriveTypeListener = (payload: unknown) => void;
+
 const mockSyncLocalDeriveTypeFromGlobal: jest.MockedFunction<
-  () => Promise<IGlobalSyncResult>
+  (params: unknown) => Promise<IGlobalSyncResult>
+> = jest.fn();
+const mockAppEventBusOn: jest.MockedFunction<
+  (name: string, fn: IGlobalDeriveTypeListener) => void
+> = jest.fn();
+const mockAppEventBusOff: jest.MockedFunction<
+  (name: string, fn: IGlobalDeriveTypeListener) => void
 > = jest.fn();
 const mockGetSelectedAccount: jest.MockedFunction<
   () => { deriveType: string | undefined; networkId: string | undefined }
@@ -27,7 +35,12 @@ const mockGetDeriveTypeOrFallbackToGlobal: jest.MockedFunction<
 
 jest.mock('@onekeyhq/shared/src/eventBus/appEventBus', () => ({
   EAppEventBusNames: { GlobalDeriveTypeUpdate: 'GlobalDeriveTypeUpdate' },
-  appEventBus: { off: jest.fn(), on: jest.fn() },
+  appEventBus: {
+    off: (name: string, fn: (payload: unknown) => void) =>
+      mockAppEventBusOff(name, fn),
+    on: (name: string, fn: (payload: unknown) => void) =>
+      mockAppEventBusOn(name, fn),
+  },
 }));
 
 jest.mock('@onekeyhq/shared/src/logger/logger', () => {
@@ -68,7 +81,8 @@ jest.mock('../../../states/jotai/contexts/accountSelector/actions', () => ({
   useAccountSelectorActions: () => ({
     current: {
       getSelectedAccount: () => mockGetSelectedAccount(),
-      syncLocalDeriveTypeFromGlobal: () => mockSyncLocalDeriveTypeFromGlobal(),
+      syncLocalDeriveTypeFromGlobal: (params: unknown) =>
+        mockSyncLocalDeriveTypeFromGlobal(params),
       updateSelectedAccountDeriveType: (params: unknown) =>
         mockUpdateSelectedAccountDeriveType(params),
     },
@@ -80,6 +94,25 @@ jest.mock('../../../states/jotai/contexts/accountSelector/perfDebug', () => ({
   getNextAccountSelectorPerfOperationId: () => 1,
   isAccountSelectorPerfDebugEnabled: () => false,
 }));
+
+function getLastGlobalDeriveTypeListener() {
+  const listener = mockAppEventBusOn.mock.calls
+    .filter(([name]) => name === 'GlobalDeriveTypeUpdate')
+    .at(-1)?.[1];
+  expect(listener).toBeDefined();
+  return listener;
+}
+
+// The first effect fires one sync on mount; drop it so assertions below only
+// see the syncs triggered by the global event listener.
+async function mountAndSettleInitialSync() {
+  const rendered = renderHook(() => useAutoSelectDeriveType({ num: 0 }));
+  await waitFor(() => {
+    expect(mockSyncLocalDeriveTypeFromGlobal).toHaveBeenCalled();
+  });
+  mockSyncLocalDeriveTypeFromGlobal.mockClear();
+  return rendered;
+}
 
 describe('useAutoSelectDeriveType global sync outcome', () => {
   beforeEach(() => {
@@ -144,5 +177,67 @@ describe('useAutoSelectDeriveType global sync outcome', () => {
       expect(mockSyncLocalDeriveTypeFromGlobal).toHaveBeenCalled();
     });
     expect(mockUpdateSelectedAccountDeriveType).not.toHaveBeenCalled();
+  });
+});
+
+describe('useAutoSelectDeriveType global derive type event', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockSyncLocalDeriveTypeFromGlobal.mockResolvedValue({
+      globalDeriveType: 'default',
+      selectionResult: { outcome: 'commit' },
+    });
+    mockGetSelectedAccount.mockReturnValue({
+      deriveType: 'default',
+      networkId: 'evm--1',
+    });
+  });
+
+  it('syncs when the event impl matches the active network impl', async () => {
+    await mountAndSettleInitialSync();
+
+    getLastGlobalDeriveTypeListener()?.({ networkImpl: 'evm' });
+
+    await waitFor(() => {
+      expect(mockSyncLocalDeriveTypeFromGlobal).toHaveBeenCalledWith(
+        expect.objectContaining({ source: 'global-event' }),
+      );
+    });
+  });
+
+  it('ignores the event when the impl belongs to another network', async () => {
+    await mountAndSettleInitialSync();
+
+    getLastGlobalDeriveTypeListener()?.({ networkImpl: 'btc' });
+
+    expect(mockSyncLocalDeriveTypeFromGlobal).not.toHaveBeenCalled();
+  });
+
+  it('still syncs when the event carries no usable impl', async () => {
+    await mountAndSettleInitialSync();
+
+    const listener = getLastGlobalDeriveTypeListener();
+    listener?.(undefined);
+    listener?.({});
+    listener?.({ networkImpl: 123 });
+
+    await waitFor(() => {
+      expect(mockSyncLocalDeriveTypeFromGlobal).toHaveBeenCalledTimes(3);
+    });
+    expect(mockSyncLocalDeriveTypeFromGlobal).toHaveBeenLastCalledWith(
+      expect.objectContaining({ source: 'global-event' }),
+    );
+  });
+
+  it('removes the listener on unmount', async () => {
+    const { unmount } = await mountAndSettleInitialSync();
+    const listener = getLastGlobalDeriveTypeListener();
+
+    unmount();
+
+    expect(mockAppEventBusOff).toHaveBeenCalledWith(
+      'GlobalDeriveTypeUpdate',
+      listener,
+    );
   });
 });

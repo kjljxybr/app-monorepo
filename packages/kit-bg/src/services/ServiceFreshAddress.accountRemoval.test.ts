@@ -72,6 +72,7 @@ function buildBackgroundApi() {
     simpleDb: {
       btcFreshAddressMeta: {
         getRecord: jest.fn(),
+        updateRecord: jest.fn(),
       },
       localHistory: {
         getLocalPendingHistoryByNetwork: jest.fn(),
@@ -152,5 +153,60 @@ describe('ServiceFreshAddress account-removal races', () => {
     expect(
       backgroundApi.serviceAccountProfile.fetchAccountDetails,
     ).not.toHaveBeenCalled();
+  });
+
+  it('completes the sync when the account and indexed account still exist', async () => {
+    const backgroundApi = buildBackgroundApi();
+    backgroundApi.serviceAccount.getDBAccountSafe.mockResolvedValue({
+      id: 'account-1',
+      indexedAccountId: 'indexed-account-1',
+      xpub: 'xpub-1',
+      xpubSegwit: 'xpub-segwit-1',
+    });
+    backgroundApi.serviceAccount.getIndexedAccountSafe.mockResolvedValue({
+      id: 'indexed-account-1',
+    });
+    backgroundApi.serviceAccount.getNetworkAccountsInSameIndexedAccountIdWithDeriveTypes.mockResolvedValue(
+      {
+        network: { id: 'btc--0' },
+        networkAccounts: [
+          { account: { id: 'account-1' }, deriveType: 'default' },
+        ],
+      },
+    );
+    backgroundApi.simpleDb.btcFreshAddressMeta.getRecord.mockResolvedValue(
+      undefined,
+    );
+    backgroundApi.simpleDb.localHistory.getLocalPendingHistoryByNetwork.mockResolvedValue(
+      { pendingTxs: {} },
+    );
+    backgroundApi.serviceAccountProfile.fetchAccountDetails.mockResolvedValue({
+      transactionCount: 0,
+      xpubDerivedTokens: [],
+    });
+    const service = new ServiceFreshAddress({ backgroundApi });
+
+    await service.syncBTCFreshAddressByAccountId({
+      accountId: 'account-1',
+      networkId: 'btc--0',
+    });
+
+    expect(
+      backgroundApi.serviceAccount
+        .getNetworkAccountsInSameIndexedAccountIdWithDeriveTypes,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({ indexedAccountId: 'indexed-account-1' }),
+    );
+    expect(
+      backgroundApi.simpleDb.btcFreshAddressMeta.getRecord,
+    ).toHaveBeenCalledWith({ networkId: 'btc--0', xpubSegwit: 'xpub-1' });
+    expect(
+      backgroundApi.serviceAccountProfile.fetchAccountDetails,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({ accountId: 'account-1', networkId: 'btc--0' }),
+    );
+    expect(
+      backgroundApi.simpleDb.btcFreshAddressMeta.updateRecord,
+    ).toHaveBeenCalled();
   });
 });
