@@ -2149,6 +2149,45 @@ async function runRapidSelectionBursts(page, fixture) {
     deriveType: deriveBurst.finalDeriveType,
     networkId: 'btc--0',
   });
+
+  // Guarantee the coalescing budget an in-window reload overlap. The rapid
+  // picks above cannot promise one on a fast machine: every UI pick reopens
+  // its selector, so consecutive selection commits land further apart than
+  // the 150ms reload throttle, and the derive writes collapse into a single
+  // dispatch before the UI sees them (SimpleDbEntityAccountSelector debounces
+  // GlobalDeriveTypeUpdate per network impl). The only overlap left is a
+  // cross-scene sync bunching on the swap scene — pure timing luck. Renaming
+  // the selected account twice back-to-back emits AccountUpdate twice in the
+  // same tick — the double-trigger shape the DApp connect flow produces
+  // naturally — so every mounted Effects instance schedules two reloads
+  // inside one throttle window and must coalesce them on any machine speed.
+  const renameBurst = await page.evaluate(
+    async ({ indexedAccountId }) => {
+      const api = globalThis.$$appGlobals.$backgroundApiProxy;
+      const indexedAccount = await api.serviceAccount.getIndexedAccount({
+        id: indexedAccountId,
+      });
+      const originalName = indexedAccount?.name;
+      if (!originalName) {
+        return undefined;
+      }
+      await api.serviceAccount.setAccountName({
+        indexedAccountId,
+        name: `${originalName} (burst)`,
+      });
+      await api.serviceAccount.setAccountName({
+        indexedAccountId,
+        name: originalName,
+      });
+      return { originalName };
+    },
+    { indexedAccountId: finalAccount.indexedAccountId },
+  );
+  assert.ok(
+    renameBurst?.originalName,
+    'Rename burst must resolve the selected fixture account name',
+  );
+
   await assertAccountSelectorStateConsistent(page, finalAccount);
 }
 
