@@ -1,6 +1,7 @@
 import type { IAccountSelectorSelectedAccount } from '@onekeyhq/kit-bg/src/dbs/simple/entity/SimpleDbEntityAccountSelector';
 import { defaultLogger } from '@onekeyhq/shared/src/logger/logger';
 import { loggerConfig } from '@onekeyhq/shared/src/logger/loggerConfig';
+import { isAccountSelectorPerfE2EAttributionEnabled } from '@onekeyhq/shared/src/logger/scopes/accountSelector/scenes/perf';
 import platformEnv from '@onekeyhq/shared/src/platformEnv';
 
 import type { IAccountSelectorActiveAccountInfo } from './atoms';
@@ -61,9 +62,14 @@ export type IAccountSelectorActiveAccountPerfCommitMeta = {
 };
 
 export function isAccountSelectorPerfDebugEnabled() {
+  if (platformEnv.isE2E) {
+    // Defaults to true. E2E scenarios may disable attribution at runtime
+    // (ServiceE2E.configureAccountSelectorPerfE2E) to exercise the production
+    // perf-off wiring; the override is authoritative even on dev builds.
+    return isAccountSelectorPerfE2EAttributionEnabled();
+  }
   return Boolean(
-    platformEnv.isE2E ||
-    (platformEnv.isDev && loggerConfig.shouldLog('accountSelector', 'perf')),
+    platformEnv.isDev && loggerConfig.shouldLog('accountSelector', 'perf'),
   );
 }
 

@@ -34,6 +34,11 @@ import {
 } from '../../states/jotai/contexts/accountSelector';
 import { useAccountSelectorActions } from '../../states/jotai/contexts/accountSelector/actions';
 import {
+  buildActiveReloadFailureKey,
+  takeActiveReloadFailureLogSlot,
+  takeActiveReloadRecoveryLogSlot,
+} from '../../states/jotai/contexts/accountSelector/activeReloadFailureLog';
+import {
   buildActiveAccountPerfSummary,
   buildSelectedAccountPerfSummary,
   getAccountSelectorPerfTimestamp,
@@ -478,6 +483,48 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
               ...payload,
             });
           };
+          // Edge triggered, unlike logDispatch: this one is meant to survive
+          // into production, so it must not repeat once per retry while the
+          // background runtime is unreachable. See activeReloadFailureLog.ts.
+          const logActiveReloadFailure = ({
+            error,
+            phase,
+          }: {
+            error: unknown;
+            phase: string;
+          }) => {
+            const errorName = (error as Error | undefined)?.name;
+            const slot = takeActiveReloadFailureLogSlot({
+              errorName,
+              key: buildActiveReloadFailureKey({ num, phase, sceneName }),
+            });
+            if (!slot) {
+              return;
+            }
+            defaultLogger.accountSelector.failure.activeReloadFailed({
+              consecutiveFailures: slot.consecutiveFailures,
+              errorMessage: (error as Error | undefined)?.message,
+              errorName,
+              num,
+              phase,
+              previousFailures: slot.previousFailures,
+              sceneName,
+            });
+          };
+          const logActiveReloadRecovery = (phase: string) => {
+            const failuresBeforeRecovery = takeActiveReloadRecoveryLogSlot(
+              buildActiveReloadFailureKey({ num, phase, sceneName }),
+            );
+            if (failuresBeforeRecovery === undefined) {
+              return;
+            }
+            defaultLogger.accountSelector.failure.activeReloadRecovered({
+              failuresBeforeRecovery,
+              num,
+              phase,
+              sceneName,
+            });
+          };
           if (request.generation !== activeReloadGenerationRef.current) {
             logDispatch({ outcome: 'cancelled-stale-scheduler' });
             return;
@@ -496,14 +543,16 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
           try {
             isInTransferImportOrBackupRestoreFlow =
               await backgroundApiProxy.servicePrimeTransfer.isInTransferImportOrBackupRestoreFlow();
-          } catch {
+          } catch (error) {
             logDispatch({
               gateMs: getElapsedMs(gateStartedAt),
               outcome: 'error',
               phase: 'transfer-gate',
             });
+            logActiveReloadFailure({ error, phase: 'transfer-gate' });
             return;
           }
+          logActiveReloadRecovery('transfer-gate');
           if (request.generation !== activeReloadGenerationRef.current) {
             logDispatch({
               gateMs: getElapsedMs(gateStartedAt),
@@ -548,10 +597,12 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
             });
             activeAccount = reloadResult.activeAccount;
             reloadOutcome = reloadResult.outcome;
-          } catch {
+          } catch (error) {
             logDispatch({ outcome: 'error', phase: 'reload-action' });
+            logActiveReloadFailure({ error, phase: 'reload-action' });
             return;
           }
+          logActiveReloadRecovery('reload-action');
           if (
             reloadOutcome === 'stale-schedule-before-build' ||
             reloadOutcome === 'stale-before-build' ||
@@ -608,7 +659,13 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
                 account: activeAccount.account,
                 networkId: activeAccount.network?.id,
               })
-              .catch(() => undefined);
+              .then(() => logActiveReloadRecovery('save-account-addresses'))
+              .catch((error: unknown) =>
+                logActiveReloadFailure({
+                  error,
+                  phase: 'save-account-addresses',
+                }),
+              );
           }
           if (request.perfEnabled) {
             defaultLogger.accountSelector.perf.trace(
@@ -788,15 +845,52 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
     }
     // do not save initial value to storage
     if (!isSelectedAccountDefaultValue) {
-      // check initFromStorage() at AccountSelectorStorageInit
-      await actions.current.saveToStorage({
-        trigger: 'selection-effect',
-        selectedAccount,
-        sceneName,
-        sceneUrl,
+      const selectionSaveKey = buildActiveReloadFailureKey({
         num,
-        selectedAccountUpdatedAt: updateMeta?.updatedAt,
+        phase: 'selection-save',
+        sceneName,
       });
+      try {
+        // check initFromStorage() at AccountSelectorStorageInit
+        await actions.current.saveToStorage({
+          trigger: 'selection-effect',
+          selectedAccount,
+          sceneName,
+          sceneUrl,
+          num,
+          selectedAccountUpdatedAt: updateMeta?.updatedAt,
+        });
+      } catch (error) {
+        // Upstream let this reject into an unhandled rejection, which at least
+        // reached Sentry. Now that the caller swallows it, the loss would be
+        // invisible: the revision below is left untouched, so the next
+        // selection change retries, but standing still keeps the stale account.
+        const errorName = (error as Error | undefined)?.name;
+        const slot = takeActiveReloadFailureLogSlot({
+          errorName,
+          key: selectionSaveKey,
+        });
+        if (slot) {
+          defaultLogger.accountSelector.failure.selectionSaveFailed({
+            consecutiveFailures: slot.consecutiveFailures,
+            errorMessage: (error as Error | undefined)?.message,
+            errorName,
+            num,
+            previousFailures: slot.previousFailures,
+            sceneName,
+          });
+        }
+        return;
+      }
+      const failuresBeforeRecovery =
+        takeActiveReloadRecoveryLogSlot(selectionSaveKey);
+      if (failuresBeforeRecovery !== undefined) {
+        defaultLogger.accountSelector.failure.selectionSaveRecovered({
+          failuresBeforeRecovery,
+          num,
+          sceneName,
+        });
+      }
       lastAutoSavedUpdatedAtRef.current = updateMeta?.updatedAt;
     } else {
       if (isAccountSelectorPerfDebugEnabled()) {

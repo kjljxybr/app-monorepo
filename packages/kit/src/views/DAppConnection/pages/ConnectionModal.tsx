@@ -82,6 +82,7 @@ function ConnectionModal() {
   // can verify the modal is not about to authorize a superseded account.
   const latestActiveAccountRef =
     useRef<IAccountSelectorActiveAccountInfo | null>(null);
+  const missingScopeLoggedRef = useRef(false);
 
   const handleAccountChanged = useCallback<IHandleAccountChanged>(
     ({ activeAccount, selectedAccount: rawSelectedAccountData }, num) => {
@@ -160,14 +161,26 @@ function ConnectionModal() {
   const onApproval = useCallback(
     async (close?: (extra?: { flag?: string }) => void) => {
       if (!$sourceInfo?.scope) {
-        Toast.error({ title: 'no injected scope' });
-        if ($sourceInfo) {
+        // A request that arrived without a scope and one whose route query was
+        // lost entirely are different failures. One value drives both the toast
+        // and the log so the two can never disagree.
+        const failReason = $sourceInfo ? 'no injected scope' : 'no source info';
+        Toast.error({ title: failReason });
+        // Logged even without $sourceInfo, which previously left that case with
+        // no trace at all.
+        //
+        // Logged once per modal: $sourceInfo is parsed from the route query and
+        // cannot change while mounted, but the confirm button stays enabled, so
+        // repeated taps would emit an identical entry and an identical server
+        // event every time.
+        if (!missingScopeLoggedRef.current) {
+          missingScopeLoggedRef.current = true;
           defaultLogger.discovery.dapp.dappUse({
-            dappName: $sourceInfo?.hostname,
-            dappDomain: $sourceInfo?.origin,
+            dappName: $sourceInfo?.hostname ?? '',
+            dappDomain: $sourceInfo?.origin ?? '',
             action: 'ConnectWallet',
             network: selectedAccount?.network?.name,
-            failReason: 'no injected scope',
+            failReason,
           });
         }
         return;
@@ -196,7 +209,11 @@ function ConnectionModal() {
         ) {
           return false;
         }
-        Toast.error({ title: 'account changed, please try again' });
+        Toast.error({
+          title: intl.formatMessage({
+            id: ETranslations.global_unknown_error_retry_message,
+          }),
+        });
         defaultLogger.discovery.dapp.dappUse({
           dappName: $sourceInfo?.hostname,
           dappDomain: $sourceInfo?.origin,
@@ -312,6 +329,7 @@ function ConnectionModal() {
     [
       dappApprove,
       $sourceInfo,
+      intl,
       serviceDApp,
       selectedAccount,
       rawSelectedAccount,

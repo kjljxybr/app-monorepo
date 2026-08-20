@@ -89,4 +89,121 @@ export class AccountSelectorFailureScene extends BaseScene {
       { entry, num, outcome, reason, sceneName, walletKind },
     ];
   }
+
+  // The active-account reload failed and the selector keeps whatever it had —
+  // or, for the build phase, an empty account already marked ready. Edge
+  // triggered via takeActiveReloadFailureLogSlot: one entry per failing run,
+  // not per retry, because the reload re-fires on every AccountUpdate while the
+  // background runtime is down.
+  //   transfer-gate ......... the pre-reload transfer/backup check threw
+  //   reload-action ......... the reload action itself threw
+  //   build-active-account .. bg could not build the active account, and the
+  //                           selector fell back to an empty one with ready:true
+  @LogToLocal({ level: 'warn' })
+  public activeReloadFailed({
+    consecutiveFailures,
+    errorMessage,
+    errorName,
+    num,
+    phase,
+    previousFailures,
+    sceneName,
+  }: {
+    // Always 1 on the entry that opens a failing run; the real total arrives on
+    // the matching activeReloadRecovered.
+    consecutiveFailures: number;
+    errorMessage: string | undefined;
+    errorName: string | undefined;
+    num: number;
+    phase: string;
+    // Failures accumulated under the previous cause when the cause changed
+    // mid-run, so no suppressed count is lost.
+    previousFailures: number | undefined;
+    sceneName: string | undefined;
+  }) {
+    return [
+      'accountSelector active account reload failed',
+      {
+        consecutiveFailures,
+        errorMessage,
+        errorName,
+        num,
+        phase,
+        previousFailures,
+        sceneName,
+      },
+    ];
+  }
+
+  // Closes a failing run reported by activeReloadFailed, carrying the retries
+  // that were suppressed in between. No entry for a phase that failed means the
+  // reload never succeeded again — see activeReloadFailureLog.ts.
+  @LogToLocal({ level: 'warn' })
+  public activeReloadRecovered({
+    failuresBeforeRecovery,
+    num,
+    phase,
+    sceneName,
+  }: {
+    failuresBeforeRecovery: number;
+    num: number;
+    phase: string;
+    sceneName: string | undefined;
+  }) {
+    return [
+      'accountSelector active account reload recovered',
+      { failuresBeforeRecovery, num, phase, sceneName },
+    ];
+  }
+
+  // The selection never reached storage, so the next cold start restores the
+  // previous account and the user's switch silently reverts. Retried only when
+  // the selection changes again — standing still keeps the loss.
+  @LogToLocal({ level: 'warn' })
+  public selectionSaveFailed({
+    consecutiveFailures,
+    errorMessage,
+    errorName,
+    num,
+    previousFailures,
+    sceneName,
+  }: {
+    consecutiveFailures: number;
+    errorMessage: string | undefined;
+    errorName: string | undefined;
+    num: number;
+    previousFailures: number | undefined;
+    sceneName: string | undefined;
+  }) {
+    return [
+      'accountSelector selection save failed',
+      {
+        consecutiveFailures,
+        errorMessage,
+        errorName,
+        num,
+        previousFailures,
+        sceneName,
+      },
+    ];
+  }
+
+  // Closes a run reported by selectionSaveFailed. Only a save that actually ran
+  // counts: the skip paths (unchanged revision, default selection) leave an open
+  // run alone rather than claiming a recovery that never happened.
+  @LogToLocal({ level: 'warn' })
+  public selectionSaveRecovered({
+    failuresBeforeRecovery,
+    num,
+    sceneName,
+  }: {
+    failuresBeforeRecovery: number;
+    num: number;
+    sceneName: string | undefined;
+  }) {
+    return [
+      'accountSelector selection save recovered',
+      { failuresBeforeRecovery, num, sceneName },
+    ];
+  }
 }

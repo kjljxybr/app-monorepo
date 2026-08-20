@@ -103,7 +103,10 @@ const mockGetDappAccountSelectorMap: jest.MockedFunction<
   () => Promise<Record<number, Record<string, unknown>> | undefined>
 > = jest.fn();
 const mockBuildActiveAccountInfoFromSelectedAccount: jest.MockedFunction<
-  () => Promise<IBuildActiveAccountInfoResult>
+  (params?: {
+    nonce?: number;
+    selectedAccount: ISelectedAccount;
+  }) => Promise<IBuildActiveAccountInfoResult>
 > = jest.fn();
 const mockFixDeriveTypesForInitAccountSelectorMap: jest.MockedFunction<
   (
@@ -349,8 +352,10 @@ jest.mock('@onekeyhq/kit/src/background/instance/backgroundApiProxy', () => ({
         mockIsTempWalletRemoved({ wallet }),
     },
     serviceAccountSelector: {
-      buildActiveAccountInfoFromSelectedAccount: () =>
-        mockBuildActiveAccountInfoFromSelectedAccount(),
+      buildActiveAccountInfoFromSelectedAccount: (params: {
+        nonce?: number;
+        selectedAccount: ISelectedAccount;
+      }) => mockBuildActiveAccountInfoFromSelectedAccount(params),
       fixDeriveTypesForInitAccountSelectorMap: (
         params: IFixDeriveTypesForInitAccountSelectorMapParams,
       ) => mockFixDeriveTypesForInitAccountSelectorMap(params),
@@ -1074,6 +1079,52 @@ describe('useAccountSelectorActions', () => {
     await act(async () => {
       reloadOutcome = (
         await result.current.reloadActiveAccountInfo({
+          forceIncompleteSelectionReload: true,
+          num: 0,
+          selectedAccount: clearedSelection,
+        })
+      ).outcome;
+    });
+
+    expect(reloadOutcome).toBe('commit');
+    expect(mockBuildActiveAccountInfoFromSelectedAccount).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(store.get(activeAccountsAtom())[0]).toBe(clearedActiveAccount);
+  });
+
+  it('keeps the stale active account when only perf metadata marks the selection as cleared', async () => {
+    // Guards the perfDebug contract: diagnostics metadata must never drive
+    // control flow, so a perf-attributed reason alone (without the formal
+    // forceIncompleteSelectionReload payload flag) must not bypass the
+    // incomplete-selection guard.
+    const clearedSelection = {
+      ...defaultSelectedAccount(),
+      networkId: 'evm--1',
+      deriveType: 'default' as const,
+    };
+    const staleActiveAccount = {
+      ...defaultActiveAccountInfo(),
+      ready: true,
+      wallet: { id: 'hd-1' } as IWallet,
+      indexedAccount: {
+        id: 'hd-1--0',
+        walletId: 'hd-1',
+      } as IIndexedAccount,
+    };
+
+    const { store, Wrapper } = createWrapper();
+    store.set(accountSelectorStorageInitDoneAtom(), true);
+    store.set(selectedAccountsAtom(), { 0: clearedSelection });
+    store.set(activeAccountsAtom(), { 0: staleActiveAccount });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let reloadOutcome: string | undefined;
+    await act(async () => {
+      reloadOutcome = (
+        await result.current.reloadActiveAccountInfo({
           num: 0,
           selectedAccount: clearedSelection,
           perfContext: {
@@ -1084,11 +1135,11 @@ describe('useAccountSelectorActions', () => {
       ).outcome;
     });
 
-    expect(reloadOutcome).toBe('commit');
-    expect(mockBuildActiveAccountInfoFromSelectedAccount).toHaveBeenCalledTimes(
-      1,
-    );
-    expect(store.get(activeAccountsAtom())[0]).toBe(clearedActiveAccount);
+    expect(reloadOutcome).toBe('skip-incomplete');
+    expect(
+      mockBuildActiveAccountInfoFromSelectedAccount,
+    ).not.toHaveBeenCalled();
+    expect(store.get(activeAccountsAtom())[0]).toBe(staleActiveAccount);
   });
 
   it('skips an active-account build when the queued selection is already stale', async () => {
@@ -2440,10 +2491,21 @@ describe('useAccountSelectorActions', () => {
   it('clears a removed account in addressInput without selecting a fallback', async () => {
     const selectedAccount = createHdSelectedAccount('hd-1--1');
     mockGetIndexedAccountSafe.mockResolvedValue(undefined);
+    const staleActiveAccount = {
+      ...defaultActiveAccountInfo(),
+      ready: true,
+      wallet: { id: 'hd-1' } as IWallet,
+      indexedAccount: {
+        id: 'hd-1--1',
+        walletId: 'hd-1',
+      } as IIndexedAccount,
+    };
     const { store, Wrapper } = createWrapper(
       EAccountSelectorSceneName.addressInput,
     );
+    store.set(accountSelectorStorageInitDoneAtom(), true);
     store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    store.set(activeAccountsAtom(), { 0: staleActiveAccount });
     const { result } = renderHook(() => useAccountSelectorActions().current, {
       wrapper: Wrapper,
     });
@@ -2461,6 +2523,26 @@ describe('useAccountSelectorActions', () => {
       indexedAccountId: undefined,
       othersWalletAccountId: undefined,
       walletId: undefined,
+    });
+    // The stale active account must be rebuilt from the cleared selection
+    // even with perf diagnostics disabled (production wiring).
+    expect(mockBuildActiveAccountInfoFromSelectedAccount).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(mockBuildActiveAccountInfoFromSelectedAccount).toHaveBeenCalledWith(
+      expect.objectContaining({
+        selectedAccount: expect.objectContaining({
+          indexedAccountId: undefined,
+          othersWalletAccountId: undefined,
+          walletId: undefined,
+        }),
+      }),
+    );
+    expect(store.get(activeAccountsAtom())[0]).toMatchObject({
+      account: undefined,
+      indexedAccount: undefined,
+      ready: true,
+      wallet: undefined,
     });
     expect(mockGetAllHdHwQrWallets).not.toHaveBeenCalled();
   });

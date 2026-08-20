@@ -87,6 +87,11 @@ import { ContextJotaiActionsBase } from '../../utils/ContextJotaiActionsBase';
 
 import { shouldKeepCurrentActiveAccountForIncompleteSelection } from './activeAccountInitGuard';
 import {
+  buildActiveReloadFailureKey,
+  takeActiveReloadFailureLogSlot,
+  takeActiveReloadRecoveryLogSlot,
+} from './activeReloadFailureLog';
+import {
   accountSelectorActiveAccountInitDoneAtom,
   accountSelectorContextDataAtom,
   accountSelectorEditModeAtom,
@@ -135,6 +140,10 @@ const ACCOUNT_SELECTOR_RECENT_SELECTION_CACHE_VERSION = 2;
 // Concurrent updates make a single stale drop expected. Three in a row without a
 // commit means the caller keeps losing its update, so fail loudly off production.
 const CONSECUTIVE_STALE_DROP_ALERT_THRESHOLD = 3;
+
+// Shared by the failure and recovery entries so both sides of a run key the same
+// way. AccountSelectorEffects owns the other two phases.
+const BUILD_ACTIVE_ACCOUNT_FAILURE_PHASE = 'build-active-account';
 
 // Wallet category for diagnostics. Never the id itself: the category is what
 // changes the investigation, the id only identifies the user.
@@ -861,6 +870,11 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       get,
       set,
       payload: {
+        // Rebuild even when the selection carries no account identity. Set by
+        // flows that intentionally cleared the selection (e.g. the selected
+        // account was removed), where the incomplete-selection guard would
+        // otherwise keep the stale active account alive.
+        forceIncompleteSelectionReload?: boolean;
         num: number;
         perfContext?: {
           coalescedCount?: number;
@@ -898,7 +912,13 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         get(accountSelectorContextDataAtom())?.sceneName;
       return this.mutex.runExclusive(async () => {
         const { serviceAccountSelector } = backgroundApiProxy;
-        const { num, perfContext, selectedAccount, shouldReload } = payload;
+        const {
+          forceIncompleteSelectionReload,
+          num,
+          perfContext,
+          selectedAccount,
+          shouldReload,
+        } = payload;
         const startedAt = perfEnabled ? getAccountSelectorPerfTimestamp() : 0;
         const mutexWaitMs = Math.round(startedAt - requestedAt);
         const buildResultTiming = () => {
@@ -993,10 +1013,8 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             });
           }
         };
-        const forceReloadClearedSelection =
-          transitionMeta?.reason === 'removeAccountSelectionClear';
         if (
-          !forceReloadClearedSelection &&
+          !forceIncompleteSelectionReload &&
           shouldKeepCurrentActiveAccountForIncompleteSelection({
             storageInitDone: get(accountSelectorStorageInitDoneAtom()),
             selectedAccount,
@@ -1069,12 +1087,53 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               stageMs: perfTiming.stageMs,
             });
           }
-        } catch (_error) {
+        } catch (error) {
           buildOutcome = 'error-fallback';
+          // The fallback below is indistinguishable from a wallet with no
+          // account: empty fields and ready:true, so the UI shows a finished
+          // load rather than a failure. Without this entry a support report has
+          // nothing tying that empty state to a background build that threw.
+          const errorName = (error as Error | undefined)?.name;
+          const failureSlot = takeActiveReloadFailureLogSlot({
+            errorName,
+            key: buildActiveReloadFailureKey({
+              num,
+              phase: BUILD_ACTIVE_ACCOUNT_FAILURE_PHASE,
+              sceneName: traceSceneName,
+            }),
+          });
+          if (failureSlot) {
+            defaultLogger.accountSelector.failure.activeReloadFailed({
+              consecutiveFailures: failureSlot.consecutiveFailures,
+              errorMessage: (error as Error | undefined)?.message,
+              errorName,
+              num,
+              phase: BUILD_ACTIVE_ACCOUNT_FAILURE_PHASE,
+              previousFailures: failureSlot.previousFailures,
+              sceneName: traceSceneName,
+            });
+          }
           activeAccount = {
             ...defaultActiveAccountInfo(),
             ready: true,
           };
+        }
+        if (buildOutcome !== 'error-fallback') {
+          const failuresBeforeRecovery = takeActiveReloadRecoveryLogSlot(
+            buildActiveReloadFailureKey({
+              num,
+              phase: BUILD_ACTIVE_ACCOUNT_FAILURE_PHASE,
+              sceneName: traceSceneName,
+            }),
+          );
+          if (failuresBeforeRecovery !== undefined) {
+            defaultLogger.accountSelector.failure.activeReloadRecovered({
+              failuresBeforeRecovery,
+              num,
+              phase: BUILD_ACTIVE_ACCOUNT_FAILURE_PHASE,
+              sceneName: traceSceneName,
+            });
+          }
         }
         // console.log('buildActiveAccountInfoFromSelectedAccount update state', {
         //   selectedAccount,
@@ -1083,12 +1142,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         const currentSelectedAccount =
           this.getSelectedAccount.call(set, { num }) ||
           defaultSelectedAccount();
-        if (
-          !isEqual(
-            omitBy(currentSelectedAccount, isUndefined),
-            omitBy(selectedAccount, isUndefined),
-          )
-        ) {
+        if (!isSameSelectedAccount(currentSelectedAccount, selectedAccount)) {
           if (perfEnabled) {
             defaultLogger.accountSelector.perf.trace('activeReloadResult', {
               ...buildResultTiming(),
@@ -1326,10 +1380,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             });
 
           if (
-            !isEqual(
-              omitBy(selectedAccount, isUndefined),
-              omitBy(resolvedSelectedAccount, isUndefined),
-            )
+            !isSameSelectedAccount(selectedAccount, resolvedSelectedAccount)
           ) {
             repairedSelectedAccountsMap[Number(numText)] =
               resolvedSelectedAccount;
@@ -1532,12 +1583,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           sceneUrl,
           num,
         });
-        if (
-          !isEqual(
-            omitBy(currentSaved, isUndefined),
-            omitBy(selectedAccount, isUndefined),
-          )
-        ) {
+        if (!isSameSelectedAccount(currentSaved, selectedAccount)) {
           phase = 'write-primary';
           primaryWriteAttempted = true;
           const primarySaveResult =
@@ -1570,10 +1616,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               mergedByData: selectedAccount,
             });
           if (
-            !isEqual(
-              omitBy(homeSelectedAccount, isUndefined),
-              omitBy(newHomeSelectedAccount, isUndefined),
-            )
+            !isSameSelectedAccount(homeSelectedAccount, newHomeSelectedAccount)
           ) {
             phase = 'write-home';
             homeWriteAttempted = true;
@@ -2007,12 +2050,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             }
           }
 
-          if (
-            isEqual(
-              omitBy(oldSelectedAccount, isUndefined),
-              omitBy(newSelectedAccount, isUndefined),
-            )
-          ) {
+          if (isSameSelectedAccount(oldSelectedAccount, newSelectedAccount)) {
             return logSelectionUpdateResult({
               outcome: 'noop',
               selectedAccount: oldSelectedAccount,
@@ -2133,12 +2171,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               selectedAccount: oldSelectedAccount,
             });
           }
-          if (
-            isEqual(
-              omitBy(oldSelectedAccount, isUndefined),
-              omitBy(newSelectedAccount, isUndefined),
-            )
-          ) {
+          if (isSameSelectedAccount(oldSelectedAccount, newSelectedAccount)) {
             return logSelectionUpdateResult({
               outcome: 'noop',
               selectedAccount: oldSelectedAccount,
@@ -4962,12 +4995,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       const currentSelectedAccount = this.getSelectedAccount.call(set, {
         num,
       });
-      if (
-        !isEqual(
-          omitBy(currentSelectedAccount, isUndefined),
-          omitBy(selectedAccount, isUndefined),
-        )
-      ) {
+      if (!isSameSelectedAccount(currentSelectedAccount, selectedAccount)) {
         return;
       }
 
@@ -5436,6 +5464,20 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                   : selectionResult.outcome,
               transitionId: selectionResult.transitionId,
             });
+            if (selectionResult.outcome === 'commit') {
+              // The cleared selection keeps only its network context, which
+              // the incomplete-selection guard reads as "identity not restored
+              // yet", keeping the removed account's active info alive. Reload
+              // here with the guard explicitly bypassed so the active account
+              // is rebuilt on every target; the Effects-scheduled reload that
+              // follows the selection change lands as a noop.
+              await this.reloadActiveAccountInfo.call(set, {
+                forceIncompleteSelectionReload: true,
+                num,
+                perfContext: { trigger: 'remove-account-clear' },
+                selectedAccount: this.getSelectedAccount.call(set, { num }),
+              });
+            }
             return selectionResult;
           }
         }

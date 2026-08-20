@@ -80,6 +80,23 @@ type IAccountSelectorPerfE2ETrace = Record<string, unknown> & {
 const accountSelectorPerfE2ETraceBuffer: IAccountSelectorPerfE2ETrace[] = [];
 let accountSelectorPerfE2EDroppedCount = 0;
 
+// Runtime override for perf attribution under E2E. Defaults to enabled so
+// existing E2E flows keep their tracing; an explicit false makes
+// isAccountSelectorPerfDebugEnabled() return false, which is the production
+// wiring (attribution WeakMaps stay empty, no perf trace calls). Module-scoped
+// like the trace buffer above: web/desktop E2E run a single JS runtime, so one
+// flag covers both UI and background callers. Split-runtime targets would need
+// the override set in each runtime.
+let accountSelectorPerfE2EAttributionEnabled = true;
+
+export function setAccountSelectorPerfE2EAttributionEnabled(enabled: boolean) {
+  accountSelectorPerfE2EAttributionEnabled = enabled;
+}
+
+export function isAccountSelectorPerfE2EAttributionEnabled() {
+  return accountSelectorPerfE2EAttributionEnabled;
+}
+
 export function drainAccountSelectorPerfE2ETrace() {
   const events = accountSelectorPerfE2ETraceBuffer.splice(0);
   const droppedCount = accountSelectorPerfE2EDroppedCount;

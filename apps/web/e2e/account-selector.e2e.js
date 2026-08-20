@@ -850,6 +850,28 @@ async function configurePerfTrace(page, devOnlyPassword) {
   assert.equal(result.enabled, true, 'AccountSelector perf logger is disabled');
 }
 
+// Disabling attribution reproduces the production perf wiring (empty
+// attribution WeakMaps, no perf traces) while isE2E stays true, so scenarios
+// can verify behavior that must not depend on perf metadata.
+async function configurePerfAttribution(page, devOnlyPassword, enabled) {
+  const result = await page.evaluate(
+    ({ attributionEnabled, password }) =>
+      globalThis.$$appGlobals.$backgroundApiProxy.serviceE2E.configureAccountSelectorPerfE2E(
+        {
+          $$devOnlyPassword: password,
+          attributionEnabled,
+          enabled: true,
+        },
+      ),
+    { attributionEnabled: enabled, password: devOnlyPassword },
+  );
+  assert.equal(
+    result.attributionEnabled,
+    enabled,
+    'AccountSelector perf attribution override was not applied',
+  );
+}
+
 async function drainPerfTrace(page, devOnlyPassword) {
   return page.evaluate(
     ({ password }) =>
@@ -4060,6 +4082,118 @@ async function runBulkSendAccountRemovalScenario(
     'Removing num 0 must leave BulkSend addressInput num 1 empty',
   );
 
+  // Perf-off regression: repeat the removal clearing with perf attribution
+  // disabled at runtime. This is the production wiring — no perf metadata
+  // exists, so the clearing must work through the formal reload payload
+  // instead of trace attribution. Uses a disposable account so later
+  // scenarios keep the wallet's index-0 account.
+  const perfOffIndexedAccountId = await page.evaluate(
+    async ({ walletId }) => {
+      const api = globalThis.$$appGlobals.$backgroundApiProxy;
+      const added = await api.serviceAccount.addHDNextIndexedAccount({
+        walletId,
+      });
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const indexedAccount = await api.serviceAccount.getIndexedAccountSafe({
+          id: added.indexedAccountId,
+        });
+        if (indexedAccount) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      await api.serviceAccount.addHDOrHWAccounts({
+        deriveType: 'default',
+        indexedAccountId: added.indexedAccountId,
+        networkId: 'evm--1',
+        walletId,
+      });
+      return added.indexedAccountId;
+    },
+    { walletId: removedTarget.walletId },
+  );
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await configurePerfAttribution(page, devOnlyPassword, false);
+  const perfOffTarget = {
+    fixtureId: removedTarget.fixtureId,
+    // Row 1: the wallet keeps its index-0 account and the freshly added
+    // account sorts after it.
+    index: 1,
+    indexedAccountId: perfOffIndexedAccountId,
+    walletId: removedTarget.walletId,
+  };
+  const perfOffSelectorButton = await getUniqueVisibleByTestID(
+    page,
+    AddressInputTestIDs.accountSelectorButton,
+  );
+  await perfOffSelectorButton.click({ timeout: pageTimeoutMs });
+  await getUniqueVisibleByTestID(page, AccountManagerTestIDs.walletList);
+  const perfOffWallet = await getUniqueVisibleByTestID(
+    page,
+    AccountManagerTestIDs.wallet(perfOffTarget.walletId),
+  );
+  await perfOffWallet.click({ timeout: pageTimeoutMs });
+  const perfOffAccount = await getUniqueVisibleByTestID(
+    page,
+    AccountManagerTestIDs.accountItem(perfOffTarget.index),
+  );
+  await perfOffAccount.click({ timeout: pageTimeoutMs });
+  await assertAccountSelectorStateConsistent(page, perfOffTarget, {
+    assertPersistence: false,
+    assertUI: false,
+    num: 0,
+    sceneName: 'addressInput',
+    sceneUrl: '',
+  });
+  await page.evaluate(
+    async ({ indexedAccountId }) => {
+      const serviceAccount =
+        globalThis.$$appGlobals.$backgroundApiProxy.serviceAccount;
+      const indexedAccount = await serviceAccount.getIndexedAccountSafe({
+        id: indexedAccountId,
+      });
+      if (!indexedAccount) {
+        throw new Error(
+          `Missing BulkSend perf-off removal account ${indexedAccountId}`,
+        );
+      }
+      await serviceAccount.removeAccount({ indexedAccount });
+    },
+    { indexedAccountId: perfOffIndexedAccountId },
+  );
+  await page.waitForFunction(
+    () => {
+      const snapshot =
+        globalThis.$$appGlobals.$$accountSelectorE2EStateAccessor?.getSnapshot?.(
+          {
+            num: 0,
+            sceneName: 'addressInput',
+            sceneUrl: '',
+          },
+        );
+      return Boolean(
+        snapshot &&
+        !snapshot.selected?.walletId &&
+        !snapshot.selected?.indexedAccountId &&
+        !snapshot.selected?.othersWalletAccountId &&
+        !snapshot.active?.walletId &&
+        !snapshot.active?.indexedAccountId,
+      );
+    },
+    undefined,
+    { timeout: pageTimeoutMs },
+  );
+  const perfOffTrace = await drainPerfTrace(page, devOnlyPassword);
+  assert.ok(
+    !perfOffTrace.events.some(
+      (event) =>
+        event.event === 'selectionStateUpdated' ||
+        event.event === 'autoSelectAccountResult',
+    ),
+    'Perf-off removal clearing must not depend on perf attribution events',
+  );
+  await configurePerfAttribution(page, devOnlyPassword, true);
+
   await closeBulkSendAddressInput(page);
   await page.waitForTimeout(1000);
   const closeTrace = await drainPerfTrace(page, devOnlyPassword);
@@ -4067,6 +4201,7 @@ async function runBulkSendAccountRemovalScenario(
     initialTrace,
     selectionTrace,
     removalTrace,
+    perfOffTrace,
     closeTrace,
   );
   assertTraceHealth({ ...trace, phase: 'bulk-send-account-removal' });

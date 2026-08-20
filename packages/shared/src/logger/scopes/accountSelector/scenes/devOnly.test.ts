@@ -190,11 +190,41 @@ describe('account selector development-only logger scenes', () => {
         sceneName: 'home',
         walletKind: 'hw',
       });
+      failureScene.activeReloadFailed({
+        consecutiveFailures: 1,
+        errorMessage: 'bg is not ready',
+        errorName: 'OneKeyLocalError',
+        num: 0,
+        phase: 'build-active-account',
+        previousFailures: undefined,
+        sceneName: 'home',
+      });
+      failureScene.activeReloadRecovered({
+        failuresBeforeRecovery: 4,
+        num: 0,
+        phase: 'build-active-account',
+        sceneName: 'home',
+      });
+      failureScene.selectionSaveFailed({
+        consecutiveFailures: 1,
+        errorMessage: 'simpleDb write failed',
+        errorName: 'OneKeyLocalError',
+        num: 0,
+        previousFailures: undefined,
+        sceneName: 'home',
+      });
+      failureScene.selectionSaveRecovered({
+        failuresBeforeRecovery: 2,
+        num: 0,
+        sceneName: 'home',
+      });
 
       // These are the only trace a support report has for "I tapped an account
       // and nothing happened" — the app cannot show a toast from the state
-      // layer, so silencing them in production would leave nothing at all.
-      expect(failureEmit).toHaveBeenCalledTimes(2);
+      // layer, so silencing them in production would leave nothing at all. The
+      // reload pair covers the quieter version of the same complaint: an empty
+      // account that the UI already marked ready.
+      expect(failureEmit).toHaveBeenCalledTimes(6);
     } finally {
       process.env.NODE_ENV = previousNodeEnv;
     }
@@ -212,6 +242,29 @@ describe('account selector development-only logger scenes', () => {
           reason: 'userSelectAccount',
           sceneName: 'home',
           walletKind: 'hw',
+        }),
+      ),
+    ).not.toContain('hd-1');
+    expect(
+      JSON.stringify(
+        failureScene.activeReloadFailed({
+          consecutiveFailures: 2,
+          errorMessage: 'bg is not ready',
+          errorName: 'OneKeyLocalError',
+          num: 0,
+          phase: 'transfer-gate',
+          previousFailures: 3,
+          sceneName: 'home',
+        }),
+      ),
+    ).not.toContain('hd-1');
+    expect(
+      JSON.stringify(
+        failureScene.activeReloadRecovered({
+          failuresBeforeRecovery: 2,
+          num: 0,
+          phase: 'transfer-gate',
+          sceneName: 'home',
         }),
       ),
     ).not.toContain('hd-1');

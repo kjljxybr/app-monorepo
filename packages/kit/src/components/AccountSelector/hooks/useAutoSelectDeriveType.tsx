@@ -172,8 +172,19 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
             reason: 'autoDeriveFallback',
           });
         logResult(selectionResult.outcome, selectionResult.transitionId);
-      } catch {
+      } catch (error) {
         logResult(cancelled ? 'cancelled' : 'error');
+        if (!cancelled) {
+          // logResult is perf-debug gated, so in production a failure here
+          // leaves no trace while the account keeps no derive type until the
+          // user switches network again. A cancelled run re-fires with the new
+          // deps and recovers on its own, so only the surviving run is logged.
+          defaultLogger.app.error.log(
+            `[useAutoSelectDeriveType] auto derive type failed at phase=${phase}: ${
+              (error as Error | undefined)?.message ?? String(error)
+            }`,
+          );
+        }
       }
     })();
     return () => {
@@ -223,7 +234,16 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
           sceneUrl,
           source: 'global-event',
         })
-        .catch(() => undefined);
+        .catch((error: unknown) => {
+          // Nothing retries this: the listener only runs again on the next
+          // global derive type event, so a failure leaves the local selection
+          // out of sync until the user changes the derive type themselves.
+          defaultLogger.app.error.log(
+            `[useAutoSelectDeriveType] global derive type sync failed: ${
+              (error as Error | undefined)?.message ?? String(error)
+            }`,
+          );
+        });
     };
     appEventBus.on(EAppEventBusNames.GlobalDeriveTypeUpdate, fn);
     return () => {

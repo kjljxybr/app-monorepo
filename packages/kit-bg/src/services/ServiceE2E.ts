@@ -38,7 +38,11 @@ import {
   defaultLoggerConfig,
   loggerConfig,
 } from '@onekeyhq/shared/src/logger/loggerConfig';
-import { drainAccountSelectorPerfE2ETrace } from '@onekeyhq/shared/src/logger/scopes/accountSelector/scenes/perf';
+import {
+  drainAccountSelectorPerfE2ETrace,
+  isAccountSelectorPerfE2EAttributionEnabled,
+  setAccountSelectorPerfE2EAttributionEnabled,
+} from '@onekeyhq/shared/src/logger/scopes/accountSelector/scenes/perf';
 import secureStorageInstance from '@onekeyhq/shared/src/storage/instance/secureStorageInstance';
 import accountUtils from '@onekeyhq/shared/src/utils/accountUtils';
 import bufferUtils from '@onekeyhq/shared/src/utils/bufferUtils';
@@ -640,10 +644,21 @@ class ServiceE2E extends ServiceBase {
 
   @backgroundMethodForDev()
   async configureAccountSelectorPerfE2E({
+    attributionEnabled,
     enabled,
     ...params
-  }: IBackgroundMethodWithDevOnlyPassword & { enabled: boolean }) {
+  }: IBackgroundMethodWithDevOnlyPassword & {
+    enabled: boolean;
+    // Runtime override for perf attribution (isAccountSelectorPerfDebugEnabled
+    // under isE2E). Omitted = keep the current state; E2E boots with it
+    // enabled. An explicit false reproduces the production perf-off wiring so
+    // scenarios can verify behavior that must not depend on perf metadata.
+    attributionEnabled?: boolean;
+  }) {
     checkDevOnlyPassword(params);
+    if (attributionEnabled !== undefined) {
+      setAccountSelectorPerfE2EAttributionEnabled(attributionEnabled);
+    }
     const currentConfig = await defaultLoggerConfig.getSavedLoggerConfig();
     defaultLoggerConfig.saveLoggerConfig({
       ...currentConfig,
@@ -658,6 +673,7 @@ class ServiceE2E extends ServiceBase {
     });
     await timerUtils.wait(400);
     return {
+      attributionEnabled: isAccountSelectorPerfE2EAttributionEnabled(),
       enabled: loggerConfig.shouldLog('accountSelector', 'perf'),
     };
   }
