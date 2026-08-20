@@ -214,9 +214,12 @@ const simulatedDAppSecondaryOrigin =
 // zero-persistence assertion cannot be satisfied by leftovers from an earlier
 // approval of the same origin.
 const simulatedDAppRejectOrigin = 'https://account-selector-reject-e2e.test';
+// Observed steady state is 15-17 commits per modal open across the dapp,
+// dappOps and stress opens (two back-to-back green runs, 2026-08-20), so the
+// default is observed max + 2.
 const dappConnectionProviderCommitLimit = readPositiveNumberEnv(
   'ACCOUNT_SELECTOR_E2E_DAPP_CONNECTION_PROVIDER_COMMIT_MAX',
-  22,
+  19,
 );
 
 // This suite asserts account-selector synchronization, never balances or fiat
@@ -594,58 +597,69 @@ function readJsonObjectEnv(name) {
   return parsed;
 }
 
+// Wall-time budget defaults are calibrated on a dev arm64 Mac at roughly 3-5x
+// the maximum observed over 16 green cycles plus two fresh runs (2026-08-20);
+// the per-budget env vars exist to raise them for slower CI machines.
 const performanceBudgetDefinitions = [
   {
-    defaultLimit: 2000,
+    // Observed p95: 6-17ms.
+    defaultLimit: 100,
     envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_RELOAD_MUTEX_P95_MS',
     event: 'activeReloadResult',
     field: 'mutexWaitMs',
     statistic: 'p95',
   },
   {
-    defaultLimit: 5000,
+    // Observed max: 162-318ms.
+    defaultLimit: 1250,
     envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_RELOAD_MUTEX_MAX_MS',
     event: 'activeReloadResult',
     field: 'mutexWaitMs',
     statistic: 'max',
   },
   {
-    defaultLimit: 3500,
+    // Observed p95: 58-140ms.
+    defaultLimit: 500,
     envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_RELOAD_TOTAL_P95_MS',
     event: 'activeReloadResult',
     field: 'totalMs',
     statistic: 'p95',
   },
   {
-    defaultLimit: 8000,
+    // Observed max: 350-413ms.
+    defaultLimit: 1500,
     envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_RELOAD_TOTAL_MAX_MS',
     event: 'activeReloadResult',
     field: 'totalMs',
     statistic: 'max',
   },
   {
-    defaultLimit: 500,
+    // Observed p95: 41.6-51.3ms.
+    defaultLimit: 250,
     envName: 'ACCOUNT_SELECTOR_E2E_PROVIDER_COMMIT_P95_MS',
     event: 'providerSubtreeCommit',
     field: 'actualDuration',
     statistic: 'p95',
   },
   {
-    defaultLimit: 1500,
+    // Observed max: 70.9-86.8ms.
+    defaultLimit: 400,
     envName: 'ACCOUNT_SELECTOR_E2E_PROVIDER_COMMIT_MAX_MS',
     event: 'providerSubtreeCommit',
     field: 'actualDuration',
     statistic: 'max',
   },
   {
-    defaultLimit: 750,
+    // Observed p95: 1ms in every recorded run; 150 still catches a stall.
+    defaultLimit: 150,
     envName: 'ACCOUNT_SELECTOR_E2E_SELECTION_UPDATE_P95_MS',
     event: 'selectionUpdateResult',
     field: 'totalMs',
     statistic: 'p95',
   },
   {
-    defaultLimit: 15_000,
+    // Observed max: 647-738ms.
+    defaultLimit: 3000,
     envName: 'ACCOUNT_SELECTOR_E2E_STORAGE_INIT_MAX_MS',
     event: 'storageInitResult',
     field: 'totalMs',
