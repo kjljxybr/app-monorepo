@@ -24,6 +24,11 @@ const artifactDir =
   path.join(repoRoot, '.tmp', 'account-selector-e2e');
 const pageTimeoutMs =
   Number(process.env.ACCOUNT_SELECTOR_E2E_TIMEOUT_MS) || 120_000;
+// Budget for an element that should already be rendering. Long enough to absorb
+// a cold first paint on a loaded machine, short enough that a genuine miss is
+// reported without waiting out the full page timeout.
+const uiSettleTimeoutMs =
+  Number(process.env.ACCOUNT_SELECTOR_E2E_UI_SETTLE_TIMEOUT_MS) || 15_000;
 
 function visibleTestIDSelector(testID) {
   return `[data-testid=${JSON.stringify(testID)}]:visible`;
@@ -1771,15 +1776,24 @@ async function selectDeriveTypeViaUI(
   page,
   { deriveType, settingsNetworkId, trigger },
 ) {
+  const itemTestID = `select-item-${deriveType}`;
+  const anyVisibleOption = page.locator(
+    '[data-testid^="select-item-"]:visible',
+  );
   await trigger.click({ timeout: pageTimeoutMs });
   let item;
   try {
-    item = await getUniqueVisibleByTestID(page, `select-item-${deriveType}`, {
-      timeout: 2000,
+    item = await getUniqueVisibleByTestID(page, itemTestID, {
+      timeout: uiSettleTimeoutMs,
     });
   } catch {
-    await trigger.click({ timeout: pageTimeoutMs });
-    item = await getUniqueVisibleByTestID(page, `select-item-${deriveType}`);
+    // The trigger toggles. Clicking it again while the dropdown is already open
+    // closes it and leaves nothing to wait for, which turns a slow first render
+    // into a guaranteed timeout. Only re-open when it is really shut.
+    if ((await anyVisibleOption.count()) === 0) {
+      await trigger.click({ timeout: pageTimeoutMs });
+    }
+    item = await getUniqueVisibleByTestID(page, itemTestID);
   }
   await item.click({ force: true, timeout: pageTimeoutMs });
   await page.waitForFunction(
@@ -3836,12 +3850,12 @@ async function runSendAddressInputScenario(page, devOnlyPassword, fixture) {
   );
 
   await getUniqueVisibleByTestID(page, SendTestIDs.recipientInput, {
-    timeout: 5000,
+    timeout: uiSettleTimeoutMs,
   });
   const accountTab = await getUniqueVisibleByTestID(
     page,
     SendTestIDs.recipientQuickSelectAccountTab,
-    { timeout: 5000 },
+    { timeout: uiSettleTimeoutMs },
   );
   await accountTab.click({ timeout: pageTimeoutMs });
   const recipient = await getUniqueVisibleByTestID(
