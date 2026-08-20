@@ -323,12 +323,26 @@ function useExternalAccountActivate({
         }
         if (accountId && networkId) {
           await timerUtils.wait(600);
-          if (
-            cancelled ||
-            activeAccountRef.current.account?.id !== accountId ||
-            activeAccountRef.current.network?.id !== networkId
-          ) {
+          const activeAccountMoved =
+            activeAccountRef.current.account?.id !== accountId;
+          const activeNetworkMoved =
+            activeAccountRef.current.network?.id !== networkId;
+          if (cancelled || activeAccountMoved || activeNetworkMoved) {
             logResult('cancelled');
+            // A cancelled effect re-runs with the new ids, so it recovers on its
+            // own. This branch is the one that does not: the ids this effect
+            // depends on are unchanged, so nothing retries the sync and the
+            // external account keeps the chain and address it had before.
+            if (!cancelled) {
+              defaultLogger.accountSelector.failure.peerSyncSkipped({
+                connectionKind: describeConnectionKind(connectionInfo),
+                num,
+                reason: activeAccountMoved
+                  ? 'active-account-changed'
+                  : 'active-network-changed',
+                sceneName,
+              });
+            }
             return;
           }
           activationPhase = 'sync-from-peer-wallet';

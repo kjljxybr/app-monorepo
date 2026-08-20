@@ -33,6 +33,31 @@ export class AccountSelectorFailureScene extends BaseScene {
     ];
   }
 
+  // The connector was activated but the peer wallet sync never ran, and nothing
+  // will retry it: the effect only re-runs when the external account id or
+  // network id changes, and neither did. Cancellation from an unmount or a
+  // dependency change is deliberately not logged here — that path re-runs on
+  // its own and would drown this one out on every account switch.
+  @LogToLocal({ level: 'warn' })
+  public peerSyncSkipped({
+    connectionKind,
+    num,
+    reason,
+    sceneName,
+  }: {
+    connectionKind: string;
+    num: number;
+    // Which half of the active account moved out from under the sync while it
+    // waited: the account or the network. They point at different owners.
+    reason: string;
+    sceneName: string | undefined;
+  }) {
+    return [
+      'accountSelector external peer wallet sync skipped',
+      { connectionKind, num, reason, sceneName },
+    ];
+  }
+
   // One entry per selection that visibly did nothing, carrying both halves of
   // the answer: `outcome` is which check rejected it, `entry` is which UI asked.
   // Reading a support log should not require correlating two separate lines.
