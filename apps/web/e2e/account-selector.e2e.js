@@ -577,6 +577,23 @@ function readPositiveNumberEnv(name, fallbackValue) {
   return value;
 }
 
+function readJsonObjectEnv(name) {
+  const rawValue = process.env[name];
+  if (rawValue === undefined || rawValue === '') return undefined;
+  let parsed;
+  try {
+    parsed = JSON.parse(rawValue);
+  } catch (error) {
+    throw new Error(`${name} must be valid JSON: ${error.message}`, {
+      cause: error,
+    });
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`${name} must be a JSON object, received: ${rawValue}`);
+  }
+  return parsed;
+}
+
 const performanceBudgetDefinitions = [
   {
     defaultLimit: 2000,
@@ -638,6 +655,266 @@ const performanceBudgetDefinitions = [
   ...budget,
   limit: readPositiveNumberEnv(budget.envName, budget.defaultLimit),
 }));
+
+// Per-phase Provider render-count budgets: the direct expression of the
+// account-selector render optimization. Each entry caps how many times a
+// perf-labeled Provider subtree commits inside one phase; runTotals cap the
+// whole post-reload window. A budgeted (phase, debugName) pair that is
+// MISSING from a run also fails — silently losing an instrumented Provider
+// must not pass, mirroring the wall-time budgets where a never-observed event
+// fails its budget.
+//
+// Calibration: two back-to-back green runs on a dev arm64 Mac (2026-08-20).
+// Commit counts are scheduling-dependent but not load-sensitive — they jitter
+// roughly 5-15% run to run — so each limit is the observed max plus ~25%
+// headroom (+2 absolute for counts of 5 or less), widened further only for
+// pairs whose 16-cycle history showed larger jitter. slowCommitCount
+// (commits >16ms actualDuration) IS load-sensitive: a busy machine turns fast
+// commits into slow ones without changing their number. Slow limits therefore
+// carry at least 3x headroom (minimum slack +5) and are budgeted per phase
+// total, not per debug name.
+//
+// Override or extend via ACCOUNT_SELECTOR_E2E_PHASE_COMMIT_BUDGETS: a JSON
+// object of this same shape whose entries merge over these defaults.
+const phaseRenderBudgetDefaults = {
+  phases: {
+    allNetworks: {
+      commitCountByDebugName: {
+        'account-selector-modal': 100,
+        'home-page': 220,
+        'perp-header': 7,
+        'perp-route': 6,
+        'swap-route': 48,
+        'unified-network-selector': 109,
+      },
+      slowCommitCount: 174,
+    },
+    autoSelect: {
+      commitCountByDebugName: {
+        'account-selector-modal': 94,
+        'home-page': 162,
+        'perp-header': 9,
+        'perp-route': 8,
+        'swap-route': 57,
+      },
+      slowCommitCount: 90,
+    },
+    bulkSendRemoval: {
+      commitCountByDebugName: {
+        'account-selector-modal': 37,
+        // Verification runs reached 45 against calibration samples of 37-38,
+        // so this entry carries observed max + 25% instead of sample max +25%.
+        'bulk-send-address-input': 57,
+        'home-page': 99,
+        'perp-header': 4,
+        'perp-route': 4,
+        'swap-route': 32,
+      },
+      slowCommitCount: 52,
+    },
+    dapp: {
+      commitCountByDebugName: {
+        'account-selector-modal': 49,
+        'dapp-connection-modal': 20,
+        'home-page': 35,
+        'swap-route': 14,
+      },
+      slowCommitCount: 48,
+    },
+    dappMultiOrigin: {
+      commitCountByDebugName: {
+        'account-selector-modal': 42,
+        'dapp-connection-list:https://account-selector-e2e.test': 30,
+        'dapp-connection-list:https://account-selector-secondary-e2e.test': 35,
+        'dapp-connection-modal': 20,
+        'home-page': 29,
+        'swap-route': 12,
+      },
+      slowCommitCount: 39,
+    },
+    dappOps: {
+      commitCountByDebugName: {
+        'dapp-connection-list:https://account-selector-e2e.test': 18,
+        'dapp-connection-list:https://account-selector-secondary-e2e.test': 20,
+        'dapp-connection-modal': 59,
+        'home-page': 72,
+        'swap-route': 17,
+      },
+      slowCommitCount: 69,
+    },
+    initialization: {
+      commitCountByDebugName: {
+        'home-page': 99,
+        'perp-header': 4,
+        'perp-route': 5,
+        'swap-route': 7,
+      },
+      slowCommitCount: 36,
+    },
+    marketSwapPanel: {
+      commitCountByDebugName: {
+        'account-selector-modal': 72,
+        'home-page': 163,
+        'perp-header': 7,
+        'perp-route': 6,
+        'swap-route': 45,
+        'unified-network-selector': 65,
+      },
+      slowCommitCount: 135,
+    },
+    multiNumCustomNetwork: {
+      commitCountByDebugName: {
+        'home-page': 12,
+        'swap-route': 37,
+      },
+      slowCommitCount: 50,
+    },
+    perps: {
+      commitCountByDebugName: {
+        'account-selector-modal': 49,
+        'home-page': 59,
+        'perp-header': 28,
+        'perp-route': 113,
+        'swap-route': 6,
+      },
+      slowCommitCount: 75,
+    },
+    postPerpsReset: {
+      commitCountByDebugName: {
+        'home-page': 73,
+        'perp-header': 5,
+        'perp-route': 5,
+        'swap-route': 7,
+      },
+      slowCommitCount: 24,
+    },
+    sendAddressInput: {
+      commitCountByDebugName: {
+        'home-page': 50,
+        'send-address-input': 73,
+      },
+      slowCommitCount: 12,
+    },
+    stress: {
+      commitCountByDebugName: {
+        'account-selector-modal': 818,
+        'dapp-connection-modal': 165,
+        'home-page': 1608,
+        'perp-header': 60,
+        'perp-route': 88,
+        'swap-route': 457,
+        'unified-network-selector': 589,
+      },
+      slowCommitCount: 1479,
+    },
+    swapInlineDerive: {
+      commitCountByDebugName: {
+        'account-selector-modal': 67,
+        'home-page': 113,
+        'perp-header': 6,
+        'perp-route': 8,
+        'swap-route': 62,
+        'unified-network-selector': 27,
+      },
+      slowCommitCount: 171,
+    },
+  },
+  runTotals: {
+    commitCount: 6300,
+    slowCommitCount: 2550,
+  },
+};
+
+function mergePhaseRenderBudgets(defaults, overrides) {
+  if (!overrides) return defaults;
+  const merged = {
+    phases: { ...defaults.phases },
+    runTotals: { ...defaults.runTotals, ...overrides.runTotals },
+  };
+  for (const [phase, phaseOverride] of Object.entries(overrides.phases || {})) {
+    const basePhase = merged.phases[phase] || { commitCountByDebugName: {} };
+    merged.phases[phase] = {
+      commitCountByDebugName: {
+        ...basePhase.commitCountByDebugName,
+        ...phaseOverride.commitCountByDebugName,
+      },
+      slowCommitCount:
+        phaseOverride.slowCommitCount ?? basePhase.slowCommitCount,
+    };
+  }
+  return merged;
+}
+
+const phaseRenderBudgets = mergePhaseRenderBudgets(
+  phaseRenderBudgetDefaults,
+  readJsonObjectEnv('ACCOUNT_SELECTOR_E2E_PHASE_COMMIT_BUDGETS'),
+);
+
+function evaluatePhaseRenderBudgets({ phaseSummaries, summary }) {
+  const results = [];
+  for (const [phase, phaseBudget] of Object.entries(
+    phaseRenderBudgets.phases,
+  )) {
+    const providerRenders = phaseSummaries[phase]?.providerRenders;
+    for (const [debugName, limit] of Object.entries(
+      phaseBudget.commitCountByDebugName,
+    )) {
+      const observed = providerRenders?.byDebugName?.[debugName]?.commitCount;
+      results.push({
+        debugName,
+        limit,
+        metric: 'commitCount',
+        observed,
+        passed: typeof observed === 'number' && observed <= limit,
+        phase,
+        scope: 'phase',
+      });
+    }
+    if (typeof phaseBudget.slowCommitCount === 'number') {
+      const observed = providerRenders?.slowCommitCount;
+      results.push({
+        limit: phaseBudget.slowCommitCount,
+        metric: 'slowCommitCount',
+        observed,
+        passed:
+          typeof observed === 'number' &&
+          observed <= phaseBudget.slowCommitCount,
+        phase,
+        scope: 'phase',
+      });
+    }
+  }
+  for (const metric of ['commitCount', 'slowCommitCount']) {
+    const limit = phaseRenderBudgets.runTotals[metric];
+    if (typeof limit === 'number') {
+      const observed = summary.providerRenders[metric];
+      results.push({
+        limit,
+        metric,
+        observed,
+        passed: typeof observed === 'number' && observed <= limit,
+        scope: 'run-total',
+      });
+    }
+  }
+  return results;
+}
+
+function assertPhaseRenderBudgets(results) {
+  const failures = results.filter((result) => !result.passed);
+  assert.deepEqual(
+    failures.map(({ debugName, limit, metric, observed, phase, scope }) => ({
+      debugName,
+      limit,
+      metric,
+      observed,
+      phase,
+      scope,
+    })),
+    [],
+    'AccountSelector phase render budget exceeded',
+  );
+}
 
 function log(message) {
   console.log(`[account-selector-e2e] ${message}`);
@@ -6322,6 +6599,26 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       [],
       'An active reload must not commit twice in the same consumer',
     );
+    const phaseSummaries = {
+      allNetworks: buildTraceSummary(allNetworksTrace.events),
+      autoSelect: buildTraceSummary(autoSelectTrace.events),
+      bulkSendRemoval: buildTraceSummary(bulkSendRemovalTrace.events),
+      dapp: buildTraceSummary(dappTrace.events),
+      dappMultiOrigin: buildTraceSummary(multiOriginDAppTrace.events),
+      dappOps: buildTraceSummary(dappOpsTrace.events),
+      initialization: buildTraceSummary(initTrace.events),
+      marketSwapPanel: buildTraceSummary(marketSwapPanelTrace.events),
+      multiNumCustomNetwork: buildTraceSummary(multiNumResult.trace.events),
+      perps: buildTraceSummary(perpsTrace.events),
+      postPerpsReset: buildTraceSummary(perpsResetTrace.events),
+      sendAddressInput: buildTraceSummary(sendAddressInputTrace.events),
+      stress: buildTraceSummary(stressTrace.events),
+      swapInlineDerive: buildTraceSummary(swapInlineDeriveTrace.events),
+    };
+    const phaseRenderBudgetResults = evaluatePhaseRenderBudgets({
+      phaseSummaries,
+      summary,
+    });
     const report = {
       cycle,
       cdpExceptionCount: cdpExceptions.length,
@@ -6329,22 +6626,8 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       iterations,
       pageErrorCount: pageErrors.length,
       pageErrors,
-      phaseSummaries: {
-        allNetworks: buildTraceSummary(allNetworksTrace.events),
-        autoSelect: buildTraceSummary(autoSelectTrace.events),
-        bulkSendRemoval: buildTraceSummary(bulkSendRemovalTrace.events),
-        dapp: buildTraceSummary(dappTrace.events),
-        dappMultiOrigin: buildTraceSummary(multiOriginDAppTrace.events),
-        dappOps: buildTraceSummary(dappOpsTrace.events),
-        initialization: buildTraceSummary(initTrace.events),
-        marketSwapPanel: buildTraceSummary(marketSwapPanelTrace.events),
-        multiNumCustomNetwork: buildTraceSummary(multiNumResult.trace.events),
-        perps: buildTraceSummary(perpsTrace.events),
-        postPerpsReset: buildTraceSummary(perpsResetTrace.events),
-        sendAddressInput: buildTraceSummary(sendAddressInputTrace.events),
-        stress: buildTraceSummary(stressTrace.events),
-        swapInlineDerive: buildTraceSummary(swapInlineDeriveTrace.events),
-      },
+      phaseRenderBudgets: phaseRenderBudgetResults,
+      phaseSummaries,
       performanceBudgets,
       summary,
     };
@@ -6378,6 +6661,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       )}\n`,
     );
     assertPerformanceBudgets(performanceBudgets);
+    assertPhaseRenderBudgets(phaseRenderBudgetResults);
     assert.deepEqual(pageErrors, [], 'Web page emitted uncaught errors');
     assert.deepEqual(
       cdpExceptions,
