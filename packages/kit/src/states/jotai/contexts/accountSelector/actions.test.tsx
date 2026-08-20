@@ -602,11 +602,12 @@ describe('useAccountSelectorActions', () => {
   });
 
   it('only alerts on stale drops that are truly consecutive', async () => {
-    // The alert throws off production (E2E included), so counting drops that are
-    // merely frequent rather than consecutive would abort unrelated callers.
+    // Counting drops that are merely frequent rather than consecutive would
+    // report callers that each lost one race for their own valid reason.
     jest.replaceProperty(platformEnv, 'isDev', true);
-    // Silences the alert's own console.error; the throw is what is asserted.
-    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const consoleErrorSpy = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
 
     const { store, Wrapper } = createWrapper();
     store.set(accountSelectorContextDataAtom(), {
@@ -637,13 +638,94 @@ describe('useAccountSelectorActions', () => {
       expect((await dropUpdate()).outcome).toBe('stale');
       expect((await dropUpdate()).outcome).toBe('stale');
     });
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
 
     // The alert is still armed: one more drop closes an unbroken run of 3.
     await act(async () => {
-      await expect(dropUpdate()).rejects.toThrow(
-        /3 consecutive stale selection drops/,
+      expect((await dropUpdate()).outcome).toBe('stale');
+    });
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/3 consecutive stale selection drops/),
+    );
+  });
+
+  it('reports the alert without throwing into callers that cannot catch', async () => {
+    // The alert runs inside the update mutex and most callers on the path have
+    // no catch (useAutoSelectAccount, the event bus handlers), so a throw became
+    // an unhandled rejection; confirmAccountSelect, the one caller that does
+    // catch, turned it into a "save failed" toast naming a symptom. It reports.
+    jest.replaceProperty(platformEnv, 'isDev', true);
+    const consoleErrorSpy = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+
+    const { store, Wrapper } = createWrapper();
+    store.set(accountSelectorContextDataAtom(), {
+      sceneName: EAccountSelectorSceneName.home,
+      sceneUrl: 'https://never-throws-stale-drop.test',
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const dropUpdate = () =>
+      result.current.updateSelectedAccount({
+        num: 0,
+        reason: 'never-throw-stale-drop-test',
+        shouldCommit: () => false,
+        builder: (current) => ({ ...current, networkId: 'evm--1' }),
+      });
+
+    await act(async () => {
+      for (let i = 0; i < 5; i += 1) {
+        // Resolves every time - the run is well past the alert threshold.
+        expect((await dropUpdate()).outcome).toBe('stale');
+      }
+    });
+    expect(consoleErrorSpy).toHaveBeenCalled();
+  });
+
+  it('counts stale drops per caller so unrelated callers cannot add up', async () => {
+    // A slow cold start has several callers racing on the same scene and num.
+    // Each may legitimately lose once; only a caller that keeps losing its own
+    // update is worth an alert.
+    jest.replaceProperty(platformEnv, 'isDev', true);
+    const consoleErrorSpy = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+
+    const { store, Wrapper } = createWrapper();
+    store.set(accountSelectorContextDataAtom(), {
+      sceneName: EAccountSelectorSceneName.home,
+      sceneUrl: 'https://per-caller-stale-drop.test',
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const dropUpdateFrom = (reason: string) =>
+      result.current.updateSelectedAccount({
+        num: 0,
+        reason,
+        shouldCommit: () => false,
+        builder: (current) => ({ ...current, networkId: 'evm--1' }),
+      });
+
+    await act(async () => {
+      expect((await dropUpdateFrom('autoSelectNextAccount')).outcome).toBe(
+        'stale',
+      );
+      expect(
+        (await dropUpdateFrom('syncHomeAndSwapSelectedAccount')).outcome,
+      ).toBe('stale');
+      expect((await dropUpdateFrom('autoDeriveGlobalSync')).outcome).toBe(
+        'stale',
+      );
+      expect((await dropUpdateFrom('confirmAccountSelect')).outcome).toBe(
+        'stale',
       );
     });
+
+    // Four drops on one scene/num, but no caller lost more than once.
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
   });
 
   it('bounds the stale drop counter map rather than growing it per scene url', async () => {
@@ -662,7 +744,7 @@ describe('useAccountSelectorActions', () => {
     counts.clear();
     try {
       for (let i = 0; i < 1000; i += 1) {
-        counts.set(`discover__https://dapp-${i}.test__0`, 1);
+        counts.set(`discover__https://dapp-${i}.test__0__some-caller`, 1);
       }
       expect(counts.size).toBe(1000);
 
@@ -1173,6 +1255,76 @@ describe('useAccountSelectorActions', () => {
     expect(store.get(activeAccountsAtom())[0]).toBe(currentActiveAccount);
   });
 
+  it('still commits a reload when only focusedWallet moved under it', async () => {
+    // focusedWallet decides which wallet the selector panel highlights and is
+    // not an input to the active account, so nothing re-schedules a reload when
+    // it changes. Judging staleness on it stranded the active account on the
+    // previous selection: reopening the selector writes focusedWallet from the
+    // (still stale) active account, the in-flight reload is dropped, and
+    // re-picking the same account is a noop that schedules nothing.
+    const selection = createHdSelectedAccount('hd-1--0');
+    const selectionWithOtherFocus = {
+      ...selection,
+      focusedWallet: 'hd-2',
+    };
+    const builtActiveAccount = {
+      ...defaultActiveAccountInfo(),
+      ready: true,
+    };
+    mockBuildActiveAccountInfoFromSelectedAccount.mockResolvedValue({
+      activeAccount: builtActiveAccount,
+    });
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: selectionWithOtherFocus });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let reloadOutcome: string | undefined;
+    await act(async () => {
+      reloadOutcome = (
+        await result.current.reloadActiveAccountInfo({
+          num: 0,
+          selectedAccount: selection,
+        })
+      ).outcome;
+    });
+
+    expect(reloadOutcome).toBe('commit');
+    expect(mockBuildActiveAccountInfoFromSelectedAccount).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(store.get(activeAccountsAtom())[0]).toBe(builtActiveAccount);
+  });
+
+  it('marks the init gate done even when the reload is dropped as stale', async () => {
+    // initFromStorage clears this map for every num. If a stale reload left the
+    // gate closed, only num 0 was restored by the init fallback and swap
+    // (num 1) or discover stayed on a skeleton until some later reload
+    // happened to commit.
+    const currentSelection = createHdSelectedAccount('hd-1--1');
+    const staleSelection = createHdSelectedAccount('hd-1--0');
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 1: currentSelection });
+    store.set(accountSelectorActiveAccountInitDoneAtom(), {});
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let reloadOutcome: string | undefined;
+    await act(async () => {
+      reloadOutcome = (
+        await result.current.reloadActiveAccountInfo({
+          num: 1,
+          selectedAccount: staleSelection,
+        })
+      ).outcome;
+    });
+
+    expect(reloadOutcome).toBe('stale-before-build');
+    expect(store.get(accountSelectorActiveAccountInitDoneAtom())[1]).toBe(true);
+  });
+
   it('skips a superseded active-account reload after waiting for the mutex', async () => {
     const firstBuild = createDeferred<IBuildActiveAccountInfoResult>();
     const activeAccount = {
@@ -1619,6 +1771,35 @@ describe('useAccountSelectorActions', () => {
       });
 
       expect(confirmed).toBe(true);
+    });
+
+    it('rejects when the selection cannot be persisted', async () => {
+      // The contract every call site is written against: a superseded selection
+      // resolves false, but a persistence failure rejects so the caller can tell
+      // the user their pick was not saved instead of closing the selector on a
+      // selection that only exists in memory. Callers must keep catching this.
+      mockSaveSelectedAccount.mockRejectedValueOnce(
+        new Error('storage unavailable'),
+      );
+
+      const { store, Wrapper } = createWrapper();
+      store.set(accountSelectorContextDataAtom(), {
+        sceneName: EAccountSelectorSceneName.home,
+      });
+      seedSelection(store, 'tron--0x2b6653dc');
+      const { result } = renderHook(() => useAccountSelectorActions().current, {
+        wrapper: Wrapper,
+      });
+
+      await act(async () => {
+        await expect(
+          result.current.confirmAccountSelect({
+            indexedAccount: qrIndexedAccount,
+            othersWalletAccount: undefined,
+            num: 0,
+          }),
+        ).rejects.toThrow('storage unavailable');
+      });
     });
 
     it('drops a stale fallback result when a newer selection completes first', async () => {

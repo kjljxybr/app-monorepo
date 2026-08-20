@@ -117,6 +117,7 @@ import {
   recordSelectedAccountPerfStateUpdate,
 } from './perfDebug';
 import {
+  isSameActiveAccountRelevantSelection,
   isSameSelectedAccount,
   isSameSelectedAccountsMap,
 } from './selectedAccountCompare';
@@ -200,7 +201,7 @@ type ISelectionWriteRevisionPolicy = 'bumped' | 'untracked';
 // timestamps: the values differ on every drop, which would defeat the log
 // transport's identical-message collapsing, and the useful signal is only
 // whether the revision moved or the selection itself changed.
-type ISelectionStaleGuard = 'revision' | 'selection';
+type ISelectionStaleGuard = 'revision' | 'selection' | 'commit-guard';
 
 type ISelectionUpdateOutcome = 'commit' | 'noop' | 'skip-empty' | 'stale';
 
@@ -228,12 +229,22 @@ const getNextSelectionUpdatedAt = ({
 }: {
   currentUpdatedAt?: number;
   requestedUpdatedAt?: number;
-}) =>
-  Math.max(
-    Date.now(),
-    currentUpdatedAt === undefined ? 0 : currentUpdatedAt + 1,
-    requestedUpdatedAt || 0,
-  );
+}) => {
+  const monotonicFloor =
+    currentUpdatedAt === undefined ? 0 : currentUpdatedAt + 1;
+  // A requested revision carries a peer runtime's ordering (extension runs the
+  // UI and background as separate runtimes, and every cross scene sync event
+  // ships the revision it was emitted with). Clamping it up to Date.now() would
+  // replace that ordering with our receive time: two updates emitted in quick
+  // succession would both land on a receive timestamp far above the second
+  // payload's revision, so the second one reads as older than what we already
+  // hold and is dropped with nothing to retry it. Only the monotonic floor
+  // applies here - local updates below still take the wall clock.
+  if (requestedUpdatedAt !== undefined) {
+    return Math.max(requestedUpdatedAt, monotonicFloor);
+  }
+  return Math.max(Date.now(), monotonicFloor);
+};
 
 type IAccountSelectorRecentSelectionCacheItem = {
   version: typeof ACCOUNT_SELECTOR_RECENT_SELECTION_CACHE_VERSION;
@@ -813,7 +824,8 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
     }
     const hasSelectedAccount = Object.values(selectedAccountsMap).some(
       (selectedAccount) =>
-        selectedAccount && !isEqual(selectedAccount, defaultSelectedAccount()),
+        selectedAccount &&
+        !isSameSelectedAccount(selectedAccount, defaultSelectedAccount()),
     );
     if (!hasSelectedAccount) {
       return false;
@@ -955,7 +967,20 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         // });
         const currentActiveAccount =
           get(activeAccountsAtom())?.[num] || defaultActiveAccountInfo();
+        const markActiveAccountInitDone = () => {
+          const initDone = get(accountSelectorActiveAccountInitDoneAtom());
+          if (!initDone[num]) {
+            set(accountSelectorActiveAccountInitDoneAtom(), {
+              ...initDone,
+              [num]: true,
+            });
+          }
+        };
         if (shouldReload && !shouldReload()) {
+          // A newer schedule owns this num, so the init gate is settled either
+          // way. Leaving it closed keeps every num but 0 on a skeleton until
+          // some later reload happens to commit.
+          markActiveAccountInitDone();
           if (perfEnabled) {
             defaultLogger.accountSelector.perf.trace('activeReloadResult', {
               ...buildResultTiming(),
@@ -981,8 +1006,12 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           this.getSelectedAccount.call(set, { num }) ||
           defaultSelectedAccount();
         if (
-          !isSameSelectedAccount(selectedAccountBeforeBuild, selectedAccount)
+          !isSameActiveAccountRelevantSelection(
+            selectedAccountBeforeBuild,
+            selectedAccount,
+          )
         ) {
+          markActiveAccountInitDone();
           if (perfEnabled) {
             defaultLogger.accountSelector.perf.trace('activeReloadResult', {
               ...buildResultTiming(),
@@ -1004,15 +1033,6 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             outcome: 'stale-before-build',
           };
         }
-        const markActiveAccountInitDone = () => {
-          const initDone = get(accountSelectorActiveAccountInitDoneAtom());
-          if (!initDone[num]) {
-            set(accountSelectorActiveAccountInitDoneAtom(), {
-              ...initDone,
-              [num]: true,
-            });
-          }
-        };
         if (
           !forceIncompleteSelectionReload &&
           shouldKeepCurrentActiveAccountForIncompleteSelection({
@@ -1142,7 +1162,13 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         const currentSelectedAccount =
           this.getSelectedAccount.call(set, { num }) ||
           defaultSelectedAccount();
-        if (!isSameSelectedAccount(currentSelectedAccount, selectedAccount)) {
+        if (
+          !isSameActiveAccountRelevantSelection(
+            currentSelectedAccount,
+            selectedAccount,
+          )
+        ) {
+          markActiveAccountInitDone();
           if (perfEnabled) {
             defaultLogger.accountSelector.perf.trace('activeReloadResult', {
               ...buildResultTiming(),
@@ -1909,9 +1935,14 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 },
               );
             }
+            // Bucketed by reason as well as scene/num: the alert means "this
+            // caller keeps losing its update". Without the reason, unrelated
+            // callers that each drop once for their own valid race (auto select,
+            // cross scene sync, auto derive, a user tap) add up into a false
+            // alert during a slow cold start.
             const staleCountKey = `${sceneInfo?.sceneName ?? ''}__${
               sceneInfo?.sceneUrl ?? ''
-            }__${num}`;
+            }__${num}__${requestReason ?? ''}`;
             // Reset on the negated condition rather than on an allow-list of
             // outcomes: 'stale' is the only outcome that discards the update, so
             // every other one (including any added later) ends the run. Listing
@@ -1974,18 +2005,20 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                     },
                   );
                 }
-                // Throwing is the fastest signal while developing, but this runs
-                // inside the update mutex and nothing on the path catches
-                // (useAutoSelectAccount, ConnectWalletModal), so under E2E it
-                // became an unhandled rejection that failed the page-error check
-                // with no indication of the real problem. E2E asserts the trace
-                // event above instead, which fails just as hard and says why.
+                // Reported, never thrown. This runs inside the update mutex and
+                // most callers on the path do not catch (useAutoSelectAccount,
+                // the event bus handlers), so throwing produced an unhandled
+                // rejection; the one caller that does catch
+                // (confirmAccountSelect) turned it into a "save failed" toast
+                // that named a symptom instead of the cause. E2E asserts the
+                // trace event above and dev gets the console error below, both
+                // of which fail just as loudly and say why.
                 if (platformEnv.isDev && !platformEnv.isE2E) {
-                  const message = `AccountSelector: ${consecutiveCount} consecutive stale selection drops without a commit (scene=${
-                    sceneInfo?.sceneName ?? 'unknown'
-                  }, num=${num}, reason=${requestReason})`;
-                  console.error(message);
-                  throw new OneKeyLocalError(message);
+                  console.error(
+                    `AccountSelector: ${consecutiveCount} consecutive stale selection drops without a commit (scene=${
+                      sceneInfo?.sceneName ?? 'unknown'
+                    }, num=${num}, reason=${requestReason})`,
+                  );
                 }
               }
             }
@@ -2169,6 +2202,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             return logSelectionUpdateResult({
               outcome: 'stale',
               selectedAccount: oldSelectedAccount,
+              staleGuard: 'commit-guard',
             });
           }
           if (isSameSelectedAccount(oldSelectedAccount, newSelectedAccount)) {
@@ -4128,6 +4162,11 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         });
       }
       set(accountSelectorStorageInitDoneAtom(), () => false);
+      // Remember which nums were already settled so the finally block can
+      // restore every one of them, not just home.
+      const previouslyInitDoneNums = Object.keys(
+        get(accountSelectorActiveAccountInitDoneAtom()),
+      );
       set(accountSelectorActiveAccountInitDoneAtom(), {});
       try {
         const { serviceAccountSelector } = backgroundApiProxy;
@@ -4316,7 +4355,10 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             ([num, selectedAccount]) => {
               if (
                 selectedAccount &&
-                !isEqual(selectedAccount, defaultSelectedAccount())
+                !isSameSelectedAccount(
+                  selectedAccount,
+                  defaultSelectedAccount(),
+                )
               ) {
                 void this.saveToStorage
                   .call(set, {
@@ -4441,10 +4483,15 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           set(accountSelectorStorageInitDoneAtom(), () => true);
           // Home reads account selector num 0. Finalize it here so an init error
           // after a warm-cache reload cannot leave the no-wallet page blank.
-          set(accountSelectorActiveAccountInitDoneAtom(), (v) => ({
-            ...v,
-            0: true,
-          }));
+          // Every num this init reset gets the same treatment, otherwise swap
+          // (num 1) and discover stay on a skeleton after a stale reload.
+          set(accountSelectorActiveAccountInitDoneAtom(), (v) => {
+            const next: Record<number, boolean> = { ...v, 0: true };
+            previouslyInitDoneNums.forEach((numKey) => {
+              next[Number(numKey)] = true;
+            });
+            return next;
+          });
           logResult('ready-finalized');
         } else {
           logResult(`stale-${phase}`);
@@ -4669,7 +4716,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 selectedAccount = defaultSelectedAccount();
               }
             }
-            if (isEqual(selectedAccount, defaultSelectedAccount())) {
+            if (
+              isSameSelectedAccount(selectedAccount, defaultSelectedAccount())
+            ) {
               logStorageResult({ outcome: 'skip-default-selection' });
               return;
             }

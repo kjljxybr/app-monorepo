@@ -139,7 +139,16 @@ function SyncDappAccountToHomeCmp({
         void tourVisited(1);
       }
     };
-    void sync();
+    // Background alignment: the account lookups inside can reject on their own,
+    // and this is not something the user asked for, so it stays silent in the
+    // log rather than surfacing or becoming an unhandled rejection.
+    void sync().catch((error) => {
+      defaultLogger.app.error.log(
+        `SyncDappAccountToHome failed: ${
+          (error as Error | undefined)?.message || String(error)
+        }`,
+      );
+    });
   }, [
     dAppAccountInfos,
     actions,

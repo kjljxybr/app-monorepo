@@ -19,6 +19,29 @@ export function isSameSelectedAccount(
   return isEqual(omitBy(first, isUndefined), omitBy(second, isUndefined));
 }
 
+// The only selection fields an active account is built from. focusedWallet is
+// deliberately absent: it drives which wallet the selector panel highlights and
+// never changes the resolved account, so it must not invalidate a reload.
+export const ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS = [
+  'walletId',
+  'indexedAccountId',
+  'othersWalletAccountId',
+  'networkId',
+  'deriveType',
+] as const;
+
+// Reload staleness must be judged on exactly the fields that schedule a reload.
+// A wider comparison drops the in-flight reload for a change nothing will
+// re-schedule, leaving the active account pinned to the previous selection.
+export function isSameActiveAccountRelevantSelection(
+  first: IAccountSelectorSelectedAccount | undefined,
+  second: IAccountSelectorSelectedAccount | undefined,
+) {
+  return ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS.every(
+    (field) => first?.[field] === second?.[field],
+  );
+}
+
 function collectDefinedSelectedAccounts(
   selectedAccountsMap: IAccountSelectorSelectedAccountsMap | undefined,
 ) {

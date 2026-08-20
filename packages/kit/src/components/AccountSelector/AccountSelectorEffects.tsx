@@ -48,6 +48,10 @@ import {
   isAccountSelectorPerfDebugEnabled,
   takeSelectedAccountReloadAttribution,
 } from '../../states/jotai/contexts/accountSelector/perfDebug';
+import {
+  ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS,
+  isSameSelectedAccount,
+} from '../../states/jotai/contexts/accountSelector/selectedAccountCompare';
 
 import { useAutoSelectAccount } from './hooks/useAutoSelectAccount';
 import { useAutoSelectDeriveType } from './hooks/useAutoSelectDeriveType';
@@ -56,6 +60,10 @@ import { useAutoSelectNetwork } from './hooks/useAutoSelectNetwork';
 const swapToAnotherAccountSwitchOnAtom = selectAtom(
   settingsAtom.atom(),
   (settings) => settings.swapToAnotherAccountSwitchOn,
+);
+
+const activeReloadFieldSet = new Set<string>(
+  ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS,
 );
 
 type IActiveAccountReloadRequest = {
@@ -432,6 +440,10 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
   useAutoSelectDeriveType({ num });
   useExternalAccountActivate({ effectInstanceId, num, sceneName });
 
+  // Must list exactly ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS: reload staleness
+  // is judged on those fields, so anything scheduled on a narrower set would be
+  // dropped with nothing left to re-schedule it. The literal form is required
+  // for react-hooks/exhaustive-deps to analyse the deps array.
   const activeAccountReloadDeps = useMemo(
     () => [
       selectedAccount.walletId,
@@ -562,6 +574,11 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
             return;
           }
           if (isInTransferImportOrBackupRestoreFlow) {
+            // Dropped without a retry of its own, and that is fine: every path
+            // that clears the flow flag funnels through
+            // ServicePrimeTransfer.finallyImportProgress, which emits
+            // WalletUpdate and AccountUpdate - both scheduled below - so the
+            // reload is re-issued once the flow ends.
             logDispatch({
               gateMs: getElapsedMs(gateStartedAt),
               outcome: 'skip-transfer-flow',
@@ -814,6 +831,9 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
   );
 
   const lastAutoSavedUpdatedAtRef = useRef<number | undefined>(undefined);
+  const lastAutoSavedSelectionRef = useRef<
+    IAccountSelectorSelectedAccount | undefined
+  >(undefined);
   const autoSaveToStorage = useCallback(async () => {
     // do not save before initFromStorage() completes
     if (!isReady) {
@@ -828,9 +848,15 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
       }
       return;
     }
+    // The selection has to match too, not just the revision. Writes made with
+    // the 'untracked' revision policy (initFromStorage applying the DB map)
+    // change a user visible selection while leaving updatedAt alone, and a
+    // revision-only check would skip those silently - no write, no event, and
+    // no later trigger because the revision never moves again.
     if (
       updateMeta?.updatedAt !== undefined &&
-      lastAutoSavedUpdatedAtRef.current === updateMeta.updatedAt
+      lastAutoSavedUpdatedAtRef.current === updateMeta.updatedAt &&
+      isSameSelectedAccount(lastAutoSavedSelectionRef.current, selectedAccount)
     ) {
       if (isAccountSelectorPerfDebugEnabled()) {
         defaultLogger.accountSelector.perf.trace('selectionStorageSkipped', {
@@ -892,6 +918,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
         });
       }
       lastAutoSavedUpdatedAtRef.current = updateMeta?.updatedAt;
+      lastAutoSavedSelectionRef.current = selectedAccount;
     } else {
       if (isAccountSelectorPerfDebugEnabled()) {
         defaultLogger.accountSelector.perf.trace('selectionStorageSkipped', {
@@ -938,16 +965,9 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
       return;
     }
     lastReloadNotRequiredTransitionIdRef.current = transitionMeta.transitionId;
-    const activeReloadFields = new Set([
-      'walletId',
-      'indexedAccountId',
-      'othersWalletAccountId',
-      'networkId',
-      'deriveType',
-    ]);
     if (
       !transitionMeta.changedFields.some((field) =>
-        activeReloadFields.has(field),
+        activeReloadFieldSet.has(field),
       ) &&
       isAccountSelectorPerfDebugEnabled()
     ) {

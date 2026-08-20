@@ -137,7 +137,7 @@ function getHomeSelectedAccountFromContextStore() {
   return homeAccountSelectorStore?.get(selectedAccountsAtom())?.[0];
 }
 
-async function getLatestHomeSelectedAccount() {
+export async function getLatestHomeSelectedAccount() {
   const homeSelectedAccountFromStore = getHomeSelectedAccountFromContextStore();
   if (homeSelectedAccountFromStore) {
     return homeSelectedAccountFromStore;

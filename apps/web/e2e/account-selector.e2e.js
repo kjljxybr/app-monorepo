@@ -1955,6 +1955,17 @@ async function runRapidSelectionBursts(page, fixture) {
     await selectWalletAccount(page, target, { waitForCommit: false });
   }
   const finalAccount = accountTargets[accountTargets.length - 1];
+
+  // Reopening the selector writes focusedWallet from the active account, and it
+  // lands here while the last pick's reload is still in flight. focusedWallet is
+  // not an input to the active account, so nothing re-schedules a reload for it:
+  // any reload dropped on account of it is dropped for good, and the active
+  // account stays on the previous pick. Every other burst ends on a field that
+  // does schedule one, so this is the only shape that exposes it.
+  await openAccountSelector(page);
+  await page.keyboard.press('Escape');
+  await waitForNoVisibleTestID(page, AccountManagerTestIDs.walletList);
+
   await waitForPersistedSelection(page, {
     indexedAccountId: finalAccount.indexedAccountId,
     walletId: finalAccount.walletId,
