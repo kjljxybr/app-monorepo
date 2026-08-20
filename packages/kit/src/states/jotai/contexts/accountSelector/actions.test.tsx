@@ -2,7 +2,7 @@
 
 import type { ReactNode } from 'react';
 
-import { act, renderHook, waitFor } from '@testing-library/react';
+import { act, render, renderHook, waitFor } from '@testing-library/react';
 import { createStore } from 'jotai';
 
 import type {
@@ -12,6 +12,7 @@ import type {
 import type { IAccountDeriveTypes } from '@onekeyhq/kit-bg/src/vaults/types';
 import { getNetworkIdsMap } from '@onekeyhq/shared/src/config/networkIds';
 import { WALLET_TYPE_IMPORTED } from '@onekeyhq/shared/src/consts/dbConsts';
+import { OneKeyLocalError } from '@onekeyhq/shared/src/errors';
 import {
   EAppEventBusNames,
   appEventBus,
@@ -40,6 +41,7 @@ import {
   defaultActiveAccountInfo,
   defaultSelectedAccount,
   selectedAccountsAtom,
+  useSelectedAccount,
 } from './atoms';
 
 import type { IAccountSelectorContextData } from './atoms';
@@ -573,6 +575,74 @@ describe('useAccountSelectorActions', () => {
     const current = store.get(selectedAccountsAtom())[0];
     expect(current).toEqual(previous);
     expect(current).not.toBe(previous);
+  });
+
+  it('costs each refresh exactly one re-render for the refreshed num only', () => {
+    // Render-side contract of the atom-side test above: refresh({num}) is a
+    // reference-bump broadcast, so a subscriber of that num pays exactly one
+    // re-render per call and receives an equal-but-not-identical selection,
+    // while subscribers of other nums are not re-rendered at all.
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: defaultSelectedAccount(),
+      1: defaultSelectedAccount(),
+    });
+
+    let num0RenderCount = 0;
+    let num1RenderCount = 0;
+    const num0Selections: ISelectedAccount[] = [];
+    let actionsFacade:
+      | ReturnType<typeof useAccountSelectorActions>['current']
+      | undefined;
+
+    function ActionsProbe() {
+      actionsFacade = useAccountSelectorActions().current;
+      return null;
+    }
+    function Num0Consumer() {
+      num0RenderCount += 1;
+      num0Selections.push(useSelectedAccount({ num: 0 }).selectedAccount);
+      return null;
+    }
+    function Num1Consumer() {
+      num1RenderCount += 1;
+      useSelectedAccount({ num: 1 });
+      return null;
+    }
+
+    render(
+      <Wrapper>
+        <ActionsProbe />
+        <Num0Consumer />
+        <Num1Consumer />
+      </Wrapper>,
+    );
+
+    if (!actionsFacade) {
+      throw new OneKeyLocalError('actions facade not captured');
+    }
+    const actions = actionsFacade;
+    const initialNum0RenderCount = num0RenderCount;
+    const initialNum1RenderCount = num1RenderCount;
+    expect(initialNum0RenderCount).toBeGreaterThan(0);
+    const selectionBeforeRefresh = num0Selections[num0Selections.length - 1];
+
+    act(() => {
+      actions.refresh({ num: 0 });
+    });
+
+    expect(num0RenderCount).toBe(initialNum0RenderCount + 1);
+    const selectionAfterRefresh = num0Selections[num0Selections.length - 1];
+    expect(selectionAfterRefresh).toEqual(selectionBeforeRefresh);
+    expect(selectionAfterRefresh).not.toBe(selectionBeforeRefresh);
+    expect(num1RenderCount).toBe(initialNum1RenderCount);
+
+    act(() => {
+      actions.refresh({ num: 0 });
+    });
+
+    expect(num0RenderCount).toBe(initialNum0RenderCount + 2);
+    expect(num1RenderCount).toBe(initialNum1RenderCount);
   });
 
   it('drops a selection update when its final commit guard is stale', async () => {

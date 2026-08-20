@@ -35,9 +35,24 @@ import { useJotaiContextRootStore } from './useJotaiContextRootStore';
 
 jest.mock(
   '../../../components/AccountSelector/AccountSelectorRootProvider',
-  () => ({
-    AccountSelectorRootProvider: () => null,
-  }),
+  () => {
+    const React = jest.requireActual<typeof import('react')>('react');
+    // Surfaces the enabledNumStr the real RootProvider would receive; that
+    // string is exactly the list of nums it mounts one AccountSelectorEffects
+    // instance for.
+    return {
+      AccountSelectorRootProvider: ({
+        enabledNumStr,
+      }: {
+        enabledNumStr: string;
+      }) =>
+        React.createElement(
+          'div',
+          { 'data-testid': 'account-selector-root-provider' },
+          enabledNumStr,
+        ),
+    };
+  },
 );
 jest.mock(
   '../../../views/Discovery/components/DiscoveryBrowserRootProvider',
@@ -337,6 +352,57 @@ describe('jotaiContextStore reset flow', () => {
 
     unmount();
     expect(getJotaiContextTrackerMap()[accountSelectorStoreId]).toBeUndefined();
+  });
+
+  it('drops the per-num effects host once no mounted mirror enables that num', async () => {
+    // End-to-end over the registry seam: mirrors feed enabledNum refcounts,
+    // JotaiContextRootProvidersAutoMount consumes the registry, and the
+    // renderer hands AccountSelectorRootProvider the enabledNumStr it mounts
+    // one AccountSelectorEffects per num for. A shrink must reach that string.
+    const buildAccountSelectorData = (
+      enabledNum: number[],
+    ): IJotaiContextStoreData => ({
+      storeName: EJotaiContextStoreNames.accountSelector,
+      accountSelectorInfo: {
+        sceneName: EAccountSelectorSceneName.swap,
+        sceneUrl: '',
+        enabledNum,
+      },
+    });
+    const renderTree = (showWideMirror: boolean) =>
+      createElement(
+        'div',
+        undefined,
+        createElement(JotaiContextRootProvidersAutoMount),
+        createElement(JotaiContextStoreMirrorTracker, {
+          ...buildAccountSelectorData([0]),
+          key: 'narrow',
+        }),
+        showWideMirror
+          ? createElement(JotaiContextStoreMirrorTracker, {
+              ...buildAccountSelectorData([0, 1]),
+              key: 'wide',
+            })
+          : undefined,
+      );
+
+    const { queryAllByTestId, rerender } = render(renderTree(true));
+
+    await waitFor(() => {
+      const hosts = queryAllByTestId('account-selector-root-provider');
+      expect(hosts).toHaveLength(1);
+      expect(hosts[0].textContent).toBe('0,1');
+    });
+
+    rerender(renderTree(false));
+
+    // num 1 was owned only by the unmounted mirror: its effects host is
+    // dropped while num 0, still counted by the remaining mirror, stays.
+    await waitFor(() => {
+      const hosts = queryAllByTestId('account-selector-root-provider');
+      expect(hosts).toHaveLength(1);
+      expect(hosts[0].textContent).toBe('0');
+    });
   });
 
   it('does not mount duplicate root providers for active stores already owned by cold-start roots', async () => {
