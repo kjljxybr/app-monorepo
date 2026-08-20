@@ -35,6 +35,7 @@ import type { IMarketAccountPortfolioItem } from '@onekeyhq/shared/types/marketV
 import type { ISwapToken } from '@onekeyhq/shared/types/swap/types';
 
 import { MarketWatchListProviderMirrorV2 } from '../../../MarketWatchListProviderMirrorV2';
+import { MarketTestIDs } from '../../../testIDs';
 
 import { ESwapDirection } from './hooks/useTradeType';
 import SwapPanelFooterButtons from './SwapPanelFooterButtons';
@@ -260,7 +261,7 @@ export function SwapPanel({
   }
 
   return (
-    <View>
+    <View testID={MarketTestIDs.swapPanel}>
       <AccountSelectorProviderMirror
         config={{
           sceneName: EAccountSelectorSceneName.home,

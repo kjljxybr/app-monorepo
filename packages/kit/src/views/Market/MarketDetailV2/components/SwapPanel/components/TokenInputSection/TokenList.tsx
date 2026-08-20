@@ -7,6 +7,7 @@ import backgroundApiProxy from '@onekeyhq/kit/src/background/instance/background
 import { TokenListItem } from '@onekeyhq/kit/src/components/TokenListItem';
 import { usePromiseResult } from '@onekeyhq/kit/src/hooks/usePromiseResult';
 import { useActiveAccount } from '@onekeyhq/kit/src/states/jotai/contexts/accountSelector';
+import { MarketTestIDs } from '@onekeyhq/kit/src/views/Market/testIDs';
 import { presetNetworksMap } from '@onekeyhq/shared/src/config/presetNetworks';
 import { equalTokenNoCaseSensitive } from '@onekeyhq/shared/src/utils/tokenUtils';
 import type { ISwapToken } from '@onekeyhq/shared/types/swap/types';
@@ -164,7 +165,7 @@ export function TokenList({
     (!disableInternalTokenDetailFetch && tokensWithDetails.isLoading);
 
   return (
-    <YStack gap="$1">
+    <YStack gap="$1" testID={MarketTestIDs.swapPanelTokenSelectorList}>
       <YStack px="$1" py="$1">
         {displayTokens?.map((token: IEnhancedToken) => {
           const isCurrentToken = Boolean(

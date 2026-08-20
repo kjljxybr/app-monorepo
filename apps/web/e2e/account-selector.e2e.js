@@ -9,6 +9,7 @@ const {
   AccountSelectorTestIDs,
   AddressInputTestIDs,
   DAppConnectionTestIDs,
+  MarketTestIDs,
   SendTestIDs,
 } = require('./account-selector-test-ids');
 const {
@@ -400,6 +401,158 @@ async function routeSwapApiStub(context) {
       status: 200,
     });
   });
+  // The Market detail swap panel initializes from `/swap/v1/speed-config`
+  // (useSpeedSwapInit): the response decides whether speed swap is enabled and
+  // which payment tokens the panel offers, so answering locally pins both.
+  // The panel network gets two payment tokens because the payment-token
+  // selector trigger only renders with more than one candidate left after
+  // SwapPanelWrap filters out the current market token; every other network
+  // gets the same disabled default the endpoint's error fallback produces.
+  await context.route(/\/swap\/v1\/speed-config/, async (route) => {
+    const url = new URL(route.request().url());
+    seenSwapApiRequests.add(url.pathname);
+    const networkId = url.searchParams.get('networkId');
+    const isPanelNetwork = networkId === marketSwapPanelToken.networkId;
+    await route.fulfill({
+      body: JSON.stringify({
+        code: 0,
+        data: {
+          onlySupportCrossChain: false,
+          onlySupportSingleChain: false,
+          provider: 'e2e-stub',
+          speedConfig: {
+            defaultLimitTokens: [],
+            defaultTokens: isPanelNetwork
+              ? [
+                  {
+                    contractAddress: '',
+                    decimals: 18,
+                    isNative: true,
+                    logoURI: '',
+                    name: 'Ethereum',
+                    networkId,
+                    speedSwapDefaultAmount: [0.1, 0.5, 1],
+                    symbol: 'ETH',
+                  },
+                  {
+                    contractAddress:
+                      '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
+                    decimals: 6,
+                    isNative: false,
+                    logoURI: '',
+                    name: 'USD Coin',
+                    networkId,
+                    speedSwapDefaultAmount: [100, 500, 1000],
+                    symbol: 'USDC',
+                  },
+                ]
+              : [],
+            slippage: 0.5,
+            spenderAddress: '',
+            swapMevNetConfig: [],
+          },
+          supportSpeedSwap: isPanelNetwork,
+        },
+        message: '',
+      }),
+      contentType: 'application/json',
+      status: 200,
+    });
+  });
+  // Fired by the panel whenever the selected payment token is native (max
+  // button gas reserve). Zero keeps the reserve math inert.
+  await context.route(/\/swap\/v1\/native-token-config/, async (route) => {
+    const url = new URL(route.request().url());
+    seenSwapApiRequests.add(url.pathname);
+    await route.fulfill({
+      body: JSON.stringify({
+        code: 0,
+        data: { networkId: url.searchParams.get('networkId'), reserveGas: 0 },
+        message: '',
+      }),
+      contentType: 'application/json',
+      status: 200,
+    });
+  });
+}
+
+// The Market swap-panel scenario mounts MarketDetailV2, whose page body fans
+// out to live market endpoints (token detail poll, k-line, information tabs,
+// portfolio). None of them feeds an account-selector assertion, but a live
+// backend adds latency and failure modes to a timing-sensitive run, so they
+// are served locally: the detail endpoint returns a fixed token and every
+// other market path returns an empty-but-well-shaped payload. Set
+// ACCOUNT_SELECTOR_E2E_STUB_MARKET_API=0 to exercise the live endpoints.
+const stubMarketApi = readBooleanEnv(
+  'ACCOUNT_SELECTOR_E2E_STUB_MARKET_API',
+  true,
+);
+const seenMarketApiRequests = new Set();
+// UNI on evm--1: a real token, so the scenario still renders against the live
+// API when the stub is disabled. Deliberately NOT one of the stubbed speed
+// swap payment tokens (ETH/USDC): SwapPanelWrap filters the current market
+// token out of the payment-token candidates, and the popover trigger needs
+// two of them to survive that filter.
+const marketSwapPanelToken = {
+  contractAddress: '0x1f9840a85d5af5bf1d1762f925bdaddc4201f984',
+  decimals: 18,
+  name: 'Uniswap',
+  networkId: 'evm--1',
+  symbol: 'UNI',
+};
+
+async function routeMarketApiStub(context) {
+  // Registered first on purpose: Playwright matches routes in reverse
+  // registration order, so the specific token-detail route below wins.
+  await context.route(/\/utility\/v\d+\/market\//, async (route) => {
+    seenMarketApiRequests.add(new URL(route.request().url()).pathname);
+    await route.fulfill({
+      body: JSON.stringify({
+        code: 0,
+        // Covers the list-shaped market payloads (`data.list`, `data.items`,
+        // k-line `data.points`) with empty-but-valid values.
+        data: { data: [], items: [], list: [], points: [], total: 0 },
+        message: '',
+      }),
+      contentType: 'application/json',
+      status: 200,
+    });
+  });
+  await context.route(
+    /\/utility\/v\d+\/market\/token\/detail/,
+    async (route) => {
+      seenMarketApiRequests.add(new URL(route.request().url()).pathname);
+      await route.fulfill({
+        body: JSON.stringify({
+          code: 0,
+          data: {
+            // No websocket config on purpose: the detail page then keeps its
+            // market data on the (stubbed) polling path and never opens a
+            // socket.
+            token: {
+              address: marketSwapPanelToken.contractAddress,
+              decimals: marketSwapPanelToken.decimals,
+              holders: 1000,
+              isNative: false,
+              liquidity: '250000000',
+              logoUrl: '',
+              marketCap: '5000000000',
+              name: marketSwapPanelToken.name,
+              networkId: marketSwapPanelToken.networkId,
+              price: '10',
+              priceChange24hPercent: '1.5',
+              supportSwap: { enable: true },
+              symbol: marketSwapPanelToken.symbol,
+              volume24h: '120000000',
+            },
+          },
+          message: '',
+        }),
+        contentType: 'application/json',
+        status: 200,
+      });
+    },
+  );
 }
 
 function readBooleanEnv(name, fallbackValue) {
@@ -5115,6 +5268,369 @@ async function runSwapInlineDeriveTypeScenario(page, devOnlyPassword, fixture) {
   return trace;
 }
 
+// Market detail swap panel ground truth (MarketDetailV2 on desktop web):
+// - MarketDetailV2.tsx and SwapPanel.tsx both mount AccountSelectorProviderMirror
+//   on the HOME scene num 0, so the panel's active account (useActiveAccount
+//   num 0 inside useSpeedSwapActions) IS the home selection — same jotai store,
+//   no cross-scene hop.
+// - The swap scene appears inside the panel only where it borrows swap-side
+//   UI: the payment-token selector popover mounts a swap/num 0 mirror lazily
+//   on open (TokenSelectorPopover.tsx; Popover renders content only while
+//   open), and the review dialog does the same. That is the exception among
+//   Market views — everything else in Market mirrors home.
+// - The swap scene follows home through TWO racing consumers of the same
+//   AccountSelectorSelectedAccountUpdate event, both alive since the
+//   multi-num phase visited the Swap tab:
+//   1. The Swap page's own sync (useSwapGlobal.syncSwapSelectedAccountFromHome)
+//      applies home's account to swap num 0 with the DEFAULT reason
+//      'updateSelectedAccount' and updatedAt = Date.now() (receive time).
+//   2. AccountSelectorEffects → syncHomeAndSwapSelectedAccount commits with
+//      reason 'syncHomeAndSwapSelectedAccount' and the payload's origin
+//      revision, for swap num 0 AND num 1.
+//   Both merge ONLY the account identity (walletId/indexedAccountId/
+//   othersWalletAccountId/focusedWallet), never the target's networkId or
+//   deriveType. On swap num 0 the race winner commits and the loser settles
+//   as a no-op or 'stale-before-fix' drop (the revision guard in
+//   syncHomeAndSwapSelectedAccount), so WHICH reason commits is timing — but
+//   the TOTAL is exactly one commit and one reload. Swap num 1 has only path
+//   2, so its reason is deterministic.
+// - Because the account-manager wallet row writes focusedWallet with its own
+//   'userSelectWallet' update (which also fans out to swap), the switch target
+//   stays in the SAME wallet as the normalized account: the wallet click is
+//   then a no-op and each swap num sees exactly one sync commit.
+async function runMarketSwapPanelScenario(page, devOnlyPassword, fixture) {
+  const traces = [];
+  const homeTarget = {
+    fixtureId: fixture.wallets[0].fixtureId,
+    index: 0,
+    indexedAccountId: fixture.wallets[0].indexedAccountIds[0],
+    walletId: fixture.wallets[0].walletId,
+  };
+  // Same wallet as homeTarget on purpose — see the focusedWallet note above.
+  const switchTarget = {
+    fixtureId: fixture.wallets[0].fixtureId,
+    index: 1,
+    indexedAccountId: fixture.wallets[0].indexedAccountIds[1],
+    walletId: fixture.wallets[0].walletId,
+  };
+  const panelNetworkId = marketSwapPanelToken.networkId;
+
+  // Normalize Home to a known account on the panel token's network so the
+  // panel's balance/network-support checks resolve against fixture accounts.
+  const preSelection = await readPersistedSelection(page);
+  const preTarget = findFixtureTarget(fixture, preSelection);
+  const normalizeAccountChanged =
+    preSelection?.walletId !== homeTarget.walletId ||
+    preSelection?.indexedAccountId !== homeTarget.indexedAccountId;
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await selectWalletAccount(page, homeTarget);
+  await assertAccountSelectorStateConsistent(page, homeTarget);
+  traces.push(
+    await collectSelectionOperationTrace(page, devOnlyPassword, {
+      expectActiveReload: normalizeAccountChanged,
+      reason: 'userSelectAccount',
+    }),
+  );
+  const normalizeNetworkChanged = preSelection?.networkId !== panelNetworkId;
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await selectNetwork(page, panelNetworkId);
+  await assertAccountSelectorStateConsistent(page, homeTarget);
+  traces.push(
+    await collectSelectionOperationTrace(page, devOnlyPassword, {
+      expectActiveReload: normalizeNetworkChanged,
+      reason: 'userSelectNetwork',
+    }),
+  );
+
+  // Navigate straight to the detail route (the same nested navigate that
+  // navigateToMarketTokenDetail performs) so the Market home list never
+  // mounts and the phase only depends on the detail surface.
+  log('market-swap-panel: open Market detail page and wait for the panel');
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await page.evaluate(
+    ({ token }) => {
+      globalThis.$$appGlobals.$navigationRef.current.navigate('main', {
+        params: {
+          params: {
+            isNative: false,
+            network: token.networkId,
+            tokenAddress: token.contractAddress,
+          },
+          screen: 'MarketDetailV2',
+        },
+        screen: 'Market',
+      });
+    },
+    { token: marketSwapPanelToken },
+  );
+  await getUniqueVisibleByTestID(page, MarketTestIDs.swapPanel);
+  // The payment-token trigger appears once the (stubbed) speed-config default
+  // tokens are in, i.e. the panel finished its own initialization.
+  await getUniqueVisibleByTestID(
+    page,
+    MarketTestIDs.swapPanelPaymentTokenTrigger,
+  );
+  // The panel mirrors home directly; the swap scene must already hold the
+  // normalized account from the selection fanout above. Neither store may
+  // drift just because the Market page mounted.
+  await assertAccountSelectorStateConsistent(page, homeTarget, {
+    assertUI: false,
+  });
+  for (const num of [0, 1]) {
+    await assertAccountSelectorStateConsistent(page, homeTarget, {
+      assertUI: false,
+      num,
+      sceneName: 'swap',
+    });
+  }
+  await page.waitForTimeout(350);
+  const mountTrace = await drainPerfTrace(page, devOnlyPassword);
+  assertTraceHealth({ ...mountTrace, phase: 'market-swap-panel-mount' });
+  // Mounting the page attaches home mirrors to the existing store; that must
+  // be a pure attach, not a selection operation.
+  assert.deepEqual(
+    mountTrace.events
+      .filter((event) =>
+        ['activeReloadScheduled', 'selectionStateUpdated'].includes(
+          event.event,
+        ),
+      )
+      .map((event) => ({
+        event: event.event,
+        num: event.num,
+        reason: event.reason,
+        sceneName: event.sceneName,
+      })),
+    [],
+    'Mounting the Market detail page must not move any account selection',
+  );
+  traces.push(mountTrace);
+
+  // Switch the home account through the standard selector UI (the Market
+  // detail header has no account trigger, so this happens on the Wallet tab)
+  // and pin the exact fanout: one home userSelectAccount operation plus one
+  // syncHomeAndSwapSelectedAccount commit per swap num, nothing else.
+  log('market-swap-panel: switch home account and verify swap-scene fanout');
+  await switchDesktopSidebarTab(page, 'Wallet', 'Home');
+  await waitForHomeShell(page);
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await selectWalletAccount(page, switchTarget);
+  await assertAccountSelectorStateConsistent(page, switchTarget);
+  const swapZeroFollowReasons = new Set([
+    'syncHomeAndSwapSelectedAccount',
+    'updateSelectedAccount',
+  ]);
+  const switchTrace = await collectPerfTraceUntil(
+    page,
+    devOnlyPassword,
+    (events) =>
+      events.some(
+        (event) =>
+          event.event === 'activeReloadResult' &&
+          event.num === 0 &&
+          event.reason === 'userSelectAccount' &&
+          event.sceneName === 'home',
+      ) &&
+      events.some(
+        (event) =>
+          event.event === 'activeReloadResult' &&
+          event.num === 0 &&
+          event.sceneName === 'swap' &&
+          swapZeroFollowReasons.has(event.reason),
+      ) &&
+      events.some(
+        (event) =>
+          event.event === 'activeReloadResult' &&
+          event.num === 1 &&
+          event.reason === 'syncHomeAndSwapSelectedAccount' &&
+          event.sceneName === 'swap',
+      ),
+  );
+  assertSelectionOperationBudget(switchTrace, {
+    expectedActiveReloads: 1,
+    expectedSelectionUpdates: 1,
+    label: 'market swap panel home switch',
+    reason: 'userSelectAccount',
+  });
+  // Same-wallet switch: the wallet row click must stay a no-op.
+  assertSelectionOperationBudget(switchTrace, {
+    expectedActiveReloads: 0,
+    expectedSelectionUpdates: 0,
+    label: 'market swap panel wallet focus',
+    reason: 'userSelectWallet',
+  });
+  // Swap num 0 converges through whichever follow-home path wins the race
+  // (ground truth above); the loser settles as a no-op or stale drop with no
+  // second commit. Pin the TOTAL across both reasons: one committed
+  // transition, one scheduled reload, one completed reload — a second one
+  // would be exactly the double-apply this suite exists to catch.
+  const swapZeroUpdates = switchTrace.events.filter(
+    (event) =>
+      event.event === 'selectionStateUpdated' &&
+      event.num === 0 &&
+      swapZeroFollowReasons.has(event.reason),
+  );
+  const swapZeroTransitionIds = new Set(
+    swapZeroUpdates.map((event) => event.transitionId),
+  );
+  const swapZeroCommittedTransitions = new Set(
+    switchTrace.events
+      .filter(
+        (event) =>
+          event.event === 'selectionStorageRequested' &&
+          event.num === 0 &&
+          event.sceneName === 'swap' &&
+          swapZeroTransitionIds.has(event.transitionId),
+      )
+      .map((event) => event.transitionId),
+  );
+  assert.equal(
+    swapZeroCommittedTransitions.size,
+    1,
+    `market swap panel swap num 0 must follow home with exactly one commit: ${describeBudgetEvents(swapZeroUpdates)}`,
+  );
+  const swapZeroSchedules = switchTrace.events.filter(
+    (event) =>
+      event.event === 'activeReloadScheduled' &&
+      event.num === 0 &&
+      event.sceneName === 'swap' &&
+      swapZeroFollowReasons.has(event.reason),
+  );
+  assert.equal(
+    swapZeroSchedules.length,
+    1,
+    `market swap panel swap num 0 must schedule one follow reload: ${describeBudgetEvents(swapZeroSchedules)}`,
+  );
+  const swapZeroReloads = switchTrace.events.filter(
+    (event) =>
+      event.event === 'activeReloadResult' &&
+      event.num === 0 &&
+      event.sceneName === 'swap' &&
+      ['commit', 'noop'].includes(event.outcome) &&
+      swapZeroFollowReasons.has(event.reason),
+  );
+  assert.equal(
+    swapZeroReloads.length,
+    1,
+    `market swap panel swap num 0 must complete one follow reload: ${describeBudgetEvents(swapZeroReloads)}`,
+  );
+  // Swap num 1 only has the cross-scene path, so its reason is deterministic.
+  assertSelectionOperationBudget(switchTrace, {
+    expectedActiveReloads: 1,
+    expectedSelectionUpdates: 1,
+    label: 'market swap panel swap num 1 follow',
+    num: 1,
+    reason: 'syncHomeAndSwapSelectedAccount',
+    sceneName: 'swap',
+  });
+  traces.push(switchTrace);
+
+  // Back on the still-mounted detail page, the panel (home scene) and the
+  // swap scene it consults must both have converged on the new account.
+  await switchAppTab(page, 'Market');
+  await getUniqueVisibleByTestID(page, MarketTestIDs.swapPanel);
+  await assertAccountSelectorStateConsistent(page, switchTarget, {
+    assertUI: false,
+  });
+  for (const num of [0, 1]) {
+    await assertAccountSelectorStateConsistent(page, switchTarget, {
+      assertUI: false,
+      num,
+      sceneName: 'swap',
+    });
+  }
+
+  // Open the payment-token popover: the panel's own swap-scene mirror mount
+  // (the Market exception this phase exists for). The token list renders
+  // under that mirror, so its appearance proves the swap store served it; the
+  // attach must not produce any selection operation.
+  log('market-swap-panel: open payment-token popover (swap-scene mirror)');
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  const paymentTokenTrigger = await getUniqueVisibleByTestID(
+    page,
+    MarketTestIDs.swapPanelPaymentTokenTrigger,
+  );
+  await paymentTokenTrigger.click({ timeout: pageTimeoutMs });
+  await getUniqueVisibleByTestID(
+    page,
+    MarketTestIDs.swapPanelTokenSelectorList,
+  );
+  await assertAccountSelectorStateConsistent(page, switchTarget, {
+    assertUI: false,
+    num: 0,
+    sceneName: 'swap',
+  });
+  await page.keyboard.press('Escape');
+  try {
+    await waitForNoVisibleTestID(
+      page,
+      MarketTestIDs.swapPanelTokenSelectorList,
+    );
+  } catch {
+    // Some floating panels only dismiss on outside press. The chart area in
+    // the left column is outside the right-column panel at every supported
+    // viewport and a click there has no navigation side effect.
+    await page.mouse.click(600, 400);
+    await waitForNoVisibleTestID(
+      page,
+      MarketTestIDs.swapPanelTokenSelectorList,
+    );
+  }
+  await page.waitForTimeout(350);
+  const popoverTrace = await drainPerfTrace(page, devOnlyPassword);
+  assertTraceHealth({ ...popoverTrace, phase: 'market-swap-panel-popover' });
+  assert.deepEqual(
+    popoverTrace.events
+      .filter((event) =>
+        ['activeReloadScheduled', 'selectionStateUpdated'].includes(
+          event.event,
+        ),
+      )
+      .map((event) => ({
+        event: event.event,
+        num: event.num,
+        reason: event.reason,
+        sceneName: event.sceneName,
+      })),
+    [],
+    'The payment-token popover must attach its swap mirror without moving any selection',
+  );
+  traces.push(popoverTrace);
+
+  // Restore the pre-scenario Home selection. The Market detail page stays
+  // mounted on its tab — like the Swap tab after earlier phases — so no
+  // later phase inherits a Market home-list mount from this one.
+  await switchDesktopSidebarTab(page, 'Wallet', 'Home');
+  await waitForHomeShell(page);
+  if (
+    preTarget.walletId !== switchTarget.walletId ||
+    preTarget.indexedAccountId !== switchTarget.indexedAccountId
+  ) {
+    await drainResidualPerfTrace(page, devOnlyPassword);
+    await selectWalletAccount(page, preTarget);
+    traces.push(
+      await collectSelectionOperationTrace(page, devOnlyPassword, {
+        expectActiveReload: true,
+        reason: 'userSelectAccount',
+      }),
+    );
+  }
+  if (preSelection?.networkId && preSelection.networkId !== panelNetworkId) {
+    await drainResidualPerfTrace(page, devOnlyPassword);
+    await selectNetwork(page, preSelection.networkId);
+    traces.push(
+      await collectSelectionOperationTrace(page, devOnlyPassword, {
+        expectActiveReload: true,
+        reason: 'userSelectNetwork',
+      }),
+    );
+  }
+  await assertAccountSelectorStateConsistent(page, preTarget);
+  const trace = mergePerfTrace(...traces);
+  assertTraceHealth({ ...trace, phase: 'market-swap-panel' });
+  return trace;
+}
+
 async function closeResidualE2EBrowserContexts(browser, phase) {
   const contexts = browser.contexts();
   const tabCount = contexts.reduce(
@@ -5152,6 +5668,9 @@ async function runCycle({ browser, cycle, rendererUrl }) {
   }
   if (stubSwapApi) {
     await routeSwapApiStub(context);
+  }
+  if (stubMarketApi) {
+    await routeMarketApiStub(context);
   }
   await context.addInitScript(
     ({ key }) => {
@@ -5327,6 +5846,16 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       fixture,
     );
 
+    // Sits between the swap phases and BulkSend on purpose: it normalizes and
+    // restores its own home selection, so the state the burst/derive phases
+    // rely on is already consumed and BulkSend re-normalizes anyway.
+    log(`cycle#${cycle}: verify Market detail swap panel account sync`);
+    const marketSwapPanelTrace = await runMarketSwapPanelScenario(
+      page,
+      devOnlyPassword,
+      fixture,
+    );
+
     log(`cycle#${cycle}: verify BulkSend account removal semantics`);
     const bulkSendRemovalTrace = await runBulkSendAccountRemovalScenario(
       page,
@@ -5430,6 +5959,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       ...allNetworksTrace.events,
       ...stressTrace.events,
       ...swapInlineDeriveTrace.events,
+      ...marketSwapPanelTrace.events,
       ...bulkSendRemovalTrace.events,
       ...autoSelectTrace.events,
       ...residualTrace.events,
@@ -5482,6 +6012,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
         dapp: buildTraceSummary(dappTrace.events),
         dappMultiOrigin: buildTraceSummary(multiOriginDAppTrace.events),
         initialization: buildTraceSummary(initTrace.events),
+        marketSwapPanel: buildTraceSummary(marketSwapPanelTrace.events),
         multiNumCustomNetwork: buildTraceSummary(multiNumResult.trace.events),
         perps: buildTraceSummary(perpsTrace.events),
         postPerpsReset: buildTraceSummary(perpsResetTrace.events),
@@ -5507,6 +6038,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
             dapp: dappTrace,
             dappMultiOrigin: multiOriginDAppTrace,
             initialization: initTrace,
+            marketSwapPanel: marketSwapPanelTrace,
             multiNumCustomNetwork: multiNumResult.trace,
             perps: perpsTrace,
             postPerpsReset: perpsResetTrace,
@@ -5544,6 +6076,13 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       `cycle#${cycle}: stubbed swap API requests: ${
         seenSwapApiRequests.size
           ? [...seenSwapApiRequests].toSorted().join(', ')
+          : 'none'
+      }`,
+    );
+    log(
+      `cycle#${cycle}: stubbed market API requests: ${
+        seenMarketApiRequests.size
+          ? [...seenMarketApiRequests].toSorted().join(', ')
           : 'none'
       }`,
     );

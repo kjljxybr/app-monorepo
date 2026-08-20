@@ -26,6 +26,9 @@ const dappConnectionTestIDValues = require(
     'packages/kit/src/views/DAppConnection/testIDValues.json',
   ),
 );
+const marketTestIDValues = require(
+  path.join(repoRoot, 'packages/kit/src/views/Market/testIDValues.json'),
+);
 const sendTestIDValues = require(
   path.join(repoRoot, 'packages/kit/src/views/Send/testIDValues.json'),
 );
@@ -69,6 +72,9 @@ const DAppConnectionTestIDs = Object.freeze({
 const AddressInputTestIDs = Object.freeze({
   ...addressInputTestIDValues,
 });
+const MarketTestIDs = Object.freeze({
+  ...marketTestIDValues,
+});
 const { recipientItemPrefix, ...sendStaticTestIDs } = sendTestIDValues;
 const SendTestIDs = Object.freeze({
   ...sendStaticTestIDs,
@@ -102,6 +108,7 @@ assertUniqueStaticTestIDs({
   AccountSelectorTestIDs,
   AddressInputTestIDs,
   DAppConnectionTestIDs,
+  MarketTestIDs,
   SendTestIDs,
 });
 
@@ -110,6 +117,7 @@ module.exports = {
   AccountSelectorTestIDs,
   AddressInputTestIDs,
   DAppConnectionTestIDs,
+  MarketTestIDs,
   SendTestIDs,
   assertUniqueStaticTestIDs,
 };

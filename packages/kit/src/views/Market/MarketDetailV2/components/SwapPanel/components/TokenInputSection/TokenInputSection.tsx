@@ -13,6 +13,7 @@ import { useIntl } from 'react-intl';
 import { Icon, Input, SizableText, XStack, YStack } from '@onekeyhq/components';
 import type { IInputRef, IYStackProps } from '@onekeyhq/components';
 import { validateAmountInput } from '@onekeyhq/kit/src/utils/validateAmountInput';
+import { MarketTestIDs } from '@onekeyhq/kit/src/views/Market/testIDs';
 import {
   EAppEventBusNames,
   appEventBus,
@@ -218,6 +219,7 @@ function TokenInputSectionComponent(
                   gap="$1"
                   px="$2"
                   {...(isTokenSelectorVisible && {
+                    testID: MarketTestIDs.swapPanelPaymentTokenTrigger,
                     onPress: () => setIsPopoverOpen(true),
                     userSelect: 'none',
                     hoverStyle: { bg: '$bgHover' },
