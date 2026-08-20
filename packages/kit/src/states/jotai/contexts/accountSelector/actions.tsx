@@ -111,6 +111,10 @@ import {
   recordActiveAccountPerfStateUpdate,
   recordSelectedAccountPerfStateUpdate,
 } from './perfDebug';
+import {
+  isSameSelectedAccount,
+  isSameSelectedAccountsMap,
+} from './selectedAccountCompare';
 import { takeStaleDropLogSlot } from './staleDropLog';
 
 import type {
@@ -208,11 +212,6 @@ type IActiveAccountReloadResult = {
   activeAccount: IAccountSelectorActiveAccountInfo;
   outcome: IActiveAccountReloadOutcome;
 };
-
-const isSameSelectedAccount = (
-  first: IAccountSelectorSelectedAccount | undefined,
-  second: IAccountSelectorSelectedAccount | undefined,
-) => isEqual(omitBy(first, isUndefined), omitBy(second, isUndefined));
 
 const getNextSelectionUpdatedAt = ({
   currentUpdatedAt,
@@ -798,7 +797,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       [num: number]: IAccountSelectorUpdateMeta;
     }>;
   }) {
-    if (isEqual(selectedAccountsMapInDB, selectedAccountsMap)) {
+    if (
+      isSameSelectedAccountsMap(selectedAccountsMapInDB, selectedAccountsMap)
+    ) {
       return false;
     }
     const hasSelectedAccount = Object.values(selectedAccountsMap).some(
@@ -4359,7 +4360,10 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         startPhase('apply-storage');
         if (
           selectedAccountsMapInDB &&
-          !isEqual(selectedAccountsMapInDB, selectedAccountsMap)
+          !isSameSelectedAccountsMap(
+            selectedAccountsMapInDB,
+            selectedAccountsMap,
+          )
         ) {
           this.setSelectedAccountsAtom(
             set,
@@ -4695,10 +4699,13 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 sceneUrl,
                 num,
               });
-            const primaryAlreadySaved = isEqual(currentSaved, selectedAccount);
+            const primaryAlreadySaved = isSameSelectedAccount(
+              currentSaved,
+              selectedAccount,
+            );
             const pendingSideEffectSelection =
               this.saveToStoragePendingSideEffectMap.get(sideEffectScopeKey);
-            const shouldReplaySideEffects = isEqual(
+            const shouldReplaySideEffects = isSameSelectedAccount(
               pendingSideEffectSelection,
               selectedAccount,
             );

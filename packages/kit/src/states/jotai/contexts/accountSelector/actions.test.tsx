@@ -451,6 +451,12 @@ function createHdSelectedAccount(indexedAccountId: string): ISelectedAccount {
   };
 }
 
+// Extension keeps UI and background in separate JS runtimes and moves payloads
+// between them as JSON, which silently drops every key whose value is undefined.
+function bridgeThroughBackground<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
 describe('useAccountSelectorActions', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -2071,6 +2077,72 @@ describe('useAccountSelectorActions', () => {
       EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
       expect.anything(),
     );
+  });
+
+  it('short circuits a saved selection that background returned without its undefined keys', async () => {
+    const selectedAccount = createHdSelectedAccount('hd-1--0');
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 1000 },
+    });
+    mockGetSelectedAccount.mockResolvedValue(
+      bridgeThroughBackground(selectedAccount),
+    );
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const emitSpy = jest.spyOn(appEventBus, 'emit').mockReturnValue(true);
+
+    await act(async () => {
+      await result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount,
+        selectedAccountUpdatedAt: 1000,
+        trigger: 'selection-effect',
+      });
+    });
+
+    expect(mockSaveSelectedAccount).not.toHaveBeenCalled();
+    expect(mockSaveGlobalDeriveType).not.toHaveBeenCalled();
+    expect(emitSpy).not.toHaveBeenCalledWith(
+      EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+      expect.anything(),
+    );
+  });
+
+  it('does not restore a recent selection cache that already matches the bridged storage map', async () => {
+    const selectedAccount = createHdSelectedAccount('hd-1--0');
+    mockGetSelectedAccountsMap.mockResolvedValue(
+      bridgeThroughBackground({ 0: selectedAccount }),
+    );
+    getAccountSelectorActions().setRecentAccountSelectorSelectionCache({
+      sceneName: EAccountSelectorSceneName.home,
+      selectedAccountsMap: { 0: selectedAccount },
+      updateMeta: {
+        0: {
+          eventEmitDisabled: false,
+          updatedAt: Date.now(),
+        },
+      },
+    });
+
+    const { store, Wrapper } = createWrapper();
+    const selectedAccountsMapInMemory = { 0: selectedAccount };
+    store.set(selectedAccountsAtom(), selectedAccountsMapInMemory);
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    await act(async () => {
+      await result.current.initFromStorage({
+        sceneName: EAccountSelectorSceneName.home,
+      });
+    });
+
+    expect(store.get(selectedAccountsAtom())).toBe(selectedAccountsMapInMemory);
+    expect(mockSaveSelectedAccount).not.toHaveBeenCalled();
   });
 
   it('does not apply a global derive type resolved for a stale selection', async () => {
