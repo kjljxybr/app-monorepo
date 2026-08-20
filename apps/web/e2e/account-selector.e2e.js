@@ -352,6 +352,56 @@ async function routeWalletTokenStub(context) {
   });
 }
 
+// The Swap inline derive-type scenario needs the swap network list to contain
+// btc--0 before useSwapInit accepts an imported BTC from-token, and the list
+// normally comes from the live `/swap/v1/networks` endpoint. Serving it locally
+// keeps the scenario deterministic on machines without network access and
+// removes the live endpoint's latency from every swap-page mount. Token detail
+// lookups fire once a token is selected and only decorate balances, so they are
+// stubbed to an empty list. Set ACCOUNT_SELECTOR_E2E_STUB_SWAP_API=0 to use the
+// live endpoints.
+const stubSwapApi = readBooleanEnv('ACCOUNT_SELECTOR_E2E_STUB_SWAP_API', true);
+const seenSwapApiRequests = new Set();
+// Aligned with expectedNetworks: every network the suite selects on Home has a
+// swap-side entry, so swap default-token syncs behave the same on every cycle.
+const stubSwapNetworkIds = [
+  'btc--0',
+  'evm--1',
+  'evm--137',
+  'sol--101',
+  'tron--0x2b6653dc',
+];
+
+async function routeSwapApiStub(context) {
+  await context.route(/\/swap\/v1\/networks/, async (route) => {
+    seenSwapApiRequests.add(new URL(route.request().url()).pathname);
+    await route.fulfill({
+      body: JSON.stringify({
+        code: 0,
+        data: stubSwapNetworkIds.map((networkId) => ({
+          networkId,
+          supportCrossChainSwap: true,
+          supportLimit: false,
+          supportPrivateSend: false,
+          supportSingleSwap: true,
+          supportStock: false,
+        })),
+        message: '',
+      }),
+      contentType: 'application/json',
+      status: 200,
+    });
+  });
+  await context.route(/\/swap\/v1\/token\/detail/, async (route) => {
+    seenSwapApiRequests.add(new URL(route.request().url()).pathname);
+    await route.fulfill({
+      body: JSON.stringify({ code: 0, data: [], message: '' }),
+      contentType: 'application/json',
+      status: 200,
+    });
+  });
+}
+
 function readBooleanEnv(name, fallbackValue) {
   const raw = process.env[name];
   if (raw === undefined || raw === '') {
@@ -4709,6 +4759,323 @@ async function runAllNetworksSelectionScenario(page, fixture, devOnlyPassword) {
   return mergePerfTrace(...traces);
 }
 
+// Import-token payloads for the Swap inline derive-type scenario. They mirror
+// swapDefaultSetTokens['btc--0'].fromToken / ['evm--1'].fromToken
+// (packages/shared/types/swap/SwapProvider.constants.ts) minus the remote logo
+// URLs; useSwapInit only accepts import tokens whose network exists in the swap
+// network list, so these must stay aligned with stubSwapNetworkIds above. The
+// EVM to-token pins swap num 1 to evm--1 so the BTC derive switch below has a
+// deterministic "must not move" scene to assert against.
+const swapInlineDeriveFromToken = {
+  contractAddress: '',
+  decimals: 8,
+  isNative: true,
+  name: 'Bitcoin',
+  networkId: 'btc--0',
+  symbol: 'BTC',
+};
+const swapInlineDeriveToToken = {
+  contractAddress: '',
+  decimals: 18,
+  isNative: true,
+  name: 'Ethereum',
+  networkId: 'evm--1',
+  symbol: 'ETH',
+};
+
+// The AddressTypeSelector popover trigger toggles like the Settings derive
+// Select does, so this follows the selectDeriveTypeViaUI retry pattern: only
+// re-open when the dropdown is really shut, then click the derive row and wait
+// for the global derive type write that AddressTypeSelector performs.
+async function selectSwapInlineDeriveType(page, { deriveType, networkId }) {
+  const trigger = await getUniqueVisibleByTestID(
+    page,
+    AccountSelectorTestIDs.walletDerivationPathTrigger,
+  );
+  const itemTestID = AccountSelectorTestIDs.addressTypeSelectorItem(deriveType);
+  const anyVisibleItem = page.locator(
+    `[data-testid^=${JSON.stringify(
+      AccountSelectorTestIDs.addressTypeSelectorItem(''),
+    )}]:visible`,
+  );
+  await trigger.click({ timeout: pageTimeoutMs });
+  let item;
+  try {
+    item = await getUniqueVisibleByTestID(page, itemTestID, {
+      timeout: uiSettleTimeoutMs,
+    });
+  } catch {
+    if ((await anyVisibleItem.count()) === 0) {
+      await trigger.click({ timeout: pageTimeoutMs });
+    }
+    item = await getUniqueVisibleByTestID(page, itemTestID);
+  }
+  await item.click({ timeout: pageTimeoutMs });
+  await waitForNoVisibleTestID(page, itemTestID);
+  await page.waitForFunction(
+    async ({ expectedDeriveType, expectedNetworkId }) => {
+      const actual =
+        await globalThis.$$appGlobals.$backgroundApiProxy.serviceNetwork.getGlobalDeriveTypeOfNetwork(
+          { networkId: expectedNetworkId },
+        );
+      return actual === expectedDeriveType;
+    },
+    { expectedDeriveType: deriveType, expectedNetworkId: networkId },
+    { timeout: pageTimeoutMs },
+  );
+}
+
+// Swap's inline derive-type control (the branches icon next to the From
+// address) is NOT the num-scoped DeriveTypeSelectorTrigger: ground truth is
+// SwapAccountAddressContainer wrapping DeriveTypeSelectorTriggerIconRenderer
+// in an AddressTypeSelector whose selection calls
+// serviceNetwork.saveGlobalDeriveTypeForNetwork (AddressTypeSelector.tsx,
+// changeDefaultAddressTypeAfterSelect defaults true, no onSelect wired). The
+// GlobalDeriveTypeUpdate event then drives autoDeriveGlobalSync in every
+// mounted scene whose selected network shares the impl — so one click must
+// move swap num 0 AND home num 0 (both on btc--0) exactly once each, leave
+// swap num 1 (evm--1) untouched, and never produce a 'userSelectDeriveType'
+// selection update (that reason is only wired in WalletDetailsHeader for
+// discover/addressInput scenes).
+async function runSwapInlineDeriveTypeScenario(page, devOnlyPassword, fixture) {
+  const traces = [];
+  const homeTarget = {
+    fixtureId: fixture.wallets[0].fixtureId,
+    index: 0,
+    indexedAccountId: fixture.wallets[0].indexedAccountIds[0],
+    walletId: fixture.wallets[0].walletId,
+  };
+  const btcNetworkId = swapInlineDeriveFromToken.networkId;
+
+  // Normalize Home to a known account on btc--0 so the swap-side BTC token
+  // matches the active account and the inline trigger becomes visible.
+  const preSelection = await readPersistedSelection(page);
+  const preTarget = findFixtureTarget(fixture, preSelection);
+  const normalizeAccountChanged =
+    preSelection?.walletId !== homeTarget.walletId ||
+    preSelection?.indexedAccountId !== homeTarget.indexedAccountId;
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await selectWalletAccount(page, homeTarget);
+  await assertAccountSelectorStateConsistent(page, homeTarget);
+  traces.push(
+    await collectSelectionOperationTrace(page, devOnlyPassword, {
+      expectActiveReload: normalizeAccountChanged,
+      reason: 'userSelectAccount',
+    }),
+  );
+  const normalizeNetworkChanged = preSelection?.networkId !== btcNetworkId;
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await selectNetwork(page, btcNetworkId);
+  await assertAccountSelectorStateConsistent(page, homeTarget);
+  traces.push(
+    await collectSelectionOperationTrace(page, devOnlyPassword, {
+      expectActiveReload: normalizeNetworkChanged,
+      reason: 'userSelectNetwork',
+    }),
+  );
+
+  const derivePlan = await page.evaluate(
+    async ({ networkId }) => {
+      const api = globalThis.$$appGlobals.$backgroundApiProxy;
+      const items = await api.serviceNetwork.getDeriveInfoItemsOfNetwork({
+        networkId,
+      });
+      const originalDeriveType =
+        await api.serviceNetwork.getGlobalDeriveTypeOfNetwork({ networkId });
+      const alternatives = items
+        .map((item) => item.value)
+        .filter((value) => value !== originalDeriveType);
+      return { originalDeriveType, targetDeriveType: alternatives[0] };
+    },
+    { networkId: btcNetworkId },
+  );
+  assert.ok(
+    derivePlan.originalDeriveType,
+    `${btcNetworkId} must resolve a global derive type`,
+  );
+  assert.ok(
+    derivePlan.targetDeriveType,
+    `${btcNetworkId} must expose an alternative derive type`,
+  );
+
+  // Open the Swap modal with an imported BTC from-token: the real user path
+  // (token-list Swap actions push the same route) and the only deterministic
+  // one — the swap tab keeps previously selected tokens, so its from-token
+  // depends on scenario order. The tab page is display:none under the modal,
+  // so every swap testID below resolves to exactly one visible element.
+  log('swap-inline-derive: open Swap modal with imported BTC from-token');
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await page.evaluate(
+    ({ fromToken, toToken }) => {
+      globalThis.$$appGlobals.$rootAppNavigation.pushModal('SwapModal', {
+        params: {
+          importFromToken: fromToken,
+          importToToken: toToken,
+        },
+        screen: 'SwapMainLand',
+      });
+    },
+    {
+      fromToken: swapInlineDeriveFromToken,
+      toToken: swapInlineDeriveToToken,
+    },
+  );
+  await getUniqueVisibleByTestID(page, 'swap-content-container');
+  await getUniqueVisibleByTestID(page, 'swap-from-amount-input');
+  await waitForPersistedSelection(
+    page,
+    {
+      indexedAccountId: homeTarget.indexedAccountId,
+      networkId: btcNetworkId,
+      walletId: homeTarget.walletId,
+    },
+    'swap',
+    0,
+  );
+  await waitForPersistedSelection(
+    page,
+    { networkId: swapInlineDeriveToToken.networkId },
+    'swap',
+    1,
+  );
+  await getUniqueVisibleByTestID(
+    page,
+    AccountSelectorTestIDs.walletDerivationPathTrigger,
+  );
+  await assertAccountSelectorStateConsistent(page, homeTarget, {
+    assertUI: false,
+    num: 0,
+    sceneName: 'swap',
+  });
+  await page.waitForTimeout(350);
+  const setupTrace = await drainPerfTrace(page, devOnlyPassword);
+  assertTraceHealth({ ...setupTrace, phase: 'swap-inline-derive-setup' });
+  traces.push(setupTrace);
+
+  // Switch to a different derive type, then restore the original through the
+  // same control so later phases inherit the pre-scenario derive type.
+  for (const [stepLabel, deriveType] of [
+    ['switch', derivePlan.targetDeriveType],
+    ['restore', derivePlan.originalDeriveType],
+  ]) {
+    log(`swap-inline-derive: ${stepLabel} to ${deriveType}`);
+    const numOneBefore = selectedAccountIdentity(
+      await readPersistedSelection(page, 'swap', 1),
+    );
+    await drainResidualPerfTrace(page, devOnlyPassword);
+    await selectSwapInlineDeriveType(page, {
+      deriveType,
+      networkId: btcNetworkId,
+    });
+    await waitForPersistedSelection(
+      page,
+      { deriveType, networkId: btcNetworkId },
+      'swap',
+      0,
+    );
+    await waitForPersistedSelection(page, {
+      deriveType,
+      networkId: btcNetworkId,
+    });
+    await assertAccountSelectorStateConsistent(page, homeTarget, {
+      assertUI: false,
+      num: 0,
+      sceneName: 'swap',
+    });
+    await assertAccountSelectorStateConsistent(page, homeTarget, {
+      assertUI: false,
+    });
+    const trace = await collectPerfTraceUntil(page, devOnlyPassword, (events) =>
+      ['home', 'swap'].every((sceneName) =>
+        events.some(
+          (event) =>
+            event.event === 'activeReloadResult' &&
+            event.num === 0 &&
+            event.reason === 'autoDeriveGlobalSync' &&
+            event.sceneName === sceneName,
+        ),
+      ),
+    );
+    assertSelectionOperationBudget(trace, {
+      expectedActiveReloads: 1,
+      expectedSelectionUpdates: 1,
+      label: `swap inline derive ${stepLabel} swap num 0`,
+      num: 0,
+      reason: 'autoDeriveGlobalSync',
+      sceneName: 'swap',
+    });
+    assertSelectionOperationBudget(trace, {
+      expectedActiveReloads: 1,
+      expectedSelectionUpdates: 1,
+      label: `swap inline derive ${stepLabel} home follow`,
+      reason: 'autoDeriveGlobalSync',
+    });
+    assertSelectionOperationBudget(trace, {
+      expectedActiveReloads: 0,
+      expectedSelectionUpdates: 0,
+      label: `swap inline derive ${stepLabel} swap num 1`,
+      num: 1,
+      reason: 'autoDeriveGlobalSync',
+      sceneName: 'swap',
+    });
+    // Guards the ground truth above: if this ever fires, the inline control
+    // switched to the num-scoped userSelectDeriveType path and this scenario's
+    // propagation assertions must be re-established from the source.
+    assert.deepEqual(
+      trace.events
+        .filter((event) => event.reason === 'userSelectDeriveType')
+        .map((event) => ({
+          event: event.event,
+          num: event.num,
+          sceneName: event.sceneName,
+        })),
+      [],
+      'Swap inline derive switching must use the global derive path, not userSelectDeriveType',
+    );
+    assert.deepEqual(
+      selectedAccountIdentity(await readPersistedSelection(page, 'swap', 1)),
+      numOneBefore,
+      'A BTC derive switch must not move the evm-pinned swap num 1 selection',
+    );
+    traces.push(trace);
+  }
+
+  // Close the modal and restore the pre-scenario Home selection so the phases
+  // after this one start from the state the stress/burst phases left behind.
+  await page.evaluate(() => {
+    globalThis.$$appGlobals.$rootAppNavigation.pop();
+  });
+  await waitForNoVisibleTestID(page, 'swap-content-container');
+  await waitForHomeShell(page);
+  if (
+    preTarget.walletId !== homeTarget.walletId ||
+    preTarget.indexedAccountId !== homeTarget.indexedAccountId
+  ) {
+    await drainResidualPerfTrace(page, devOnlyPassword);
+    await selectWalletAccount(page, preTarget);
+    traces.push(
+      await collectSelectionOperationTrace(page, devOnlyPassword, {
+        expectActiveReload: true,
+        reason: 'userSelectAccount',
+      }),
+    );
+  }
+  if (preSelection?.networkId && preSelection.networkId !== btcNetworkId) {
+    await drainResidualPerfTrace(page, devOnlyPassword);
+    await selectNetwork(page, preSelection.networkId);
+    traces.push(
+      await collectSelectionOperationTrace(page, devOnlyPassword, {
+        expectActiveReload: true,
+        reason: 'userSelectNetwork',
+      }),
+    );
+  }
+  await assertAccountSelectorStateConsistent(page, preTarget);
+  const trace = mergePerfTrace(...traces);
+  assertTraceHealth({ ...trace, phase: 'swap-inline-derive' });
+  return trace;
+}
+
 async function closeResidualE2EBrowserContexts(browser, phase) {
   const contexts = browser.contexts();
   const tabCount = contexts.reduce(
@@ -4743,6 +5110,9 @@ async function runCycle({ browser, cycle, rendererUrl }) {
   }
   if (stubHyperliquidApi) {
     await routeHyperliquidStub(context);
+  }
+  if (stubSwapApi) {
+    await routeSwapApiStub(context);
   }
   await context.addInitScript(
     ({ key }) => {
@@ -4908,6 +5278,16 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     const stressTrace = mergePerfTrace(repeatedDAppTrace, burstTrace);
     assertTraceHealth({ ...stressTrace, phase: 'stress' });
 
+    // Runs after the latest-wins bursts on purpose: the burst phase needs the
+    // exact selection the stress loop leaves behind, while the BulkSend phase
+    // below re-normalizes its own selection, so this slot disturbs neither.
+    log(`cycle#${cycle}: verify Swap inline derive type switching`);
+    const swapInlineDeriveTrace = await runSwapInlineDeriveTypeScenario(
+      page,
+      devOnlyPassword,
+      fixture,
+    );
+
     log(`cycle#${cycle}: verify BulkSend account removal semantics`);
     const bulkSendRemovalTrace = await runBulkSendAccountRemovalScenario(
       page,
@@ -5010,6 +5390,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       ...multiOriginDAppTrace.events,
       ...allNetworksTrace.events,
       ...stressTrace.events,
+      ...swapInlineDeriveTrace.events,
       ...bulkSendRemovalTrace.events,
       ...autoSelectTrace.events,
       ...residualTrace.events,
@@ -5067,6 +5448,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
         postPerpsReset: buildTraceSummary(perpsResetTrace.events),
         sendAddressInput: buildTraceSummary(sendAddressInputTrace.events),
         stress: buildTraceSummary(stressTrace.events),
+        swapInlineDerive: buildTraceSummary(swapInlineDeriveTrace.events),
       },
       performanceBudgets,
       summary,
@@ -5091,6 +5473,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
             postPerpsReset: perpsResetTrace,
             sendAddressInput: sendAddressInputTrace,
             stress: stressTrace,
+            swapInlineDerive: swapInlineDeriveTrace,
           },
         },
         null,
@@ -5115,6 +5498,13 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       `cycle#${cycle}: stubbed Hyperliquid actions: ${
         seenHyperliquidActions.size
           ? [...seenHyperliquidActions].toSorted().join(', ')
+          : 'none'
+      }`,
+    );
+    log(
+      `cycle#${cycle}: stubbed swap API requests: ${
+        seenSwapApiRequests.size
+          ? [...seenSwapApiRequests].toSorted().join(', ')
           : 'none'
       }`,
     );

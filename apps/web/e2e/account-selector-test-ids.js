@@ -30,8 +30,11 @@ const sendTestIDValues = require(
   path.join(repoRoot, 'packages/kit/src/views/Send/testIDValues.json'),
 );
 
-const { deriveTypeSelectorTriggerPrefix, ...accountSelectorStaticTestIDs } =
-  accountSelectorTestIDValues;
+const {
+  addressTypeSelectorItemPrefix,
+  deriveTypeSelectorTriggerPrefix,
+  ...accountSelectorStaticTestIDs
+} = accountSelectorTestIDValues;
 const {
   accountEditButtonPrefix,
   accountItemPrefix,
@@ -45,6 +48,8 @@ const {
 
 const AccountSelectorTestIDs = Object.freeze({
   ...accountSelectorStaticTestIDs,
+  addressTypeSelectorItem: (deriveType) =>
+    `${addressTypeSelectorItemPrefix}${deriveType}`,
   deriveTypeSelectorTrigger: (pathTemplate) =>
     `${deriveTypeSelectorTriggerPrefix}${pathTemplate}`,
 });
