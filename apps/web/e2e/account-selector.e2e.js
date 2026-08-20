@@ -210,6 +210,10 @@ const expectedAccountAddressFixtures = {
 const simulatedDAppOrigin = 'https://account-selector-e2e.test';
 const simulatedDAppSecondaryOrigin =
   'https://account-selector-secondary-e2e.test';
+// Only ever opened and rejected, never approved: a dedicated origin proves the
+// zero-persistence assertion cannot be satisfied by leftovers from an earlier
+// approval of the same origin.
+const simulatedDAppRejectOrigin = 'https://account-selector-reject-e2e.test';
 const dappConnectionProviderCommitLimit = readPositiveNumberEnv(
   'ACCOUNT_SELECTOR_E2E_DAPP_CONNECTION_PROVIDER_COMMIT_MAX',
   22,
@@ -4030,6 +4034,313 @@ async function runSimulatedDAppScenario(page, devOnlyPassword, fixture) {
   return trace;
 }
 
+// The connection operations the other DApp phases never exercise: rejecting a
+// connection request, disconnecting one origin from the connection list, and
+// removing every connection at once. Each operation is asserted on both sides
+// of the boundary — the background promise settlement / dappConnection storage
+// AND the list UI — so a regression names which side broke.
+async function runDAppConnectionOpsScenario(page, devOnlyPassword, fixture) {
+  const homeSelectionBefore = await readPersistedSelection(page);
+  const homeTarget = findFixtureTarget(fixture, homeSelectionBefore);
+
+  // --- Reject: the openConnectionModal promise must reject, persist nothing.
+  await deleteSimulatedDAppConnection(page, simulatedDAppRejectOrigin);
+  const rejectPendingTrace = await drainPerfTrace(page, devOnlyPassword);
+  await page.evaluate(
+    ({ origin }) => {
+      const api = globalThis.$$appGlobals.$backgroundApiProxy;
+      const state = {
+        hasResult: false,
+        outcome: 'pending',
+      };
+      globalThis.__accountSelectorE2EDappRejection = state;
+      void api.serviceDApp
+        .openConnectionModal({
+          data: {
+            method: 'eth_requestAccounts',
+            params: [],
+          },
+          id: `account-selector-e2e-reject-${Date.now()}`,
+          origin,
+          scope: 'ethereum',
+        })
+        .then((result) => {
+          state.hasResult = Boolean(result);
+          state.outcome = 'resolved';
+        })
+        .catch((error) => {
+          state.errorCode = error?.code;
+          state.errorMessage = error?.message || String(error);
+          state.outcome = 'rejected';
+        });
+    },
+    { origin: simulatedDAppRejectOrigin },
+  );
+  const rejectModal = await getUniqueVisibleByTestID(
+    page,
+    DAppConnectionTestIDs.ConnectionModal,
+  );
+  await rejectModal
+    .locator(visibleTestIDSelector(DAppConnectionTestIDs.AccountListItem))
+    .first()
+    .waitFor({ state: 'visible', timeout: pageTimeoutMs });
+  // The modal initializes identically whether it will be approved or rejected,
+  // so the reject path must satisfy the same initialization budget.
+  const rejectInitializationTrace = await collectPerfTraceUntil(
+    page,
+    devOnlyPassword,
+    (events) =>
+      events.some(
+        (event) =>
+          event.event === 'autoSelectAccountResult' &&
+          event.num === 0 &&
+          event.sceneName === 'discover' &&
+          event.source === 'active-ready',
+      ) &&
+      events.some(
+        (event) =>
+          event.event === 'manualSceneSyncResult' &&
+          event.num === 0 &&
+          event.sourceNum === 0 &&
+          event.sourceSceneName === 'home',
+      ) &&
+      events.some(
+        (event) =>
+          event.event === 'dappConnectionAccountObserved' &&
+          event.num === 0 &&
+          event.hasAddress === true,
+      ) &&
+      events.some(
+        (event) =>
+          event.event === 'providerSubtreeCommit' &&
+          event.perfDebugName === 'dapp-connection-modal',
+      ),
+  );
+  assertTraceHealth({
+    ...rejectInitializationTrace,
+    phase: 'dapp-reject-initialization',
+  });
+  assertDAppAccountSelectorInitializationRefreshBudget(
+    rejectInitializationTrace,
+  );
+
+  const rejectButton = await getUniqueVisibleByTestID(
+    rejectModal,
+    DAppConnectionTestIDs.ConnectionRejectButton,
+  );
+  await rejectButton.click({ timeout: pageTimeoutMs });
+  await rejectModal.waitFor({ state: 'hidden', timeout: pageTimeoutMs });
+  await page.waitForFunction(
+    () => globalThis.__accountSelectorE2EDappRejection?.outcome !== 'pending',
+    undefined,
+    { timeout: pageTimeoutMs },
+  );
+  const rejectionResult = await page.evaluate(() => {
+    const state = globalThis.__accountSelectorE2EDappRejection;
+    delete globalThis.__accountSelectorE2EDappRejection;
+    return state;
+  });
+  assert.deepEqual(
+    rejectionResult,
+    {
+      errorCode: 4001,
+      errorMessage: 'User rejected the request.',
+      hasResult: false,
+      outcome: 'rejected',
+    },
+    'Rejecting the connection modal must settle the DApp request with the EIP-1193 userRejectedRequest error',
+  );
+  const rejectedMap = await page.evaluate(
+    ({ origin }) =>
+      globalThis.$$appGlobals.$backgroundApiProxy.simpleDb.dappConnection.getAccountSelectorMap(
+        { sceneUrl: origin },
+      ),
+    { origin: simulatedDAppRejectOrigin },
+  );
+  assert.equal(
+    rejectedMap,
+    undefined,
+    'A rejected DApp connection must not persist any dappConnection entry',
+  );
+  await page.waitForTimeout(350);
+  const rejectCompletionTrace = await drainPerfTrace(page, devOnlyPassword);
+  const rejectTrace = mergePerfTrace(
+    rejectPendingTrace,
+    rejectInitializationTrace,
+    rejectCompletionTrace,
+  );
+  assertDAppAccountSelectorMirrorLifecycle(rejectTrace);
+  const rejectSummary = buildTraceSummary(rejectTrace.events);
+  const rejectProviderSummary =
+    rejectSummary.providerRenders.byDebugName['dapp-connection-modal'];
+  assert.ok(rejectProviderSummary, 'DApp rejection Provider trace is missing');
+  assert.ok(
+    rejectProviderSummary.commitCount <= dappConnectionProviderCommitLimit,
+    `DApp rejection Provider committed ${rejectProviderSummary.commitCount} times (limit ${dappConnectionProviderCommitLimit})`,
+  );
+  assertTraceHealth({ ...rejectTrace, phase: 'dapp-reject' });
+
+  // --- Disconnect one origin: the other origin's storage must stay untouched.
+  const primaryConnectionTrace = await openAndApproveSimulatedDAppConnection(
+    page,
+    devOnlyPassword,
+    {
+      assertInitializationDetails: false,
+      expectedSelection: homeTarget,
+      writeArtifacts: false,
+    },
+  );
+  const secondaryConnectionTrace = await openAndApproveSimulatedDAppConnection(
+    page,
+    devOnlyPassword,
+    {
+      assertInitializationDetails: false,
+      expectedSelection: homeTarget,
+      origin: simulatedDAppSecondaryOrigin,
+      writeArtifacts: false,
+    },
+  );
+
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  const connectionList = await openDAppConnectionList(page);
+  const connectionItems = connectionList.locator(
+    visibleTestIDSelector(DAppConnectionTestIDs.ConnectionListItem),
+  );
+  await connectionItems
+    .nth(1)
+    .waitFor({ state: 'visible', timeout: pageTimeoutMs });
+  assert.equal(
+    await connectionItems.count(),
+    2,
+    'DApp connection list must render both approved origins',
+  );
+  const listInitializationTrace = await collectPerfTraceUntil(
+    page,
+    devOnlyPassword,
+    (events) =>
+      [simulatedDAppOrigin, simulatedDAppSecondaryOrigin].every((origin) =>
+        events.some(
+          (event) =>
+            event.event === 'providerSubtreeCommit' &&
+            event.perfDebugName === `dapp-connection-list:${origin}` &&
+            event.enabledNum?.join(',') === '0',
+        ),
+      ),
+  );
+  assertTraceHealth({
+    ...listInitializationTrace,
+    phase: 'dapp-ops-list-initialization',
+  });
+
+  const mapsBeforeDisconnect = await Promise.all(
+    [simulatedDAppOrigin, simulatedDAppSecondaryOrigin].map((origin) =>
+      page.evaluate(
+        ({ sceneUrl }) =>
+          globalThis.$$appGlobals.$backgroundApiProxy.simpleDb.dappConnection.getAccountSelectorMap(
+            { sceneUrl },
+          ),
+        { sceneUrl: origin },
+      ),
+    ),
+  );
+  assert.ok(
+    mapsBeforeDisconnect[0]?.[0]?.walletId &&
+      mapsBeforeDisconnect[1]?.[0]?.walletId,
+    'Both approved origins must have a persisted dappConnection entry',
+  );
+
+  const primaryCard = connectionItems.filter({
+    hasText: new URL(simulatedDAppOrigin).hostname,
+  });
+  assert.equal(
+    await primaryCard.count(),
+    1,
+    `DApp connection list must render one card for ${simulatedDAppOrigin}`,
+  );
+  const disconnectButton = await getUniqueVisibleByTestID(
+    primaryCard,
+    DAppConnectionTestIDs.ConnectionListDisconnectButton,
+  );
+  await disconnectButton.click({ timeout: pageTimeoutMs });
+  await primaryCard.waitFor({ state: 'hidden', timeout: pageTimeoutMs });
+  assert.equal(
+    await connectionItems.count(),
+    1,
+    'Disconnecting one origin must leave exactly one connection card',
+  );
+  assert.equal(
+    await connectionItems
+      .filter({ hasText: new URL(simulatedDAppSecondaryOrigin).hostname })
+      .count(),
+    1,
+    'The remaining connection card must belong to the untouched origin',
+  );
+  const mapsAfterDisconnect = await Promise.all(
+    [simulatedDAppOrigin, simulatedDAppSecondaryOrigin].map((origin) =>
+      page.evaluate(
+        ({ sceneUrl }) =>
+          globalThis.$$appGlobals.$backgroundApiProxy.simpleDb.dappConnection.getAccountSelectorMap(
+            { sceneUrl },
+          ),
+        { sceneUrl: origin },
+      ),
+    ),
+  );
+  assert.equal(
+    mapsAfterDisconnect[0],
+    undefined,
+    'Disconnecting an origin must delete its dappConnection entry',
+  );
+  assert.deepEqual(
+    mapsAfterDisconnect[1],
+    mapsBeforeDisconnect[1],
+    'Disconnecting one origin must not mutate the other origin selections',
+  );
+
+  // --- Remove all: every connection gone, HOME scene selection untouched.
+  const removeAllButton = await getUniqueVisibleByTestID(
+    page,
+    DAppConnectionTestIDs.ConnectionListRemoveAllButton,
+  );
+  await removeAllButton.click({ timeout: pageTimeoutMs });
+  await waitForNoVisibleTestID(page, DAppConnectionTestIDs.ConnectionListItem);
+  const mapsAfterRemoveAll = await Promise.all(
+    [simulatedDAppOrigin, simulatedDAppSecondaryOrigin].map((origin) =>
+      page.evaluate(
+        ({ sceneUrl }) =>
+          globalThis.$$appGlobals.$backgroundApiProxy.simpleDb.dappConnection.getAccountSelectorMap(
+            { sceneUrl },
+          ),
+        { sceneUrl: origin },
+      ),
+    ),
+  );
+  assert.deepEqual(
+    mapsAfterRemoveAll,
+    [undefined, undefined],
+    'Removing all connections must delete every origin dappConnection entry',
+  );
+  const homeSelectionAfter = await readPersistedSelection(page);
+  assert.deepEqual(
+    homeSelectionAfter,
+    homeSelectionBefore,
+    'DApp connection operations must not disturb the HOME scene selection',
+  );
+
+  await closeDAppConnectionList(page);
+  await page.waitForTimeout(350);
+  const operationsTrace = await drainPerfTrace(page, devOnlyPassword);
+  const trace = mergePerfTrace(
+    rejectTrace,
+    primaryConnectionTrace,
+    secondaryConnectionTrace,
+    listInitializationTrace,
+    operationsTrace,
+  );
+  assertTraceHealth({ ...trace, phase: 'dapp-ops' });
+  return trace;
+}
+
 async function openBulkSendAddressInput(page, target) {
   await switchAppTab(page, 'Home');
   await page.evaluate(
@@ -5808,6 +6119,18 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       devOnlyPassword,
       fixture,
     );
+    // Runs directly after the multi-origin phase on purpose: that phase deletes
+    // both simulated origins on exit, so this one starts from empty
+    // dappConnection storage and its remove-all step restores exactly that
+    // state for the phases that follow.
+    log(
+      `cycle#${cycle}: verify DApp connection reject, disconnect and remove-all`,
+    );
+    const dappOpsTrace = await runDAppConnectionOpsScenario(
+      page,
+      devOnlyPassword,
+      fixture,
+    );
     // Runs before the stress iterations on purpose: the latest-wins burst
     // phase later relies on the pre-burst state the stress loop leaves behind
     // (its first rapid network pick must be a real change to overlap reloads),
@@ -5956,6 +6279,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       ...multiNumResult.trace.events,
       ...dappTrace.events,
       ...multiOriginDAppTrace.events,
+      ...dappOpsTrace.events,
       ...allNetworksTrace.events,
       ...stressTrace.events,
       ...swapInlineDeriveTrace.events,
@@ -6011,6 +6335,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
         bulkSendRemoval: buildTraceSummary(bulkSendRemovalTrace.events),
         dapp: buildTraceSummary(dappTrace.events),
         dappMultiOrigin: buildTraceSummary(multiOriginDAppTrace.events),
+        dappOps: buildTraceSummary(dappOpsTrace.events),
         initialization: buildTraceSummary(initTrace.events),
         marketSwapPanel: buildTraceSummary(marketSwapPanelTrace.events),
         multiNumCustomNetwork: buildTraceSummary(multiNumResult.trace.events),
@@ -6037,6 +6362,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
             bulkSendRemoval: bulkSendRemovalTrace,
             dapp: dappTrace,
             dappMultiOrigin: multiOriginDAppTrace,
+            dappOps: dappOpsTrace,
             initialization: initTrace,
             marketSwapPanel: marketSwapPanelTrace,
             multiNumCustomNetwork: multiNumResult.trace,
