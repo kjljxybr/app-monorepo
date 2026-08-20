@@ -301,8 +301,15 @@ function SwapPanelWrapContent({ onCloseDialog }: ISwapPanelWrapProps) {
   } = speedSwapActions;
 
   const { result: mergeDeriveAssetsEnabled } = usePromiseResult(async () => {
+    const balanceNetworkId = balanceToken?.networkId;
+    // The payment token settles asynchronously after the panel mounts, and
+    // getVaultSettings throws on an empty networkId instead of returning a
+    // default — which surfaces as an unhandled rejection on every mount.
+    if (!balanceNetworkId) {
+      return undefined;
+    }
     const result = await backgroundApiProxy.serviceNetwork.getVaultSettings({
-      networkId: balanceToken?.networkId || '',
+      networkId: balanceNetworkId,
     });
     return result?.mergeDeriveAssetsEnabled;
   }, [balanceToken?.networkId]);
