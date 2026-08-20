@@ -178,6 +178,12 @@ export function NetworkContent({
       accountId={accountId}
       indexedAccountId={indexedAccountId}
       zeroValue={zeroValue}
+      // Without this the network tab renders no All Networks entry at all:
+      // the list header row is gated on allNetworkItem, and RecentNetworks
+      // filters recents against availableNetworks (which is built from
+      // mainnet/testnet items + allNetworkItem), so showAllNetworkInRecentNetworks
+      // above could never match anything either.
+      allNetworkItem={chainSelectorNetworks.allNetworkItem}
       mainnetItems={chainSelectorNetworks.mainnetItems}
       testnetItems={chainSelectorNetworks.testnetItems}
       unavailableItems={chainSelectorNetworks.unavailableItems}

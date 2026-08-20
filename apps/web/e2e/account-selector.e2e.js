@@ -83,6 +83,19 @@ const expectedNetworks = [
   'tron--0x2b6653dc',
   'sol--101',
 ];
+// Ground truth for the All Networks selection shape:
+// - network id: packages/shared/src/config/presetNetworks.ts (`onekeyall--0`).
+// - the persisted record strips deriveType for all-networks on save AND read
+//   (SimpleDbEntityAccountSelector.cloneAndFixSelectedAccount), while the
+//   jotai selection resolves the global derive type of `onekeyall--0`, which
+//   nothing ever writes, so getGlobalDeriveTypeOfNetwork falls back to
+//   'default'.
+// - the active account for an HD indexed account is the mocked all-network
+//   account (ServiceAccount.getMockedAllNetworkAccount) whose address is
+//   ALL_NETWORK_ACCOUNT_MOCK_ADDRESS (packages/shared/src/consts/addresses.ts).
+const allNetworksNetworkId = 'onekeyall--0';
+const allNetworksMockAddress = 'AllNetworkMockAddress';
+const allNetworksSelectedDeriveType = 'default';
 const accountSelectorE2EWalletFixtures = [
   { accountNames: ['A-1', 'A-2'], fixtureId: 'alpha', name: 'E2E A' },
   { accountNames: ['B-1', 'B-2'], fixtureId: 'beta', name: 'E2E B' },
@@ -1140,7 +1153,7 @@ async function createFixture(page, devOnlyPassword) {
           }
         }
       }
-      return { addressFixtures, wallets };
+      return { addressFixtures, rawPassword, wallets };
     },
     {
       addressNetworkIds: expectedNetworks,
@@ -1148,6 +1161,30 @@ async function createFixture(page, devOnlyPassword) {
       password: devOnlyPassword,
       walletFixtures: accountSelectorE2EWalletFixtures,
     },
+  );
+}
+
+// A page reload restarts the single web runtime and with it the in-memory
+// wallet password cache (ServicePassword.cachedPassword). The first
+// key-deriving call after a reload would then raise a passcode prompt dialog
+// that nothing in the suite can answer (observed with the BulkSend perf-off
+// account creation). Re-verify the fixture password through the real
+// verifyPassword path — the same thing a user unlocking does — so the cache
+// matches the pre-reload state.
+async function restoreWalletPasswordCache(page, fixture) {
+  await page.evaluate(
+    async ({ rawPassword }) => {
+      const api = globalThis.$$appGlobals.$backgroundApiProxy;
+      const encoded = await api.servicePassword.encodeSensitiveText({
+        text: rawPassword,
+      });
+      await api.servicePassword.verifyPassword({
+        password: encoded,
+        passwordMode: 'password',
+        skipPostVerifyBackgroundTasks: true,
+      });
+    },
+    { rawPassword: fixture.rawPassword },
   );
 }
 
@@ -1243,6 +1280,10 @@ async function assertAccountSelectorStateConsistent(
   {
     assertPersistence = true,
     assertUI = true,
+    // All Networks is opt-in: a caller that expects it gets the exact
+    // all-networks state shape asserted, and every other caller fails loudly
+    // if the app drifted into All Networks on its own.
+    expectAllNetworks = false,
     num = 0,
     sceneName = 'home',
     sceneUrl,
@@ -1325,18 +1366,41 @@ async function assertAccountSelectorStateConsistent(
   const active = snapshot?.active;
   assert.ok(selected, `${sceneName} selected Atom snapshot is missing`);
   assert.ok(active?.ready, `${sceneName} active Atom must be ready`);
-  const isAllNetworkSelection = selected.networkId === 'onekeyall--0';
+  assert.equal(
+    selected.networkId === allNetworksNetworkId,
+    expectAllNetworks,
+    expectAllNetworks
+      ? `${sceneName} selected network must be All Networks (${allNetworksNetworkId}), got ${selected.networkId}`
+      : `${sceneName} selected network must not be All Networks`,
+  );
+  if (expectAllNetworks) {
+    assert.equal(
+      selected.deriveType,
+      allNetworksSelectedDeriveType,
+      `${sceneName} All Networks selection must resolve deriveType '${allNetworksSelectedDeriveType}'`,
+    );
+  }
   if (assertPersistence) {
+    if (expectAllNetworks) {
+      // cloneAndFixSelectedAccount strips deriveType from the persisted
+      // record whenever networkId is the all-network id, so `undefined` is
+      // the exact persisted form, not a relaxation.
+      assert.equal(
+        persisted?.deriveType,
+        undefined,
+        `${sceneName} persisted All Networks selection must have no deriveType`,
+      );
+    }
     assert.deepEqual(
       {
-        ...(isAllNetworkSelection ? {} : { deriveType: selected.deriveType }),
+        ...(expectAllNetworks ? {} : { deriveType: selected.deriveType }),
         indexedAccountId: selected.indexedAccountId,
         networkId: selected.networkId,
         othersWalletAccountId: selected.othersWalletAccountId,
         walletId: selected.walletId,
       },
       {
-        ...(isAllNetworkSelection ? {} : { deriveType: persisted?.deriveType }),
+        ...(expectAllNetworks ? {} : { deriveType: persisted?.deriveType }),
         indexedAccountId: persisted?.indexedAccountId,
         networkId: persisted?.networkId,
         othersWalletAccountId: persisted?.othersWalletAccountId,
@@ -1371,15 +1435,25 @@ async function assertAccountSelectorStateConsistent(
     `${sceneName} selected account must match the fixture`,
   );
 
-  const expectedAddress =
-    expectedAccountAddressFixtures[target.fixtureId]?.[target.index]?.[
-      selected.networkId
-    ]?.[selected.deriveType];
-  if (isAllNetworkSelection) {
+  const expectedAddress = expectAllNetworks
+    ? undefined
+    : expectedAccountAddressFixtures[target.fixtureId]?.[target.index]?.[
+        selected.networkId
+      ]?.[selected.deriveType];
+  if (expectAllNetworks) {
     assert.equal(
-      expectedAddress,
+      expectedAccountAddressFixtures[target.fixtureId]?.[target.index]?.[
+        selected.networkId
+      ],
       undefined,
       'All Networks must not use a chain-specific golden address',
+    );
+    // buildActiveAccountInfoFromSelectedAccount swaps in the mocked
+    // all-network account for HD indexed accounts.
+    assert.equal(
+      active.address,
+      allNetworksMockAddress,
+      `${sceneName} active All Networks account must expose the mocked all-network address`,
     );
   } else {
     assert.ok(
@@ -1421,6 +1495,14 @@ async function assertAccountSelectorStateConsistent(
         visibleAddress?.trim(),
         expectedAddress,
         'Visible account address must match the golden fixture',
+      );
+    }
+    if (expectAllNetworks && visibleAddressCount === 1) {
+      const visibleAddress = await visibleAddressLocator.textContent();
+      assert.notEqual(
+        visibleAddress?.trim(),
+        allNetworksMockAddress,
+        'The mocked all-network address must never be displayed',
       );
     }
   }
@@ -4126,9 +4208,11 @@ async function runBulkSendAccountRemovalScenario(
   await drainResidualPerfTrace(page, devOnlyPassword);
   await configurePerfAttribution(page, devOnlyPassword, false);
   const perfOffTarget = {
-    fixtureId: removedTarget.fixtureId,
     // Row 1: the wallet keeps its index-0 account and the freshly added
-    // account sorts after it.
+    // account sorts after it. The disposable account reuses no fixture HD
+    // index (removal never rolls the wallet's accountHdIndex counter back),
+    // so it has no golden-address entry and the fixture-based consistency
+    // helper does not apply to it.
     index: 1,
     indexedAccountId: perfOffIndexedAccountId,
     walletId: removedTarget.walletId,
@@ -4149,13 +4233,34 @@ async function runBulkSendAccountRemovalScenario(
     AccountManagerTestIDs.accountItem(perfOffTarget.index),
   );
   await perfOffAccount.click({ timeout: pageTimeoutMs });
-  await assertAccountSelectorStateConsistent(page, perfOffTarget, {
-    assertPersistence: false,
-    assertUI: false,
-    num: 0,
-    sceneName: 'addressInput',
-    sceneUrl: '',
-  });
+  // The selection must land on the disposable account and resolve an active
+  // address before its removal below can prove the perf-off clearing (the
+  // regression this block guards kept the removed account's address alive).
+  await page.waitForFunction(
+    ({ expectedIndexedAccountId, expectedWalletId }) => {
+      const snapshot =
+        globalThis.$$appGlobals.$$accountSelectorE2EStateAccessor?.getSnapshot?.(
+          {
+            num: 0,
+            sceneName: 'addressInput',
+            sceneUrl: '',
+          },
+        );
+      return Boolean(
+        snapshot?.active?.ready &&
+        snapshot.selected?.walletId === expectedWalletId &&
+        snapshot.selected?.indexedAccountId === expectedIndexedAccountId &&
+        snapshot.active?.walletId === expectedWalletId &&
+        snapshot.active?.indexedAccountId === expectedIndexedAccountId &&
+        Boolean(snapshot.active?.address),
+      );
+    },
+    {
+      expectedIndexedAccountId: perfOffTarget.indexedAccountId,
+      expectedWalletId: perfOffTarget.walletId,
+    },
+    { timeout: pageTimeoutMs },
+  );
   await page.evaluate(
     async ({ indexedAccountId }) => {
       const serviceAccount =
@@ -4454,6 +4559,156 @@ async function runStressInteractions(page, fixture, devOnlyPassword) {
   return mergePerfTrace(...traces);
 }
 
+// All Networks (onekeyall--0) round-trip through the real UI:
+// 1. select All Networks in the unified network selector (userSelectNetwork),
+// 2. select a different account while All Networks is active — this walks
+//    confirmAccountSelect's all-networks fallback end-to-end (the HD fixture
+//    wallet has compatible enabled networks, so getAllNetworksFallbackNetworkId
+//    returns undefined and the selection keeps onekeyall--0),
+// 3. switch back to a concrete chain so later scenarios never inherit
+//    All Networks.
+// Each step asserts the strict all-networks state shape plus the selection
+// operation budget for its reason.
+async function runAllNetworksSelectionScenario(page, fixture, devOnlyPassword) {
+  const traces = [];
+  const firstTarget = {
+    fixtureId: fixture.wallets[0].fixtureId,
+    index: 0,
+    indexedAccountId: fixture.wallets[0].indexedAccountIds[0],
+    walletId: fixture.wallets[0].walletId,
+  };
+  const secondTarget = {
+    fixtureId: fixture.wallets[1].fixtureId,
+    index: 1,
+    indexedAccountId: fixture.wallets[1].indexedAccountIds[1],
+    walletId: fixture.wallets[1].walletId,
+  };
+
+  // Normalize to a known single-chain selection first so every budget below
+  // measures exactly one deliberate transition.
+  const preAccountSelection = await readPersistedSelection(page);
+  const normalizeAccountChanged =
+    preAccountSelection?.walletId !== firstTarget.walletId ||
+    preAccountSelection?.indexedAccountId !== firstTarget.indexedAccountId;
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await selectWalletAccount(page, firstTarget);
+  await assertAccountSelectorStateConsistent(page, firstTarget);
+  traces.push(
+    await collectSelectionOperationTrace(page, devOnlyPassword, {
+      expectActiveReload: normalizeAccountChanged,
+      reason: 'userSelectAccount',
+    }),
+  );
+  const preNetworkSelection = await readPersistedSelection(page);
+  const normalizeNetworkChanged = preNetworkSelection?.networkId !== 'evm--1';
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await selectNetwork(page, 'evm--1');
+  await assertAccountSelectorStateConsistent(page, firstTarget);
+  traces.push(
+    await collectSelectionOperationTrace(page, devOnlyPassword, {
+      expectActiveReload: normalizeNetworkChanged,
+      reason: 'userSelectNetwork',
+    }),
+  );
+
+  log('all-networks: select All Networks via the unified network selector');
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await selectNetwork(page, allNetworksNetworkId);
+  await assertAccountSelectorStateConsistent(page, firstTarget, {
+    expectAllNetworks: true,
+  });
+  const enterTrace = await collectSelectionOperationTrace(
+    page,
+    devOnlyPassword,
+    {
+      expectActiveReload: true,
+      reason: 'userSelectNetwork',
+    },
+  );
+  assertSelectionOperationBudget(enterTrace, {
+    expectedActiveReloads: 1,
+    expectedSelectionUpdates: 1,
+    label: 'all-networks network selection',
+    reason: 'userSelectNetwork',
+  });
+  traces.push(enterTrace);
+
+  log('all-networks: select another account while All Networks is active');
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await selectWalletAccount(page, secondTarget);
+  await assertAccountSelectorStateConsistent(page, secondTarget, {
+    expectAllNetworks: true,
+  });
+  const accountTrace = await collectSelectionOperationTrace(
+    page,
+    devOnlyPassword,
+    {
+      expectActiveReload: true,
+      reason: 'userSelectAccount',
+    },
+  );
+  assertSelectionOperationBudget(accountTrace, {
+    expectedActiveReloads: 1,
+    expectedSelectionUpdates: 1,
+    label: 'all-networks account selection',
+    reason: 'userSelectAccount',
+  });
+  assertSelectionOperationBudget(accountTrace, {
+    expectedActiveReloads: 0,
+    expectedSelectionUpdates: 1,
+    label: 'all-networks wallet focus selection',
+    reason: 'userSelectWallet',
+  });
+  // confirmAccountSelect emits its result before the account selector modal
+  // dismisses, so the confirm outcome is always inside this window. The
+  // fallbackOutcome field proves the all-networks dead-end check really ran:
+  // 'not-needed' here would mean the branch was skipped and this scenario
+  // silently stopped covering it.
+  const accountSelectResults = accountTrace.events.filter(
+    (event) =>
+      event.event === 'accountSelectResult' &&
+      event.num === 0 &&
+      event.reason === 'userSelectAccount',
+  );
+  assert.equal(
+    accountSelectResults.length,
+    1,
+    `all-networks account selection must confirm exactly once: ${JSON.stringify(accountSelectResults)}`,
+  );
+  assert.equal(
+    accountSelectResults[0].outcome,
+    'commit',
+    'all-networks account selection must commit',
+  );
+  assert.equal(
+    accountSelectResults[0].fallbackOutcome,
+    'success',
+    'all-networks account selection must run the dead-end fallback check',
+  );
+  traces.push(accountTrace);
+
+  log('all-networks: switch back to a concrete chain');
+  await drainResidualPerfTrace(page, devOnlyPassword);
+  await selectNetwork(page, 'evm--1');
+  await assertAccountSelectorStateConsistent(page, secondTarget);
+  const exitTrace = await collectSelectionOperationTrace(
+    page,
+    devOnlyPassword,
+    {
+      expectActiveReload: true,
+      reason: 'userSelectNetwork',
+    },
+  );
+  assertSelectionOperationBudget(exitTrace, {
+    expectedActiveReloads: 1,
+    expectedSelectionUpdates: 1,
+    label: 'all-networks exit network selection',
+    reason: 'userSelectNetwork',
+  });
+  traces.push(exitTrace);
+  return mergePerfTrace(...traces);
+}
+
 async function closeResidualE2EBrowserContexts(browser, phase) {
   const contexts = browser.contexts();
   const tabCount = contexts.reduce(
@@ -4549,6 +4804,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     });
     await waitForAppReady(page);
     await waitForHomeShell(page);
+    await restoreWalletPasswordCache(page, fixture);
     // The reload replaced the runtime that produced them, and its ids restart.
     takeResidualTrace();
     const initTrace = await collectPerfTraceUntil(
@@ -4563,7 +4819,13 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     );
     const restoredSelection = await readPersistedSelection(page);
     const restoredTarget = findFixtureTarget(fixture, restoredSelection);
-    await assertAccountSelectorStateConsistent(page, restoredTarget);
+    // A fresh install defaults the home scene to All Networks and no scenario
+    // has selected a concrete chain yet, so the restored selection is the
+    // all-networks shape by design — assert it strictly instead of tolerating
+    // whatever the restore produced.
+    await assertAccountSelectorStateConsistent(page, restoredTarget, {
+      expectAllNetworks: true,
+    });
 
     log(`cycle#${cycle}: verify Send address input account selection`);
     const sendAddressInputTrace = await runSendAddressInputScenario(
@@ -4584,6 +4846,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     });
     await waitForAppReady(page);
     await waitForHomeShell(page);
+    await restoreWalletPasswordCache(page, fixture);
     await configurePerfTrace(page, devOnlyPassword);
     const preReloadResidualTrace = takeResidualTrace();
     const perpsResetTrace = await collectPerfTraceUntil(
@@ -4617,6 +4880,17 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       devOnlyPassword,
       fixture,
     );
+    // Runs before the stress iterations on purpose: the latest-wins burst
+    // phase later relies on the pre-burst state the stress loop leaves behind
+    // (its first rapid network pick must be a real change to overlap reloads),
+    // so this scenario must not be the last thing that touches the selection.
+    log(`cycle#${cycle}: verify All Networks selection round-trip`);
+    const allNetworksTrace = await runAllNetworksSelectionScenario(
+      page,
+      fixture,
+      devOnlyPassword,
+    );
+    assertTraceHealth({ ...allNetworksTrace, phase: 'all-networks' });
     log(
       `cycle#${cycle}: run ${iterations} wallet/account/network/derive iterations`,
     );
@@ -4734,6 +5008,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       ...multiNumResult.trace.events,
       ...dappTrace.events,
       ...multiOriginDAppTrace.events,
+      ...allNetworksTrace.events,
       ...stressTrace.events,
       ...bulkSendRemovalTrace.events,
       ...autoSelectTrace.events,
@@ -4781,6 +5056,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       pageErrorCount: pageErrors.length,
       pageErrors,
       phaseSummaries: {
+        allNetworks: buildTraceSummary(allNetworksTrace.events),
         autoSelect: buildTraceSummary(autoSelectTrace.events),
         bulkSendRemoval: buildTraceSummary(bulkSendRemovalTrace.events),
         dapp: buildTraceSummary(dappTrace.events),
@@ -4804,6 +5080,7 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       `${JSON.stringify(
         {
           phases: {
+            allNetworks: allNetworksTrace,
             autoSelect: autoSelectTrace,
             bulkSendRemoval: bulkSendRemovalTrace,
             dapp: dappTrace,
