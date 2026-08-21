@@ -1,31 +1,51 @@
 #!/usr/bin/env node
 
 /*
- * Cross-branch React render-commit baseline for account-selector UI flows.
+ * Cross-branch React render baseline for account-selector UI flows (v2).
  *
  * Purpose
  * -------
- * Measures how many React commits (plus browser long tasks and wall time) a
- * fixed set of account-selector interactions costs on the web app:
+ * Measures what a fixed set of account-selector interactions costs on the web
+ * app, on two dimensions per React commit:
+ *   - commits:             top-level React commit count (v1 metric, kept)
+ *   - rendered components: how many composite components performed work inside
+ *     each commit, counted the way React DevTools detects rendered fibers
+ *     (fiber.flags & PerformedWork). This resolves optimizations that reduce
+ *     re-renders WITHIN a commit (subscription isolation, stable identities),
+ *     which the commit count alone cannot see.
+ * Best-effort, it also sums React's profiling actualDuration per commit:
+ * installing a devtools hook before the bundle loads makes React dev builds
+ * create roots in ProfileMode, so fiber.actualDuration is populated. If it is
+ * not, the artifact reports it as unavailable instead of faking it.
+ *
+ * Phases:
  *   - account-switch:      open the account selector and pick the other account
  *   - network-switch:      toggle evm--1 <-> btc--0 through the network trigger
  *   - selector-open-close: open the account selector and dismiss it
  *   - tab-switch:          Wallet <-> Trade sidebar tab round trip
- * Each flow runs RENDER_BASELINE_ITERATIONS times (default 5) and the per
- * iteration commit deltas are reported as min/median/max, so two runs of this
- * script on two branches quantify a render optimization as "switching an
- * account went from N commits to M".
+ *   - background-churn:    with the Home page settled and NOTHING changed in
+ *     the data, emit AccountUpdate on the app event bus repeatedly (spaced
+ *     beyond the reload throttle) and measure what each no-op reload cycle
+ *     costs between quiescent points. This is the decisive phase for reload
+ *     dedup work: a branch that gates deep-equal rebuilds writes nothing.
+ * Interactive phases run RENDER_BASELINE_ITERATIONS times (default 5);
+ * background-churn performs RENDER_BASELINE_CHURN_EMITS emits (default 10),
+ * one measured iteration per emit.
+ *
+ * Fixture: 3 HD wallets x 2 indexed accounts (public BIP39 test mnemonics),
+ * chain accounts on evm--1 + btc--0 with the default derive type = 12 chain
+ * accounts, so account-selector lists and consumers have realistic breadth.
  *
  * Zero intrusion
  * --------------
  * The app is never modified and no in-repo instrumentation is required:
- * commits are counted by installing a minimal __REACT_DEVTOOLS_GLOBAL_HOOK__
+ * everything is counted by installing a minimal __REACT_DEVTOOLS_GLOBAL_HOOK__
  * via Playwright's context.addInitScript BEFORE any page script runs (React
  * binds to whatever hook exists at load time), and long tasks come from a
  * PerformanceObserver installed the same way. Every selector, testID,
- * background API and storage key used below exists on origin/x as well as on
- * feature branches, and this file deliberately requires nothing from the repo
- * besides the root-level playwright-core dependency.
+ * background API, event-bus global and storage key used below exists on
+ * origin/x as well as on feature branches, and this file deliberately requires
+ * nothing from the repo besides the root-level playwright-core dependency.
  *
  * Getting the x baseline
  * ----------------------
@@ -35,14 +55,18 @@
  *      "test:e2e:web:render-baseline": "node apps/web/e2e/render-commit-baseline.e2e.js"
  * 2. Run `yarn test:e2e:web:render-baseline` there exactly as here.
  * 3. Diff the two JSON artifacts written to .tmp/render-baseline/
- *    (<git-short-sha>-<branch>.json) phase by phase.
+ *    (<git-short-sha>-<branch>-v2.json) phase by phase.
  *
  * Comparability caveats
  * ---------------------
  * Numbers are comparable only between runs on the SAME machine, with the SAME
  * headless setting (WEB_E2E_HEADLESS) and under similar machine load. Commit
- * counts are stable per branch; long-task counts and wall ms are noisier and
- * should be read as a secondary signal.
+ * and rendered-component counts are stable per branch; actualDuration and wall
+ * ms are noisier and should be read as a secondary signal. The fiber walk in
+ * onCommitFiberRoot costs the same on both branches (symmetric overhead), but
+ * it runs on the main thread inside commit processing, so it inflates the
+ * long-task counter; long tasks are still recorded but should not be compared
+ * against v1 runs or treated as a primary signal.
  */
 
 const assert = require('node:assert/strict');
@@ -60,6 +84,8 @@ const artifactDir =
   process.env.RENDER_BASELINE_ARTIFACT_DIR ||
   path.join(repoRoot, '.tmp', 'render-baseline');
 
+const METRICS_VERSION = 2;
+
 const RENDERER_TIMEOUT_MS =
   Number(process.env.WEB_E2E_RENDERER_TIMEOUT_MS) || 180_000;
 const PAGE_TIMEOUT_MS = Number(process.env.WEB_E2E_PAGE_TIMEOUT_MS) || 120_000;
@@ -71,12 +97,22 @@ const QUIESCENCE_TIMEOUT_MS =
   Number(process.env.RENDER_BASELINE_QUIESCENCE_TIMEOUT_MS) || 30_000;
 // Fixed settle between phases, before the quiescence wait takes over.
 const PHASE_SETTLE_MS = Number(process.env.RENDER_BASELINE_SETTLE_MS) || 1000;
+// background-churn: emits per run and the fixed post-emit window that lets the
+// throttled reload (150ms trailing on both branches) fire before the
+// quiescence wait takes over. Combined with the settle + quiescence between
+// iterations, consecutive emits are spaced well beyond the reload throttle,
+// so every emit triggers its own full reload cycle.
+const CHURN_EMITS = Number(process.env.RENDER_BASELINE_CHURN_EMITS) || 10;
+const CHURN_POST_EMIT_WAIT_MS = 500;
 
-// Public BIP39 test vector (Trezor/BIP39 reference data) - NOT a secret and
-// never holds funds. Using a fixed mnemonic keeps account names, addresses and
-// list contents identical across branches so render costs are comparable.
-const PUBLIC_TEST_MNEMONIC =
-  'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+// Public BIP39 test vectors (Trezor/BIP39 reference data) - NOT secrets and
+// never holding funds. Fixed mnemonics keep account names, addresses and list
+// contents identical across branches so render costs are comparable.
+const PUBLIC_TEST_MNEMONICS = [
+  'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+  'legal winner thank year wave sausage worth useful legal winner thank yellow',
+  'letter advice cage absurd amount doctor acoustic avoid letter advice cage above',
+];
 
 // Every value below is verified to exist on origin/x AND current branches.
 const WALLET_MODE_STORAGE_KEY = '$onekey_web_dapp_mode';
@@ -347,8 +383,116 @@ async function launchBrowser() {
 // break the app. react-refresh (dev builds) wraps hook.inject and
 // hook.onCommitFiberRoot but chains to the originals, so counting survives it;
 // it also iterates hook.renderers, hence the real Map.
+//
+// Because the hook exists before react-dom evaluates, React's dev build also
+// creates roots in ProfileMode (createHostRootFiber ORs ProfileMode in when
+// isDevToolsPresent), which populates fiber.actualDuration; identical on both
+// branches, so the profiling overhead is symmetric too.
 function installRenderBaselineHook() {
-  const state = { commits: 0, longTasks: 0 };
+  const state = {
+    actualDurationMs: 0,
+    // Append-only per-commit logs so the driver can compute per-commit and
+    // per-slice stats. A run produces a few thousand commits; the cap only
+    // guards against a pathological run growing without bound.
+    commitDurationsMs: [],
+    commitRenderedCounts: [],
+    commits: 0,
+    commitsMissingDuration: 0,
+    longTasks: 0,
+    renderedComponents: 0,
+    walkErrors: 0,
+    walkOverflows: 0,
+  };
+  const MAX_COMMIT_LOG = 100_000;
+  const WALK_NODE_BUDGET = 200_000;
+
+  // Counts composite components that rendered in THIS commit, the way React
+  // DevTools does: a visited composite fiber rendered iff its PerformedWork
+  // flag (0b1; fiber.effectTag on React <17) is set (didFiberRender), and -
+  // critically - the walk descends only where `next.child !== prev.child`
+  // relative to the fiber's alternate (updateFiberRecursively's gate).
+  // Subtrees reused without cloning keep stale PerformedWork bits from older
+  // commits; the alternate diff stops exactly at the never-worked clones above
+  // them, so stale bits are never visited. Fibers without an alternate are
+  // newly mounted this commit: every composite in such a subtree is counted,
+  // matching DevTools' mount semantics. Only composite component fibers count -
+  // FunctionComponent(0), ClassComponent(1), ForwardRef(11), MemoComponent(14)
+  // and SimpleMemoComponent(15) - host/host-root fibers are excluded. The walk
+  // is iterative (explicit stack, no recursion) and capped so a pathological
+  // tree cannot hang the page; its cost is identical on both branches
+  // (symmetric overhead), but it does pollute the long-task counter.
+  function countRenderedComposites(rootFiber) {
+    const PERFORMED_WORK = 0b1;
+    const isCountedTag = (tag) =>
+      tag === 0 || tag === 1 || tag === 11 || tag === 14 || tag === 15;
+    const didRender = (fiber) => {
+      const flags = fiber.flags === undefined ? fiber.effectTag : fiber.flags;
+      return (flags & PERFORMED_WORK) !== 0;
+    };
+    let rendered = 0;
+    let visited = 0;
+    // Stack entries: [nextFiber, prevFiber] pairs for updated subtrees, or
+    // [nextFiber, null] inside newly mounted subtrees.
+    const stack = [[rootFiber, rootFiber.alternate || null]];
+    while (stack.length) {
+      visited += 1;
+      if (visited > WALK_NODE_BUDGET) {
+        state.walkOverflows += 1;
+        break;
+      }
+      const [next, prev] = stack.pop();
+      if (!prev) {
+        if (isCountedTag(next.tag)) {
+          rendered += 1;
+        }
+        for (let child = next.child; child; child = child.sibling) {
+          stack.push([child, null]);
+        }
+      } else {
+        if (isCountedTag(next.tag) && didRender(next)) {
+          rendered += 1;
+        }
+        if (next.child !== prev.child) {
+          for (let child = next.child; child; child = child.sibling) {
+            stack.push([child, child.alternate || null]);
+          }
+        }
+      }
+    }
+    return rendered;
+  }
+
+  function recordCommit(root) {
+    state.commits += 1;
+    try {
+      const rootFiber = root && root.current;
+      if (!rootFiber) {
+        return;
+      }
+      const rendered = countRenderedComposites(rootFiber);
+      state.renderedComponents += rendered;
+      if (state.commitRenderedCounts.length < MAX_COMMIT_LOG) {
+        state.commitRenderedCounts.push(rendered);
+      }
+      // In ProfileMode the finished HostRoot fiber's actualDuration is the
+      // render time of this commit: createWorkInProgress resets it to 0 and
+      // completeWork bubbles rendered children's durations up the spine.
+      const duration = rootFiber.actualDuration;
+      const hasDuration =
+        typeof duration === 'number' && Number.isFinite(duration);
+      if (hasDuration) {
+        state.actualDurationMs += duration;
+      } else {
+        state.commitsMissingDuration += 1;
+      }
+      if (state.commitDurationsMs.length < MAX_COMMIT_LOG) {
+        state.commitDurationsMs.push(hasDuration ? duration : -1);
+      }
+    } catch {
+      state.walkErrors += 1;
+    }
+  }
+
   let nextRendererId = 1;
   const hook = {
     checkDCE() {},
@@ -362,8 +506,8 @@ function installRenderBaselineHook() {
     isDisabled: false,
     off() {},
     on() {},
-    onCommitFiberRoot() {
-      state.commits += 1;
+    onCommitFiberRoot(_id, root) {
+      recordCommit(root);
     },
     onCommitFiberUnmount() {},
     onPostCommitFiberRoot() {},
@@ -383,7 +527,7 @@ function installRenderBaselineHook() {
     const existing = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
     const original = existing.onCommitFiberRoot;
     existing.onCommitFiberRoot = function onCommitFiberRoot(...args) {
-      state.commits += 1;
+      recordCommit(args[1]);
       return typeof original === 'function'
         ? original.apply(this, args)
         : undefined;
@@ -397,8 +541,20 @@ function installRenderBaselineHook() {
     // long-task observer unsupported: counts stay 0
   }
   globalThis.__renderBaseline = {
+    get actualDurationMs() {
+      return state.actualDurationMs;
+    },
+    get commitDurationsMs() {
+      return state.commitDurationsMs;
+    },
+    get commitRenderedCounts() {
+      return state.commitRenderedCounts;
+    },
     get commits() {
       return state.commits;
+    },
+    get commitsMissingDuration() {
+      return state.commitsMissingDuration;
     },
     get longTasks() {
       return state.longTasks;
@@ -408,18 +564,42 @@ function installRenderBaselineHook() {
         commits: state.commits,
         longTasks: state.longTasks,
         name: String(name),
+        renderedComponents: state.renderedComponents,
         tMs: Math.round(globalThis.performance.now()),
       });
     },
     marks: [],
+    get renderedComponents() {
+      return state.renderedComponents;
+    },
+    get walkErrors() {
+      return state.walkErrors;
+    },
+    get walkOverflows() {
+      return state.walkOverflows;
+    },
   };
 }
 
 async function readCounters(page) {
   return page.evaluate(() => ({
+    actualDurationMs: globalThis.__renderBaseline.actualDurationMs,
+    commitLogLength: globalThis.__renderBaseline.commitRenderedCounts.length,
     commits: globalThis.__renderBaseline.commits,
+    commitsMissingDuration: globalThis.__renderBaseline.commitsMissingDuration,
     longTasks: globalThis.__renderBaseline.longTasks,
+    renderedComponents: globalThis.__renderBaseline.renderedComponents,
+    walkErrors: globalThis.__renderBaseline.walkErrors,
+    walkOverflows: globalThis.__renderBaseline.walkOverflows,
   }));
+}
+
+async function readCommitRenderedSlice(page, fromIndex, toIndex) {
+  return page.evaluate(
+    ({ from, to }) =>
+      globalThis.__renderBaseline.commitRenderedCounts.slice(from, to),
+    { from: fromIndex, to: toIndex },
+  );
 }
 
 async function waitForCommitQuiescence(
@@ -536,13 +716,17 @@ async function waitForPersistedSelection(page, expected) {
 }
 
 // ---------------------------------------------------------------------------
-// Fixture: 1 HD wallet, 2 indexed accounts, accounts on evm--1 and btc--0.
-// Everything runs through background APIs that exist on origin/x.
+// Fixture: 3 HD wallets x 2 indexed accounts, chain accounts on evm--1 and
+// btc--0 with the default (first) derive type = 12 chain accounts total.
+// Everything runs through background APIs that exist on origin/x. The app
+// auto-selects the newest wallet's first account, so the LAST created wallet
+// is the primary wallet the measured flows operate on; the other two keep the
+// selector lists and their consumers populated.
 // ---------------------------------------------------------------------------
 
 async function createFixture(page, devOnlyPassword) {
   return page.evaluate(
-    async ({ mnemonic, networkIds, password }) => {
+    async ({ mnemonics, networkIds, password }) => {
       const api = globalThis.$$appGlobals.$backgroundApiProxy;
       const e2eParams = { $$devOnlyPassword: password };
       await api.serviceE2E.clearWalletsAndAccounts(e2eParams);
@@ -553,16 +737,6 @@ async function createFixture(page, devOnlyPassword) {
         text: rawPassword,
       });
       await api.servicePassword.setPassword(encodedPassword, 'password');
-
-      const encodedMnemonic = await api.servicePassword.encodeSensitiveText({
-        text: mnemonic,
-      });
-      const created = await api.serviceAccount.createHDWallet({
-        isWalletBackedUp: true,
-        mnemonic: encodedMnemonic,
-        name: 'Render Baseline',
-      });
-      const walletId = created.wallet.id;
 
       const waitForIndexedAccount = async (indexedAccountId) => {
         for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -577,32 +751,49 @@ async function createFixture(page, devOnlyPassword) {
         throw new Error(`Indexed account ${indexedAccountId} not readable`);
       };
 
-      await waitForIndexedAccount(created.indexedAccount.id);
-      const second = await api.serviceAccount.addHDNextIndexedAccount({
-        walletId,
-      });
-      const indexedAccountIds = [
-        created.indexedAccount.id,
-        second.indexedAccountId,
-      ];
-      const accountNames = [];
-      for (const indexedAccountId of indexedAccountIds) {
-        const indexedAccount = await waitForIndexedAccount(indexedAccountId);
-        accountNames.push(indexedAccount.name);
-        for (const networkId of networkIds) {
-          const deriveItems =
-            await api.serviceNetwork.getDeriveInfoItemsOfNetwork({
-              networkId,
-            });
-          for (const deriveItem of deriveItems) {
+      const wallets = [];
+      for (const [walletIndex, mnemonic] of mnemonics.entries()) {
+        const encodedMnemonic = await api.servicePassword.encodeSensitiveText({
+          text: mnemonic,
+        });
+        const created = await api.serviceAccount.createHDWallet({
+          isWalletBackedUp: true,
+          mnemonic: encodedMnemonic,
+          name: `Render Baseline ${walletIndex + 1}`,
+        });
+        const walletId = created.wallet.id;
+
+        await waitForIndexedAccount(created.indexedAccount.id);
+        const second = await api.serviceAccount.addHDNextIndexedAccount({
+          walletId,
+        });
+        const indexedAccountIds = [
+          created.indexedAccount.id,
+          second.indexedAccountId,
+        ];
+        const accountNames = [];
+        for (const indexedAccountId of indexedAccountIds) {
+          const indexedAccount = await waitForIndexedAccount(indexedAccountId);
+          accountNames.push(indexedAccount.name);
+          for (const networkId of networkIds) {
+            const deriveItems =
+              await api.serviceNetwork.getDeriveInfoItemsOfNetwork({
+                networkId,
+              });
+            if (!deriveItems.length) {
+              throw new Error(`Network ${networkId} has no derive items`);
+            }
+            // Default derive type only: 3 wallets x 2 accounts x 2 networks
+            // = 12 chain accounts.
             await api.serviceAccount.addHDOrHWAccounts({
-              deriveType: deriveItem.value,
+              deriveType: deriveItems[0].value,
               indexedAccountId,
               networkId,
               walletId,
             });
           }
         }
+        wallets.push({ accountNames, indexedAccountIds, walletId });
       }
 
       const networkNames = {};
@@ -615,15 +806,13 @@ async function createFixture(page, devOnlyPassword) {
       }
 
       return {
-        accountNames,
-        indexedAccountIds,
         networkNames,
         rawPassword,
-        walletId,
+        wallets,
       };
     },
     {
-      mnemonic: PUBLIC_TEST_MNEMONIC,
+      mnemonics: PUBLIC_TEST_MNEMONICS,
       networkIds: NETWORK_IDS,
       password: devOnlyPassword,
     },
@@ -736,15 +925,15 @@ async function closeAccountSelector(page) {
   await waitForHiddenTestID(page, TEST_IDS.walletList);
 }
 
-async function flowAccountSwitch(page, fixture, iteration) {
+async function flowAccountSwitch(page, primaryWallet, iteration) {
   const targetIndex = iteration % 2 === 0 ? 1 : 0;
-  const targetName = fixture.accountNames[targetIndex];
+  const targetName = primaryWallet.accountNames[targetIndex];
   await openAccountSelector(page);
-  await clickTestID(page, TEST_IDS.walletItem(fixture.walletId));
+  await clickTestID(page, TEST_IDS.walletItem(primaryWallet.walletId));
   await clickTestID(page, TEST_IDS.accountItem(targetIndex));
   await waitForHiddenTestID(page, TEST_IDS.walletList);
   await waitForPersistedSelection(page, {
-    indexedAccountId: fixture.indexedAccountIds[targetIndex],
+    indexedAccountId: primaryWallet.indexedAccountIds[targetIndex],
   });
   // The desktop-web header renders the trigger in horizontal layout, and on
   // origin/x that layout's account label carries no "account-name" testID
@@ -829,6 +1018,28 @@ async function flowTabSwitch(page) {
     .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
 }
 
+// The decisive phase for reload dedup: emit AccountUpdate on the app event bus
+// from page context with NOTHING actually changed in the data. On both
+// branches AccountSelectorEffects listens for AccountUpdate and schedules
+// reloadActiveAccountInfo behind a 150ms trailing throttle (origin/x
+// AccountSelectorEffects.tsx:224 / branch:1032), so a single emit per
+// quiescent window triggers exactly one full reload cycle. What each cycle
+// then costs is the measurement - the branch is expected to gate deep-equal
+// rebuilds into a no-op write, but nothing here forces that outcome. The
+// $appEventBus global is assigned unconditionally in
+// packages/shared/src/eventBus/appEventBus.ts on both branches, and
+// $$appGlobals is exposed in dev builds (which this harness always runs).
+async function flowBackgroundChurn(page) {
+  await page.evaluate(() => {
+    globalThis.$$appGlobals.$appEventBus.emit('AccountUpdate', undefined);
+  });
+  // Give the trailing throttle a fixed window to fire and start the reload
+  // before the commit-quiescence wait takes over. Together with the settle +
+  // quiescence between iterations, consecutive emits are spaced far beyond
+  // the 150ms reload throttle.
+  await page.waitForTimeout(CHURN_POST_EMIT_WAIT_MS);
+}
+
 // ---------------------------------------------------------------------------
 // Measurement driver
 // ---------------------------------------------------------------------------
@@ -845,12 +1056,25 @@ function summarize(values) {
   };
 }
 
-async function measurePhase(page, phaseName, runIteration) {
-  log(`phase ${phaseName}: ${ITERATIONS} iterations`);
+function roundMs(value) {
+  return Math.round(value * 100) / 100;
+}
+
+async function measurePhase(
+  page,
+  phaseName,
+  runIteration,
+  { iterations = ITERATIONS } = {},
+) {
+  log(`phase ${phaseName}: ${iterations} iterations`);
   const commitDeltas = [];
+  const renderedComponentDeltas = [];
+  const maxRenderedInCommitPerIteration = [];
+  const actualDurationMsDeltas = [];
   const longTaskDeltas = [];
   const wallMs = [];
-  for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
+  let missingDurationCommits = 0;
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
     await page.waitForTimeout(PHASE_SETTLE_MS);
     await waitForCommitQuiescence(page);
     const before = await readCounters(page);
@@ -859,20 +1083,55 @@ async function measurePhase(page, phaseName, runIteration) {
     await waitForCommitQuiescence(page);
     const after = await readCounters(page);
     commitDeltas.push(after.commits - before.commits);
+    renderedComponentDeltas.push(
+      after.renderedComponents - before.renderedComponents,
+    );
+    const commitSlice = await readCommitRenderedSlice(
+      page,
+      before.commitLogLength,
+      after.commitLogLength,
+    );
+    maxRenderedInCommitPerIteration.push(
+      commitSlice.length ? Math.max(...commitSlice) : 0,
+    );
+    actualDurationMsDeltas.push(
+      roundMs(after.actualDurationMs - before.actualDurationMs),
+    );
+    missingDurationCommits +=
+      after.commitsMissingDuration - before.commitsMissingDuration;
     longTaskDeltas.push(after.longTasks - before.longTasks);
     wallMs.push(Date.now() - startedAt);
   }
+  // actualDuration is best-effort: if any commit in this phase lacked it,
+  // report the phase's duration metric as unavailable instead of a partial sum.
+  const actualDurationAvailable = missingDurationCommits === 0;
   const result = {
+    actualDurationAvailable,
+    actualDurationMs: actualDurationAvailable
+      ? summarize(actualDurationMsDeltas)
+      : 'unavailable',
+    actualDurationMsDeltas: actualDurationAvailable
+      ? actualDurationMsDeltas
+      : 'unavailable',
     commitDeltas,
     commits: summarize(commitDeltas),
-    iterations: ITERATIONS,
+    iterations,
     longTaskDeltas,
     longTasks: summarize(longTaskDeltas),
+    maxRenderedInCommit: summarize(maxRenderedInCommitPerIteration),
+    maxRenderedInCommitPerIteration,
     phase: phaseName,
+    renderedComponentDeltas,
+    renderedComponents: summarize(renderedComponentDeltas),
     wallMs: summarize(wallMs),
   };
   log(
-    `phase ${phaseName}: commits/iter min=${result.commits.min} median=${result.commits.median} max=${result.commits.max}`,
+    `phase ${phaseName}: commits/iter median=${result.commits.median} ` +
+      `rendered/iter median=${result.renderedComponents.median} ` +
+      `maxRendered/commit median=${result.maxRenderedInCommit.median} ` +
+      `actualDuration/iter median=${
+        actualDurationAvailable ? result.actualDurationMs.median : 'unavailable'
+      }`,
   );
   return result;
 }
@@ -906,9 +1165,13 @@ async function main() {
     });
     await waitForAppReady(page);
 
-    log('create HD wallet fixture (public BIP39 test mnemonic)');
+    log('create HD wallet fixture (public BIP39 test mnemonics)');
     const fixture = await createFixture(page, devOnlyPassword);
-    assert.equal(fixture.accountNames.length, 2);
+    assert.equal(fixture.wallets.length, PUBLIC_TEST_MNEMONICS.length);
+    // createHDWallet auto-selects each new wallet's first account, so the last
+    // created wallet is the active one; the measured flows stay on it.
+    const primaryWallet = fixture.wallets[fixture.wallets.length - 1];
+    assert.equal(primaryWallet.accountNames.length, 2);
 
     // Reload so the measured document starts from a clean boot; all measured
     // phases run inside this single document.
@@ -919,7 +1182,7 @@ async function main() {
     await waitForAppReady(page);
     await waitForHomeShell(page);
     await restoreWalletPasswordCache(page, fixture);
-    await waitForPersistedSelection(page, { walletId: fixture.walletId });
+    await waitForPersistedSelection(page, { walletId: primaryWallet.walletId });
     await waitForCommitQuiescence(page);
     log(`pin home selection to ${NETWORK_IDS[0]}`);
     await pinHomeToSingleNetwork(page, fixture, NETWORK_IDS[0]);
@@ -936,12 +1199,16 @@ async function main() {
     await waitForCommitQuiescence(page);
     const bootCounters = await readCounters(page);
     log(
-      `boot: ${bootCounters.commits} commits, ${bootCounters.longTasks} long tasks`,
+      `boot: ${bootCounters.commits} commits, ` +
+        `${bootCounters.renderedComponents} rendered components, ` +
+        `${roundMs(bootCounters.actualDurationMs)}ms actualDuration ` +
+        `(${bootCounters.commitsMissingDuration} commits without duration), ` +
+        `${bootCounters.longTasks} long tasks`,
     );
 
     phases.push(
       await measurePhase(page, 'account-switch', (iteration) =>
-        flowAccountSwitch(page, fixture, iteration),
+        flowAccountSwitch(page, primaryWallet, iteration),
       ),
     );
     phases.push(
@@ -962,10 +1229,27 @@ async function main() {
       notes.push('tab-switch skipped: Trade sidebar tab not present');
       log('phase tab-switch: skipped (Trade sidebar tab not present)');
     }
+    // Home settles on whatever account the last account-switch iteration
+    // left selected - deterministic and identical across branches.
+    phases.push(
+      await measurePhase(
+        page,
+        'background-churn',
+        () => flowBackgroundChurn(page),
+        { iterations: CHURN_EMITS },
+      ),
+    );
 
     const finalCounters = await readCounters(page);
     const artifact = {
-      boot: bootCounters,
+      boot: {
+        actualDurationMs: roundMs(bootCounters.actualDurationMs),
+        commits: bootCounters.commits,
+        commitsMissingDuration: bootCounters.commitsMissingDuration,
+        longTasks: bootCounters.longTasks,
+        renderedComponents: bootCounters.renderedComponents,
+      },
+      churnEmits: CHURN_EMITS,
       environment: {
         arch: os.arch(),
         headless: shouldRunHeadless(),
@@ -974,17 +1258,23 @@ async function main() {
       },
       git,
       iterations: ITERATIONS,
+      metricsVersion: METRICS_VERSION,
       notes,
       phases,
       quietMs: QUIET_MS,
       timestamp: new Date().toISOString(),
+      totalActualDurationMs: roundMs(finalCounters.actualDurationMs),
       totalCommits: finalCounters.commits,
+      totalCommitsMissingDuration: finalCounters.commitsMissingDuration,
       totalLongTasks: finalCounters.longTasks,
+      totalRenderedComponents: finalCounters.renderedComponents,
+      walkErrors: finalCounters.walkErrors,
+      walkOverflows: finalCounters.walkOverflows,
     };
     const sanitizedBranch = git.branch.replace(/[^a-zA-Z0-9._-]+/g, '_');
     const artifactPath = path.join(
       artifactDir,
-      `${git.sha}-${sanitizedBranch}.json`,
+      `${git.sha}-${sanitizedBranch}-v${METRICS_VERSION}.json`,
     );
     fs.writeFileSync(artifactPath, `${JSON.stringify(artifact, null, 2)}\n`);
     log(`artifact: ${artifactPath}`);
@@ -992,18 +1282,41 @@ async function main() {
     console.table(
       phases.map((phase) => ({
         phase: phase.phase,
-        'commits min': phase.commits.min,
         'commits med': phase.commits.median,
-        'commits max': phase.commits.max,
-        'longtasks med': phase.longTasks.median,
+        'rendered med': phase.renderedComponents.median,
+        'rendered max': phase.renderedComponents.max,
+        'max/commit med': phase.maxRenderedInCommit.median,
+        'duration med':
+          phase.actualDurationAvailable === true
+            ? phase.actualDurationMs.median
+            : 'n/a',
         'wall ms med': phase.wallMs.median,
       })),
     );
 
-    for (const phase of phases) {
+    assert.equal(
+      finalCounters.walkErrors,
+      0,
+      'fiber walk threw: rendered-component counts are unreliable',
+    );
+    assert.equal(
+      finalCounters.walkOverflows,
+      0,
+      'fiber walk hit its node budget: rendered-component counts undercount',
+    );
+    // Zero commits per background-churn emit is a legitimate (ideal) churn
+    // result, not a broken hook; the interactive phases already prove the hook.
+    const hookProvingPhases = phases.filter(
+      (phase) => phase.phase !== 'background-churn',
+    );
+    for (const phase of hookProvingPhases) {
       assert.ok(
         phase.commits.max > 0,
         `phase ${phase.phase} observed zero commits: measurement hook broken`,
+      );
+      assert.ok(
+        phase.renderedComponents.max > 0,
+        `phase ${phase.phase} observed zero rendered components: fiber walk broken`,
       );
     }
   } catch (error) {
