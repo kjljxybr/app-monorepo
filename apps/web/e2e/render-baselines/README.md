@@ -84,12 +84,92 @@ guards in `apps/web/e2e/account-selector.e2e.js`), which this whole-app commit
 counter does not resolve; this baseline's job is to catch coarse cross-branch
 regressions in interaction cost, and it shows none in either direction.
 
-## Reproducing a future x baseline (agent-ready recipe)
+## Comparing against x: one command
 
-Both recorded pairs were produced with disposable shallow clones. Never run a
-measurement inside a development worktree that has uncommitted changes: the
-dev server compiles whatever is on disk, so the numbers stop describing any
-commit, and the run competes with in-progress work.
+The whole cross-branch A/B protocol (previously the manual recipe in the
+appendix below) is codified in a driver,
+`apps/web/e2e/render-baseline-compare.e2e.js`. From the repo root:
+
+```
+yarn test:e2e:web:render-baseline:compare
+```
+
+What the driver does, in order:
+
+1. Resolves the two targets: the PINNED x commit
+   `a830dee4bbcee70217c127ec369432cd15c4b14e` (the recorded v2 baseline, a
+   constant in the driver) as baseline, and the current repo's committed HEAD
+   as candidate. A dirty worktree only triggers a prominent warning:
+   uncommitted changes are excluded by design, because the numbers must
+   describe a commit.
+2. Refuses to start while another render measurement or account-selector e2e
+   is running (`pgrep`), and prints the idle-machine requirement.
+3. Prepares two disposable shallow clones under `.tmp/render-baseline-clones/`
+   in this repo (gitignored), cloning from the LOCAL repository over
+   `file://` - no network. The candidate side is a plain `--depth 1 -b
+   <branch>` clone (detached HEAD is handled by fetching `HEAD` directly).
+   The x side never trusts the often-stale local `x` branch: it is built with
+   `git init` plus a depth-1 fetch of `refs/remotes/origin/x`, deepened
+   progressively (`--deepen 50` -> `--deepen 500` -> `--unshallow`) until the
+   pinned sha is present, then checked out detached at the pinned sha - the
+   robust path for a pinned commit behind a moving origin/x. If the sha is
+   unreachable, it fails telling you to `git fetch origin x` first.
+4. Runs `yarn install` in each clone as needed (~2 minutes each with a warm
+   cache).
+5. Copies the harness from the CANDIDATE CLONE (the committed version) into
+   the x clone byte-identical and injects the one-line
+   `test:e2e:web:render-baseline` script into the x clone's `package.json`.
+   Nothing ever requires x's `local-secret-envelope.e2e.js`.
+6. Runs both measurements back-to-back (x first, then candidate) with
+   `WEB_E2E_HEADLESS=true`, streaming logs with `[x]` / `[candidate]`
+   prefixes.
+7. Prints per-phase comparison tables (rendered components, commits, max
+   rendered per commit, actualDuration; medians plus % change, with
+   background-churn highlighted as the decisive phase) and writes to
+   `.tmp/render-baseline/` in the main repo:
+   `compare-<xsha7>-vs-<candsha7>-<runid>.json` (machine-readable summary)
+   plus copies of both raw artifacts next to it
+   (`...-x-raw.json` / `...-candidate-raw.json`).
+8. Exits non-zero if either run fails, keeping clones and logs (their paths
+   are printed) for diagnosis. Per-step logs live under
+   `.tmp/render-baseline/runs/`.
+
+Expect roughly 40-50 minutes for a cold run (two clones, two installs, two
+measured runs). Reruns reuse cached clones and skip clone+install.
+
+Env knobs:
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `RENDER_BASELINE_X_COMMIT` | pinned constant | Baseline commit. Full 40-char shas are used as-is; anything else is resolved in the local repo (prefer `origin/x` after a fetch - a bare `x` resolves the often-stale local branch). |
+| `RENDER_BASELINE_FRESH` | unset | `1` ignores cached clones and rebuilds them from scratch. |
+| `RENDER_BASELINE_CLEANUP` | unset | `1` deletes the clone cache after a successful run. |
+| `RENDER_BASELINE_CLONES_DIR` | `.tmp/render-baseline-clones` | Where the clones live (put them on another disk if needed). |
+| `RENDER_BASELINE_ITERATIONS`, other `RENDER_BASELINE_*`, `WEB_E2E_*` | harness defaults | Passed through unchanged to BOTH measured runs. |
+
+Clone cache: after a successful run the two clones for the current sha pair
+are kept for reuse (a rerun on the same shas skips clone+install, saving
+about 4 minutes per clone) and clones for any other shas are pruned. Each
+clone costs about 8GB of disk; purge with
+`rm -rf .tmp/render-baseline-clones` or `RENDER_BASELINE_CLEANUP=1`.
+
+Pinned-commit policy: the x side is pinned so that every future run compares
+against the same baseline the recorded pair describes, even as origin/x moves
+on. When the team decides to re-pin (for example after x changes make the old
+baseline uninformative), do BOTH in one change: update
+`DEFAULT_PINNED_X_COMMIT` in `render-baseline-compare.e2e.js` AND record a
+new artifact pair in this directory (copy the raw artifacts in with sha-keyed
+names, extend the Files table with FULL shas, refresh the comparison tables).
+The driver prints the copy instructions but never records a baseline
+automatically.
+
+## Appendix: manual recipe (kept for debugging the driver)
+
+Both recorded pairs were produced with this manual protocol before it was
+codified into the driver above. Never run a measurement inside a development
+worktree that has uncommitted changes: the dev server compiles whatever is on
+disk, so the numbers stop describing any commit, and the run competes with
+in-progress work.
 
 1. Resolve the x commit to measure. CAUTION: the local `x` branch is often
    stale (it pointed at `2b82b23c5e` while origin/x was `a830dee4bb` when the
