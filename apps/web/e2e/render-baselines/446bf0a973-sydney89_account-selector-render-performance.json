@@ -1,0 +1,156 @@
+{
+  "boot": {
+    "commits": 368,
+    "longTasks": 16
+  },
+  "environment": {
+    "arch": "arm64",
+    "headless": true,
+    "nodeVersion": "v25.2.1",
+    "platform": "darwin"
+  },
+  "git": {
+    "branch": "sydney89/account-selector-render-performance",
+    "sha": "446bf0a973"
+  },
+  "iterations": 5,
+  "notes": [],
+  "phases": [
+    {
+      "commitDeltas": [
+        97,
+        82,
+        76,
+        80,
+        76
+      ],
+      "commits": {
+        "max": 97,
+        "median": 80,
+        "min": 76
+      },
+      "iterations": 5,
+      "longTaskDeltas": [
+        3,
+        3,
+        3,
+        3,
+        3
+      ],
+      "longTasks": {
+        "max": 3,
+        "median": 3,
+        "min": 3
+      },
+      "phase": "account-switch",
+      "wallMs": {
+        "max": 3190,
+        "median": 2904,
+        "min": 2689
+      }
+    },
+    {
+      "commitDeltas": [
+        87,
+        64,
+        66,
+        58,
+        61
+      ],
+      "commits": {
+        "max": 87,
+        "median": 64,
+        "min": 58
+      },
+      "iterations": 5,
+      "longTaskDeltas": [
+        4,
+        4,
+        4,
+        5,
+        4
+      ],
+      "longTasks": {
+        "max": 5,
+        "median": 4,
+        "min": 4
+      },
+      "phase": "network-switch",
+      "wallMs": {
+        "max": 4134,
+        "median": 2958,
+        "min": 2722
+      }
+    },
+    {
+      "commitDeltas": [
+        41,
+        43,
+        45,
+        45,
+        49
+      ],
+      "commits": {
+        "max": 49,
+        "median": 45,
+        "min": 41
+      },
+      "iterations": 5,
+      "longTaskDeltas": [
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "longTasks": {
+        "max": 2,
+        "median": 2,
+        "min": 2
+      },
+      "phase": "selector-open-close",
+      "wallMs": {
+        "max": 4243,
+        "median": 2492,
+        "min": 2328
+      }
+    },
+    {
+      "commitDeltas": [
+        65,
+        20,
+        19,
+        21,
+        23
+      ],
+      "commits": {
+        "max": 65,
+        "median": 21,
+        "min": 19
+      },
+      "iterations": 5,
+      "longTaskDeltas": [
+        5,
+        2,
+        2,
+        2,
+        2
+      ],
+      "longTasks": {
+        "max": 5,
+        "median": 2,
+        "min": 2
+      },
+      "phase": "tab-switch",
+      "wallMs": {
+        "max": 4063,
+        "median": 2448,
+        "min": 2421
+      }
+    }
+  ],
+  "quietMs": 800,
+  "timestamp": "2026-08-20T14:49:07.230Z",
+  "totalCommits": 1529,
+  "totalLongTasks": 75
+}
