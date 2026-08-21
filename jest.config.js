@@ -127,6 +127,11 @@ module.exports = async () => {
     ],
     modulePathIgnorePatterns: [
       '<rootDir>/.claude/worktrees/',
+      // Disposable repo clones created by the render-baseline e2e harness
+      // (apps/web/e2e/render-baseline-compare.e2e.js). Each clone carries a
+      // full packages/ tree, which collides with the real one in the Haste
+      // module map and breaks every react-native-preset suite.
+      '<rootDir>/.tmp/',
       '<rootDir>/.worktree/',
       '<rootDir>/.worktrees/',
       '<rootDir>/ignore/',
@@ -138,6 +143,7 @@ module.exports = async () => {
       '\\.integration\\.test\\.ts$',
       '-smoke\\.test\\.ts$',
       '<rootDir>/\\.claude/worktrees/',
+      '<rootDir>/\\.tmp/',
       '<rootDir>/\\.worktree/',
       '<rootDir>/\\.worktrees/',
       '<rootDir>/ignore/',
