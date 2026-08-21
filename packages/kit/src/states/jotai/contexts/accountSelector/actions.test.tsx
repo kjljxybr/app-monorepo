@@ -3260,6 +3260,243 @@ describe('useAccountSelectorActions', () => {
     expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(1000);
   });
 
+  it('lets the Effects-path sync land after a listener apply that forwards the event revision', async () => {
+    // One home account switch fans out to two appliers on the swap store: the
+    // swap page listener (syncSwapSelectedAccountFromHome in useSwapGlobal)
+    // and the AccountSelectorEffects path (syncHomeAndSwapSelectedAccount,
+    // the only one that runs fixOthersWalletAccountNetworkPair). The listener
+    // used to mint Date.now() as its commit revision, which outranked the
+    // event's real revision and dropped the Effects-path delivery as
+    // skip-older-event; forwarding the event revision makes the second
+    // delivery tie and converge as a noop instead. Restoring a Date.now()
+    // revision at the swap listener call site makes this test fail.
+    mockShouldSyncHomeAndSwapSelectedAccount.mockResolvedValue(true);
+
+    const { store, Wrapper } = createWrapper(EAccountSelectorSceneName.swap);
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--0'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: {
+        eventEmitDisabled: false,
+        updatedAt: 1000,
+      },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const homeSelectedAccount = createHdSelectedAccount('hd-1--1');
+    const homeCommitUpdatedAt = 2000;
+
+    // The swap page listener path: apply the event's selection under the
+    // event's own source revision (the fixed call shape of
+    // syncSwapSelectedAccountFromHome).
+    await act(async () => {
+      const listenerResult = await result.current.updateSelectedAccount({
+        eventUpdatedAt: homeCommitUpdatedAt,
+        num: 0,
+        reason: 'syncSwapSelectedAccountFromHome',
+        updateMeta: {
+          eventEmitDisabled: true,
+          updatedAt: homeCommitUpdatedAt,
+        },
+        builder: () => homeSelectedAccount,
+      });
+      expect(listenerResult.outcome).toBe('commit');
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(
+      homeCommitUpdatedAt,
+    );
+
+    // The Effects path delivering the SAME home change afterwards: no longer
+    // older than the listener's commit, so it is not dropped.
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.syncHomeAndSwapSelectedAccount({
+          eventPayload: {
+            selectedAccount: homeSelectedAccount,
+            selectedAccountUpdatedAt: homeCommitUpdatedAt,
+            sceneName: EAccountSelectorSceneName.home,
+            num: 0,
+          },
+          sceneName: EAccountSelectorSceneName.swap,
+          num: 0,
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('noop');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(
+      homeCommitUpdatedAt,
+    );
+  });
+
+  it('skips the equal-value initial home sync against an inflated legacy cached revision', async () => {
+    // Migration seam: builds before the revision fix let the swap listener
+    // (syncSwapSelectedAccountFromHome) mint Date.now() at sync-completion
+    // time as its commit revision - AHEAD of the smaller home commit revision
+    // that produced the very same selection - and persisted that inflated
+    // value into the cold-start cache. After upgrading, the restored swap
+    // slot outranks the initial re-sync of the identical selection, which
+    // must converge as skip-older-event and touch nothing: the data already
+    // matches, so the one skip is harmless. The verdict fires before the
+    // builder runs, so the equal value still reports skip-older-event, not
+    // noop; a change that reorders the guards or rewrites the slot or its
+    // revision here makes this test fail.
+    const inflatedCachedRevision = 5000;
+    const homeRealRevision = 3000;
+
+    const { store, Wrapper } = createWrapper(EAccountSelectorSceneName.swap);
+    // Equivalent of restoring a legacy persisted slot from the cold-start
+    // cache: the selection and its self-minted revision land as atom values.
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--0'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: {
+        eventEmitDisabled: true,
+        updatedAt: inflatedCachedRevision,
+      },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.updateSelectedAccount({
+          eventUpdatedAt: homeRealRevision,
+          num: 0,
+          reason: 'syncSwapSelectedAccountFromHome',
+          updateMeta: {
+            eventEmitDisabled: true,
+            updatedAt: homeRealRevision,
+          },
+          // The same selection the cached slot already holds.
+          builder: () => createHdSelectedAccount('hd-1--0'),
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('skip-older-event');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--0',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(
+      inflatedCachedRevision,
+    );
+  });
+
+  it('lets a later real home change outrank an inflated legacy cached revision', async () => {
+    // The key invariant behind the harmless skip above: a legacy inflated
+    // revision may cost at most that one equal-value skip - it must never
+    // suppress a FUTURE legitimate home change. A switch that happens after
+    // the cached Date.now() carries an even larger revision and must land,
+    // value and revision both. If a commit ever re-minted a receive-time
+    // revision (pushing the committed value permanently ahead of real
+    // events), swap would stay pinned to the stale selection and this fails.
+    const inflatedCachedRevision = 5000;
+
+    const { store, Wrapper } = createWrapper(EAccountSelectorSceneName.swap);
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--0'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: {
+        eventEmitDisabled: true,
+        updatedAt: inflatedCachedRevision,
+      },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const syncFromHome = (indexedAccountId: string, eventUpdatedAt: number) =>
+      result.current.updateSelectedAccount({
+        eventUpdatedAt,
+        num: 0,
+        reason: 'syncSwapSelectedAccountFromHome',
+        updateMeta: {
+          eventEmitDisabled: true,
+          updatedAt: eventUpdatedAt,
+        },
+        builder: () => createHdSelectedAccount(indexedAccountId),
+      });
+
+    await act(async () => {
+      // The one equal-value skip paid for the inflated cache entry.
+      expect((await syncFromHome('hd-1--0', 3000)).outcome).toBe(
+        'skip-older-event',
+      );
+      // A real home switch afterwards: newer than the inflated revision, so
+      // it must not be dropped.
+      expect((await syncFromHome('hd-1--1', 6000)).outcome).toBe('commit');
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(6000);
+  });
+
+  it('commits the snapshot-path sync unconditionally when the home store is unavailable', async () => {
+    // When the home store does not exist in this runtime,
+    // syncSwapSelectedAccountFromLatestHome can only read the simpleDb
+    // snapshot and passes eventUpdatedAt: undefined - the local-caller
+    // contract: apply unconditionally and mint a fresh monotonic revision,
+    // even over an inflated legacy cached revision. Demoting undefined to
+    // the null fill-only semantics (or to any compare-if-newer number below
+    // the cache) would skip this initial sync and leave swap out of step
+    // with home after a cold start into the swap tab - then this test fails.
+    const inflatedCachedRevision = 5000;
+
+    const { store, Wrapper } = createWrapper(EAccountSelectorSceneName.swap);
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--0'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: {
+        eventEmitDisabled: true,
+        updatedAt: inflatedCachedRevision,
+      },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.updateSelectedAccount({
+          eventUpdatedAt: undefined,
+          num: 0,
+          reason: 'syncSwapSelectedAccountFromLatestHome',
+          updateMeta: {
+            eventEmitDisabled: true,
+            // The snapshot carries no revision (`?? undefined` at the call
+            // site), so the commit mints one from the wall clock instead.
+            updatedAt: undefined,
+          },
+          builder: () => createHdSelectedAccount('hd-1--2'),
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('commit');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--2',
+    });
+    // getNextSelectionUpdatedAt: with no requested revision the commit takes
+    // max(Date.now(), committed + 1), always strictly above the old value.
+    expect(
+      store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt,
+    ).toBeGreaterThan(inflatedCachedRevision);
+  });
+
   it('applies a same-scene event from a peer runtime and emits no echo', async () => {
     // Two extension windows on the same scene (popup home vs expanded home)
     // never converged while the same-scene branch skipped unconditionally.
