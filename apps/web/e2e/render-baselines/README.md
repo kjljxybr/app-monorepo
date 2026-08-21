@@ -84,18 +84,84 @@ guards in `apps/web/e2e/account-selector.e2e.js`), which this whole-app commit
 counter does not resolve; this baseline's job is to catch coarse cross-branch
 regressions in interaction cost, and it shows none in either direction.
 
-## Reproducing a future x baseline
+## Reproducing a future x baseline (agent-ready recipe)
 
-1. Copy `apps/web/e2e/render-commit-baseline.e2e.js` (only that file) onto a
-   checkout of origin/x and add the one-line script to the root `package.json`:
+Both recorded pairs were produced with disposable shallow clones. Never run a
+measurement inside a development worktree that has uncommitted changes: the
+dev server compiles whatever is on disk, so the numbers stop describing any
+commit, and the run competes with in-progress work.
+
+1. Resolve the x commit to measure. CAUTION: the local `x` branch is often
+   stale (it pointed at `2b82b23c5e` while origin/x was `a830dee4bb` when the
+   recorded pairs were made). Always take `origin/x`:
+
+   ```
+   git -C <local-main-repo> fetch origin x
+   git -C <local-main-repo> rev-parse origin/x   # record the full sha
+   ```
+
+2. Create two throwaway clones in a temp directory, cloning from the LOCAL
+   repository (`file://`) so no network is needed. A plain `-b x` clone would
+   pick the stale local branch, so fetch the remote-tracking ref explicitly:
+
+   ```
+   mkdir x-clone && cd x-clone && git init
+   git fetch --depth 1 file://<local-main-repo> refs/remotes/origin/x
+   git checkout FETCH_HEAD
+   ```
+
+   For the branch under test a normal shallow clone works:
+
+   ```
+   git clone --depth 1 -b <branch> file://<local-main-repo> branch-clone
+   ```
+
+3. `yarn install` in each clone (about 2 minutes with a warm yarn cache;
+   postinstall/patch steps run normally; no mobile toolchains are needed).
+4. Copy the harness from the branch under test into the x clone so both runs
+   use byte-identical harness code, and add the script line to the x clone's
+   root `package.json`:
+
+   ```
+   cp branch-clone/apps/web/e2e/render-commit-baseline.e2e.js x-clone/apps/web/e2e/
+   ```
+
    `"test:e2e:web:render-baseline": "node apps/web/e2e/render-commit-baseline.e2e.js"`
-2. Run `WEB_E2E_HEADLESS=true yarn test:e2e:web:render-baseline` there, then
-   the same command on the branch under test, back-to-back on the same idle
-   machine with the same headless setting.
-3. Each run writes `.tmp/render-baseline/<git-short-sha>-<branch>-v2.json`;
-   copy both artifacts into this directory and compare phase by phase. Commit
-   and rendered-component counts are the stable signal; actualDuration and
-   wall ms are secondary.
+
+   The harness is deliberately self-contained. Do NOT make it require x's
+   `apps/web/e2e/local-secret-envelope.e2e.js`: on x that file executes its
+   whole test suite as a require side effect. Every selector and background
+   API the harness uses was verified to exist on origin/x (see the harness
+   header); keep any future edit x-compatible the same way.
+5. Run back-to-back on an otherwise idle machine (no parallel e2e runs or
+   builds), x first, then the branch, same settings:
+
+   ```
+   WEB_E2E_HEADLESS=true yarn test:e2e:web:render-baseline
+   ```
+
+   Defaults: `RENDER_BASELINE_ITERATIONS=5`, 10 churn emits, `quietMs=800`.
+6. Each run writes `.tmp/render-baseline/<git-short-sha>-<branch>-v2.json`
+   inside its own clone. Copy both artifacts into this directory (keep the
+   sha-keyed names; record the FULL shas in the table above - shallow clones
+   abbreviate to 7 characters), extend the README tables, then delete the
+   clones. Commit and rendered-component counts are the stable signal;
+   actualDuration and wall ms are secondary; long tasks are incomparable to
+   v1 numbers because the v2 fiber walk inflates them.
+
+Known pitfalls, learned producing the recorded pairs:
+
+- Stale local `x` branch (step 1) - the single most likely way to silently
+  measure the wrong baseline.
+- On origin/x the horizontal-layout header label carries no `account-name`
+  testID; the harness therefore waits on the `AccountSelectorTriggerBase`
+  container instead (fixed in `3b5b19d280`). Keep that wait if editing the
+  account-switch flow.
+- A fresh wallet auto-selects All Networks on boot, and in that state the
+  header trigger has no stable testID on x; the harness escapes it with the
+  unmeasured single-network pinning step before any phase runs.
+- Comparable numbers require the same machine, same headless setting, and
+  back-to-back timing; cross-machine or cross-day comparisons are not valid.
 
 ## v2: component-level renders (x `a830dee4bb` vs branch `d7ed222781`)
 
