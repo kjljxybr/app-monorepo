@@ -214,12 +214,17 @@ class ServiceAccountSelector extends ServiceBase {
     }
 
     let dbAccountId = othersWalletAccountId || '';
-    if (!dbAccountId && indexedAccount && networkId && deriveType) {
+    // Prefer the fetched indexedAccount but fall back to the raw
+    // indexedAccountId: a transient getIndexedAccount failure (bg service
+    // worker recycled, native DB busy, cold-start race) must not cascade
+    // into skipping the dbAccount/network account lookups below.
+    const effectiveIndexedAccountId = indexedAccount?.id || indexedAccountId;
+    if (!dbAccountId && effectiveIndexedAccountId && networkId && deriveType) {
       try {
         dbAccountId =
           await this.backgroundApi.serviceAccount.getDbAccountIdFromIndexedAccountId(
             {
-              indexedAccountId: indexedAccount.id,
+              indexedAccountId: effectiveIndexedAccountId,
               networkId,
               deriveType,
             },
@@ -254,7 +259,7 @@ class ServiceAccountSelector extends ServiceBase {
     const networkAccountAndDeriveStartedAt = startStage();
     if (networkId) {
       const canQueryIndexedNetworkAccount = Boolean(
-        deriveType && indexedAccount && wallet,
+        deriveType && effectiveIndexedAccountId && wallet,
       );
       const canQueryOthersNetworkAccount = Boolean(othersWalletAccountId);
       if (canQueryIndexedNetworkAccount || canQueryOthersNetworkAccount) {

@@ -151,6 +151,12 @@ export function JotaiContextStoreMirrorTracker({
   const renderVersionRef = useRef(0);
   const commitCountRef = useRef(0);
   const lastCommittedRenderVersionRef = useRef(0);
+  // Diagnostics-only prop read through a ref: its identity flips when the
+  // perf toggle changes, and having it in the registration effect deps would
+  // remove+re-add the mirror count, letting a pending store reset destroy a
+  // still-mounted scene store.
+  const accountSelectorPerfContextRef = useRef(accountSelectorPerfContext);
+  accountSelectorPerfContextRef.current = accountSelectorPerfContext;
   renderVersionRef.current += 1;
   useDebugComponentRemountLog({
     name: `JotaiContextStoreMirrorTracker`,
@@ -221,14 +227,25 @@ export function JotaiContextStoreMirrorTracker({
         });
         // The counts only cover mounts of this runtime, while the map they are
         // written into is shared across runtimes. On single UI runtime targets
-        // that is the whole picture, so a shrink is accurate. An extension can
-        // run several UI runtimes (popup, side panel, expand tab) at once, and
-        // shrinking there would tear down effects another runtime still needs,
-        // so keep the union semantics on removal like the shared map expects.
+        // that is the whole picture, so a count-based shrink is accurate. An
+        // extension can run several UI runtimes (popup, side panel, expand
+        // tab) at once, so its local counts cannot represent the global
+        // picture: publish only on add, and only as a union with the already
+        // published enabledNum — replacing it with local keys after a local
+        // unmount would erase nums other runtimes still need.
         if (action === 'add' || !platformEnv.isExtension) {
+          const localEnabledNum = [...enabledNumCounts.keys()];
+          const nextEnabledNum = platformEnv.isExtension
+            ? [
+                ...new Set([
+                  ...value.accountSelectorInfo.enabledNum,
+                  ...localEnabledNum,
+                ]),
+              ]
+            : localEnabledNum;
           value.accountSelectorInfo = {
             ...value.accountSelectorInfo,
-            enabledNum: [...enabledNumCounts.keys()].toSorted((a, b) => a - b),
+            enabledNum: nextEnabledNum.toSorted((a, b) => a - b),
           };
         }
       }
@@ -247,13 +264,14 @@ export function JotaiContextStoreMirrorTracker({
       if (action === 'remove' && value.count <= 0) {
         jotaiContextStore.completeStoreResetIfRequestedById(storeId);
       }
-      if (accountSelectorPerfContext) {
+      const perfContext = accountSelectorPerfContextRef.current;
+      if (perfContext) {
         defaultLogger.accountSelector.perf.trace('mirrorTrackerRegistration', {
           action,
-          perfDebugName: accountSelectorPerfContext.perfDebugName,
-          providerInstanceId: accountSelectorPerfContext.providerInstanceId,
+          perfDebugName: perfContext.perfDebugName,
+          providerInstanceId: perfContext.providerInstanceId,
           registrationCount: Math.max(0, value.count),
-          sceneName: accountSelectorPerfContext.sceneName,
+          sceneName: perfContext.sceneName,
           storeId,
         });
       }
@@ -264,13 +282,7 @@ export function JotaiContextStoreMirrorTracker({
     return () => {
       processMapCount('remove');
     };
-  }, [
-    accountSelectorInfo,
-    accountSelectorPerfContext,
-    setMap,
-    storeId,
-    storeName,
-  ]);
+  }, [accountSelectorInfo, setMap, storeId, storeName]);
 
   return null;
 }

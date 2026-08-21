@@ -179,6 +179,7 @@ describe('jotaiContextStore reset flow', () => {
     delete globalCache.__ONEKEY_CTX_ATOM_SNAPSHOT__;
     platformEnv.isNative = false;
     platformEnv.isDesktop = false;
+    platformEnv.isExtension = false;
     jotaiContextStore.storeCache.clear();
     jotaiContextStore.storeResetRequests.clear();
     clearJotaiContextTrackerMap();
@@ -349,6 +350,77 @@ describe('jotaiContextStore reset flow', () => {
       count: 1,
       accountSelectorInfo: { enabledNum: [0] },
     });
+
+    unmount();
+    expect(getJotaiContextTrackerMap()[accountSelectorStoreId]).toBeUndefined();
+  });
+
+  it('keeps published enabled numbers on extension after a local mirror unmount', () => {
+    // On extension several UI runtimes (popup, side panel, expand tab) share
+    // the tracker map, so a runtime's local counts must never shrink the
+    // published enabledNum: after the wide mirror unmounts locally, a later
+    // local mount must not erase num 1 for the other runtimes.
+    platformEnv.isExtension = true;
+    const buildAccountSelectorData = (
+      enabledNum: number[],
+    ): IJotaiContextStoreData => ({
+      storeName: EJotaiContextStoreNames.accountSelector,
+      accountSelectorInfo: {
+        sceneName: EAccountSelectorSceneName.swap,
+        sceneUrl: '',
+        enabledNum,
+      },
+    });
+    // Stable data identities so rerenders do not re-run the still-mounted
+    // mirrors' registration effects.
+    const narrowData = buildAccountSelectorData([0]);
+    const wideData = buildAccountSelectorData([0, 1]);
+    const lateData = buildAccountSelectorData([0]);
+    const accountSelectorStoreId = buildJotaiContextStoreId(narrowData);
+    const renderTrackers = ({
+      showWideMirror,
+      showLateMirror,
+    }: {
+      showWideMirror: boolean;
+      showLateMirror: boolean;
+    }) =>
+      createElement(
+        'div',
+        undefined,
+        createElement(JotaiContextStoreMirrorTracker, {
+          ...narrowData,
+          key: 'narrow',
+        }),
+        showWideMirror
+          ? createElement(JotaiContextStoreMirrorTracker, {
+              ...wideData,
+              key: 'wide',
+            })
+          : undefined,
+        showLateMirror
+          ? createElement(JotaiContextStoreMirrorTracker, {
+              ...lateData,
+              key: 'late',
+            })
+          : undefined,
+      );
+
+    const { rerender, unmount } = render(
+      renderTrackers({ showWideMirror: true, showLateMirror: false }),
+    );
+
+    expect(getJotaiContextTrackerMap()[accountSelectorStoreId]).toMatchObject({
+      count: 2,
+      accountSelectorInfo: { enabledNum: [0, 1] },
+    });
+
+    rerender(renderTrackers({ showWideMirror: false, showLateMirror: false }));
+    rerender(renderTrackers({ showWideMirror: false, showLateMirror: true }));
+
+    expect(
+      getJotaiContextTrackerMap()[accountSelectorStoreId]?.accountSelectorInfo
+        ?.enabledNum,
+    ).toEqual([0, 1]);
 
     unmount();
     expect(getJotaiContextTrackerMap()[accountSelectorStoreId]).toBeUndefined();
