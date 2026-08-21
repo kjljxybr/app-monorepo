@@ -243,6 +243,21 @@ export function useAutoSelectDeriveType({ num }: { num: number }) {
       ) {
         return;
       }
+      // Deliberately no retry on a stale sync result. The event carries no
+      // value — the sync re-reads the authoritative global value and applies
+      // it under a narrow (networkId, deriveType) CAS — so it is a
+      // level-triggered idempotent reconciliation, and every change that can
+      // still drop it ships its own structural successor:
+      //   (a) networkId changed mid-sync -> the network-change effect above
+      //       re-runs for the new network and issues a fresh sync;
+      //   (b) the user changed deriveType mid-sync -> dropping is the correct
+      //       semantics (user intent wins), and their value propagates through
+      //       saveGlobalDeriveType into a new global value + a new event;
+      //   (c) a peer selection sync wrote the same deriveType -> both sides
+      //       already agree and the next change reconciles naturally.
+      // A failure-driven retry would add cross-runtime interleaving risk (each
+      // UI runtime receives this event and would retry independently) for a
+      // window every drop already covers.
       void actions.current
         .syncLocalDeriveTypeFromGlobal({
           num,

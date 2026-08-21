@@ -458,7 +458,9 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
   // Must list exactly ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS: reload staleness
   // is judged on those fields, so anything scheduled on a narrower set would be
   // dropped with nothing left to re-schedule it. The literal form is required
-  // for react-hooks/exhaustive-deps to analyse the deps array.
+  // for react-hooks/exhaustive-deps to analyse the deps array; the key-set test
+  // in selectedAccountCompare.test.ts fails when a new selection field is added
+  // without an explicit decision, which is what keeps this literal honest.
   const activeAccountReloadDeps = useMemo(
     () => [
       selectedAccount.walletId,
@@ -964,6 +966,47 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
   useEffect(() => {
     void autoSaveToStorage().catch(() => undefined);
   }, [autoSaveToStorage]);
+
+  // Mirror-shrink safety net (non-extension targets): when the last sibling UI
+  // holding a num releases it, JotaiContextStoreMirrorTracker shrinks
+  // enabledNum and unmounts this effects instance. A selection a sibling wrote
+  // for this num just before the shrink may not have been saved yet — the
+  // auto-save effect above is gone and nothing re-triggers the save, so a
+  // process kill inside that window loses the selection. Flush once on
+  // unmount. The comparison and the flush read the store directly (not render
+  // closures): the write that opened the window may have landed in the same
+  // React batch as the unmount and never reached a committed render.
+  // lastAutoSavedSelectionRef is a mutable ref updated on save success, so it
+  // is not subject to closure staleness; when it already matches the store the
+  // window is closed and the flush is skipped. A redundant flush is safe:
+  // saveToStorage's ready gate, default-selection gate, already-saved noop and
+  // isPayloadStillCurrent checks collapse it (including a race with
+  // confirmAccountSelect's explicit save) into a no-op. Fire-and-forget by
+  // necessity — cleanups cannot await — and safe after unmount because the
+  // jotai context store and the bound setter outlive this component.
+  useEffect(
+    () => () => {
+      const currentSelectedAccount = actions.current.getSelectedAccount({
+        num,
+      });
+      if (
+        isSameSelectedAccount(
+          lastAutoSavedSelectionRef.current,
+          currentSelectedAccount,
+        )
+      ) {
+        return;
+      }
+      void actions.current
+        .flushSelectionSaveForNum({
+          num,
+          sceneName,
+          sceneUrl,
+        })
+        .catch(() => undefined);
+    },
+    [actions, num, sceneName, sceneUrl],
+  );
 
   useEffect(() => {
     noopObject(activeAccountReloadDeps);

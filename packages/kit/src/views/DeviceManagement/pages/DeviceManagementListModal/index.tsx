@@ -65,7 +65,9 @@ export type IDeviceManagementListItem = IHwQrWalletWithDevice & {
 // Module-level so dedup survives modal close/reopen within a session.
 const reportedUnverifiedDeviceIds = new Set<string>();
 
-function DeviceListItem({
+// Exported for tests only (render-prop identity guard in
+// DeviceListItem.test.tsx).
+export function DeviceListItem({
   item,
   onPress,
   isConnected,

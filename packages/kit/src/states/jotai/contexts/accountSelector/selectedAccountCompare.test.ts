@@ -3,7 +3,9 @@ import type {
   IAccountSelectorSelectedAccountsMap,
 } from '@onekeyhq/kit-bg/src/dbs/simple/entity/SimpleDbEntityAccountSelector';
 
+import { defaultSelectedAccount } from './atoms';
 import {
+  ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS,
   isSameSelectedAccount,
   isSameSelectedAccountsMap,
 } from './selectedAccountCompare';
@@ -35,6 +37,20 @@ const allUndefinedSelectedAccount: IAccountSelectorSelectedAccount = {
   deriveType: undefined,
   focusedWallet: undefined,
 };
+
+describe('ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS', () => {
+  // Guards the three-way agreement between the staleness field list, the
+  // reload-scheduling deps in AccountSelectorEffects, and the background build
+  // inputs. When a new field is added to IAccountSelectorSelectedAccount this
+  // test fails until the author explicitly decides whether the field takes
+  // part in active-account reloads (add it to the list) or not (add it to the
+  // exclusion set below, next to focusedWallet).
+  it('covers every selection field except focusedWallet', () => {
+    expect(
+      new Set([...ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS, 'focusedWallet']),
+    ).toEqual(new Set(Object.keys(defaultSelectedAccount())));
+  });
+});
 
 describe('isSameSelectedAccount', () => {
   it('treats a bridged selection as the same as its in-memory source', () => {

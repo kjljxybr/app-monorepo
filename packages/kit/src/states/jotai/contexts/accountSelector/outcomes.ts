@@ -54,6 +54,9 @@ export enum ESelectionUpdateOutcome {
 /** Which guard rejected a selection update. */
 export enum ESelectionStaleGuard {
   CommitGuard = 'commit-guard',
+  // Narrow CAS (`expectedPartialSelection`): only the fields the caller's
+  // decision was derived from went stale, unrelated fields are ignored.
+  PartialSelection = 'partial-selection',
   Revision = 'revision',
   Selection = 'selection',
 }

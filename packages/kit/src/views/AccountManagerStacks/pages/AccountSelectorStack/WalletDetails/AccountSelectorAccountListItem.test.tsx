@@ -7,6 +7,9 @@ import { act, render } from '@testing-library/react';
 import { AccountSelectorAccountListItem } from './AccountSelectorAccountListItem';
 
 let capturedOnPress: (() => Promise<void>) | undefined;
+// One entry per ListItem render; used to compare render-prop identity across
+// re-renders.
+let capturedRenderItemTexts: unknown[] = [];
 
 const mockConfirmAccountSelect = jest.fn(async (_params: unknown) => true);
 const mockToastError = jest.fn((_params: unknown) => undefined);
@@ -63,8 +66,15 @@ jest.mock(
 );
 
 jest.mock('@onekeyhq/kit/src/components/ListItem', () => {
-  const ListItemMock = ({ onPress }: { onPress?: () => Promise<void> }) => {
+  const ListItemMock = ({
+    onPress,
+    renderItemText,
+  }: {
+    onPress?: () => Promise<void>;
+    renderItemText?: unknown;
+  }) => {
     capturedOnPress = onPress;
+    capturedRenderItemTexts.push(renderItemText);
     return null;
   };
   ListItemMock.Text = () => null;
@@ -164,7 +174,23 @@ describe('AccountSelectorAccountListItem account select', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     capturedOnPress = undefined;
+    capturedRenderItemTexts = [];
     mockConfirmAccountSelect.mockImplementation(async () => true);
+  });
+
+  it('keeps the renderItemText identity stable across unrelated re-renders', () => {
+    // ListItem renders renderItemText as a component type
+    // (`<Render {...props} />`), so a new function identity per render means
+    // React unmounts and remounts the whole text subtree. This guards the
+    // useCallback memoization: reverting it to an inline arrow would hand
+    // ListItem a fresh function on the second render and fail this test.
+    const props = buildProps();
+    const view = render(<AccountSelectorAccountListItem {...props} />);
+    view.rerender(<AccountSelectorAccountListItem {...props} />);
+
+    expect(capturedRenderItemTexts.length).toBeGreaterThanOrEqual(2);
+    expect(typeof capturedRenderItemTexts[0]).toBe('function');
+    expect(capturedRenderItemTexts[1]).toBe(capturedRenderItemTexts[0]);
   });
 
   it('toasts on a rejected confirmAccountSelect and keeps the selector modal open', async () => {

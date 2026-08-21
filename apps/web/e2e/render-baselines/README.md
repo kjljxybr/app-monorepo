@@ -7,7 +7,10 @@ iterations), browser long tasks, wall time, and boot counters. v2 files
 (`metricsVersion: 2`, `-v2` suffix) additionally record per-flow rendered
 composite-component deltas (React DevTools' PerformedWork semantics), the max
 components rendered in a single commit, per-commit `actualDuration` sums, and
-the `background-churn` phase (no-op `AccountUpdate` reload cycles).
+the `background-churn` phase (no-op `AccountUpdate` reload cycles). v3
+artifacts (`metricsVersion: 3`, `-v3` suffix) keep the v2 metrics and add one
+unmeasured warm-up iteration before each interactive phase's measured
+iterations; see the v3 section at the bottom for what that changes.
 
 ## Files
 
@@ -132,10 +135,20 @@ What the driver does, in order:
    rendered per commit, actualDuration; medians plus % change, with
    background-churn highlighted as the decisive phase) and writes to
    `.tmp/render-baseline/` in the main repo:
-   `compare-<xsha7>-vs-<candsha7>-<runid>.json` (machine-readable summary)
-   plus copies of both raw artifacts next to it
+   `compare-<xsha7>-vs-<candsha7>-<runid>.json` (machine-readable summary,
+   including the regression-gate verdict from step 8) plus copies of both
+   raw artifacts next to it
    (`...-x-raw.json` / `...-candidate-raw.json`).
-8. Exits non-zero if either run fails, keeping clones and logs (their paths
+8. Applies the regression gate (on by default): for every phase measured on
+   both sides, the candidate's rendered-components and commits medians must
+   not exceed the x medians of this same run by more than
+   `RENDER_BASELINE_GATE_FACTOR` (default 1.3); actualDuration and wall-ms
+   medians only warn. On failure it prints each offending phase/metric with
+   both medians and exits with code 2 (after the summary is fully written).
+   `RENDER_BASELINE_GATE=0` turns the gate off. See the v3 section for the
+   gate semantics and the factor rationale.
+9. Exits with code 1 if either measurement run fails (a failed gate exits
+   with code 2 instead, see step 8), keeping clones and logs (their paths
    are printed) for diagnosis. Per-step logs live under
    `.tmp/render-baseline/runs/`.
 
@@ -152,6 +165,8 @@ Env knobs:
 | `RENDER_BASELINE_FRESH` | unset | `1` ignores cached clones and rebuilds them from scratch. |
 | `RENDER_BASELINE_CLEANUP` | unset | `1` deletes the clone cache after a successful run. |
 | `RENDER_BASELINE_CLONES_DIR` | `.tmp/render-baseline-clones` | Where the clones live. On the same volume as the repo git hardlinks the object store; a different volume falls back to copying it. |
+| `RENDER_BASELINE_GATE` | on | `0` disables the regression gate entirely; comparison tables and the summary are still produced. |
+| `RENDER_BASELINE_GATE_FACTOR` | `1.3` | Regression threshold: a gated phase metric fails when candidate median > x median * factor. Rationale in the v3 section. |
 | `RENDER_BASELINE_ITERATIONS`, other `RENDER_BASELINE_*`, `WEB_E2E_*` | harness defaults | Passed through unchanged to BOTH measured runs. |
 
 Clone cache: after a successful run the two clones for the current sha pair
@@ -234,7 +249,8 @@ in-progress work.
    ```
 
    Defaults: `RENDER_BASELINE_ITERATIONS=5`, 10 churn emits, `quietMs=800`.
-6. Each run writes `.tmp/render-baseline/<git-short-sha>-<branch>-v2.json`
+6. Each run writes
+   `.tmp/render-baseline/<git-short-sha>-<branch>-v<metricsVersion>.json`
    inside its own clone. Copy both artifacts into this directory (keep the
    sha-keyed names; record the FULL shas in the table above - shallow clones
    abbreviate to 7 characters), extend the README tables, then delete the
@@ -378,3 +394,60 @@ redundant background `AccountUpdate` costs x ~3.5k component renders and
 v1 commit counter could not resolve, and it confirms the branch's noop-gate /
 subscription-isolation work does what it claims without regressing the
 interactive flows.
+
+## v3: warm-up iterations and the regression gate
+
+The v1/v2 pairs exposed a systematic false signal: the FIRST iteration of an
+interactive phase pays one-time lazy-mount spikes (x account-switch commit
+deltas 90/22/21/21/35; x tab-switch rendered deltas
+23856/6868/6868/7761/6868), so a 5-sample median could land on either side of
+the spike - that is what produced the spurious tab-switch +27% (v1) / +35%
+(v2) readings called out as noise above. v3 changes two things.
+
+Harness (`metricsVersion: 3`, artifacts `...-v3.json`):
+
+- Every interactive phase now runs one unmeasured warm-up iteration (the same
+  flow, numbers discarded) before the `RENDER_BASELINE_ITERATIONS` measured
+  ones, so the lazy-mount spike is paid before measurement starts. The
+  flow-iteration index keeps counting across warm-up + measured iterations,
+  so the alternating flows (account-switch, network-switch) stay real
+  switches instead of repeating the warm-up target as a same-target no-op.
+  `background-churn` runs no warm-up: its first emit shows no systematic
+  spike. A warm-up failure fails the phase exactly like a measured-iteration
+  failure - if the flow cannot complete, the environment is broken and any
+  measured numbers would be meaningless. Artifacts record `warmupIterations`
+  both top-level and per phase.
+- Comparability boundary: the compare driver copies the candidate's harness
+  into BOTH clones and re-measures both sides back-to-back, so driver A/B
+  comparisons are unaffected by this bump. The boundary only matters when
+  comparing v3 numbers DIRECTLY against the recorded v2 JSONs in this
+  directory: v2 interactive medians were computed over 5 samples whose first
+  is systematically inflated, v3 medians over 5 post-warm-up samples - expect
+  v3 interactive medians to be equal or slightly lower, with far less
+  median-placement noise. background-churn numbers are unaffected. The
+  recorded pairs here remain v2 until a re-pin records a v3 pair.
+
+Driver regression gate (`render-baseline-compare.e2e.js`, on by default):
+
+- For every phase measured on both sides, the candidate's
+  `renderedComponents` and `commits` medians must not exceed
+  `x median * RENDER_BASELINE_GATE_FACTOR` (default 1.3). The gate is
+  SYMMETRIC regression detection against the x numbers measured in the same
+  run - deliberately never "candidate must beat x", a one-directional claim
+  that would go permanently stale the moment x is re-pinned onto a commit
+  that already contains the optimization under test. A zero x median leaves
+  the candidate no headroom (factor scaling cannot express slack above zero);
+  that strictness is intentional.
+- `actualDurationMs` and `wallMs` medians only WARN when they exceed the
+  factor: duration and wall time are too noisy to fail a run on.
+- Factor rationale: with warm-up removing the first-iteration spike,
+  back-to-back 5-sample medians of the gated count metrics vary within
+  roughly 10% run to run on an idle machine; 1.3 sits well above that noise
+  while still failing on the multi-x regressions this baseline exists to
+  guard (the background-churn effect it protects is -64% commits / -93%
+  rendered components).
+- Verdicts (per phase and per metric: x median, candidate median, limit,
+  pass/fail) are written into the `gate` object of the compare summary JSON.
+- Exit codes: a failed gate exits with code 2, after the comparison tables
+  and the summary are fully written; measurement failures exit with code 1;
+  `RENDER_BASELINE_GATE=0` disables the gate entirely.

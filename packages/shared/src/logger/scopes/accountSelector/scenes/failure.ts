@@ -156,6 +156,54 @@ export class AccountSelectorFailureScene extends BaseScene {
     ];
   }
 
+  // A single stage of the background active-account build threw and the build
+  // continued with a degraded result (missing wallet, account, network, or
+  // derive info) instead of failing outright. Deliberately not gated by the
+  // perf nonce: dapp-triggered builds never pass one, and these partial
+  // failures are the only bg-side trace for "my account looks empty after
+  // switching network". Payload stays deterministic for a given failure so the
+  // transport can collapse byte-identical consecutive entries.
+  @LogToLocal({ level: 'warn' })
+  public buildActiveAccountStageFailed({
+    errorMessage,
+    errorName,
+    networkId,
+    stage,
+  }: {
+    errorMessage: string | undefined;
+    errorName: string | undefined;
+    // Network id is chain topology, not an account identifier, and which chain
+    // was being resolved is usually the answer to why a stage failed.
+    networkId: string | undefined;
+    stage: string;
+  }) {
+    return [
+      'accountSelector build active account stage failed',
+      { errorMessage, errorName, networkId, stage },
+    ];
+  }
+
+  // Marking stale hardware wallets deprecated failed after the device pairing
+  // itself already succeeded. Best-effort by design — the success path must
+  // never fail on it — but a stale wallet left visible sends the user into a
+  // dead wallet entry, so the exported log needs the failure.
+  @LogToLocal({ level: 'warn' })
+  public hwWalletDeprecatedStatusUpdateFailed({
+    errorMessage,
+    errorName,
+    walletType,
+  }: {
+    errorMessage: string | undefined;
+    errorName: string | undefined;
+    // onekey-hardware / trezor: two dedup flows that share only this outcome.
+    walletType: string;
+  }) {
+    return [
+      'accountSelector hw wallet deprecated status update failed',
+      { errorMessage, errorName, walletType },
+    ];
+  }
+
   // The selection never reached storage, so the next cold start restores the
   // previous account and the user's switch silently reverts. Retried only when
   // the selection changes again — standing still keeps the loss.

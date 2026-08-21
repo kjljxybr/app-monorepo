@@ -13,6 +13,7 @@ import {
   AccountSelectorJotaiProvider,
   accountSelectorStorageReadyAtom,
   accountSelectorUpdateMetaAtom,
+  defaultActiveAccountInfo,
   defaultSelectedAccount,
   selectedAccountsAtom,
 } from '../../states/jotai/contexts/accountSelector/atoms';
@@ -33,6 +34,23 @@ const mockIsInTransferImportOrBackupRestoreFlow: jest.MockedFunction<
 > = jest.fn();
 const mockShouldSyncHomeAndSwapSelectedAccount: jest.MockedFunction<
   () => Promise<boolean>
+> = jest.fn();
+const mockBuildActiveAccountInfoFromSelectedAccount: jest.MockedFunction<
+  (params: unknown) => Promise<unknown>
+> = jest.fn();
+const mockFixOthersWalletAccountNetworkPair: jest.MockedFunction<
+  (params: { selectedAccount: unknown }) => Promise<unknown>
+> = jest.fn();
+const mockSaveGlobalDeriveType: jest.MockedFunction<() => Promise<void>> =
+  jest.fn();
+const mockShouldSyncWithHomeSource: jest.MockedFunction<
+  () => Promise<boolean>
+> = jest.fn();
+const mockSimpleDbGetSelectedAccount: jest.MockedFunction<
+  () => Promise<unknown>
+> = jest.fn();
+const mockSimpleDbSaveSelectedAccount: jest.MockedFunction<
+  (params: unknown) => Promise<{ persisted: boolean }>
 > = jest.fn();
 
 // Import-time surface of actions.tsx, mirrored from actions.test.tsx: these
@@ -108,9 +126,16 @@ jest.mock('@onekeyhq/kit/src/background/instance/backgroundApiProxy', () => ({
   __esModule: true,
   default: {
     serviceAccountSelector: {
+      buildActiveAccountInfoFromSelectedAccount: (params: unknown) =>
+        mockBuildActiveAccountInfoFromSelectedAccount(params),
+      fixOthersWalletAccountNetworkPair: (params: {
+        selectedAccount: unknown;
+      }) => mockFixOthersWalletAccountNetworkPair(params),
       getGlobalDeriveType: () => mockGetGlobalDeriveType(),
+      saveGlobalDeriveType: () => mockSaveGlobalDeriveType(),
       shouldSyncHomeAndSwapSelectedAccount: () =>
         mockShouldSyncHomeAndSwapSelectedAccount(),
+      shouldSyncWithHomeSource: () => mockShouldSyncWithHomeSource(),
       shouldUseGlobalDeriveType: () => mockShouldUseGlobalDeriveType(),
     },
     serviceNetwork: {
@@ -120,6 +145,13 @@ jest.mock('@onekeyhq/kit/src/background/instance/backgroundApiProxy', () => ({
     servicePrimeTransfer: {
       isInTransferImportOrBackupRestoreFlow: () =>
         mockIsInTransferImportOrBackupRestoreFlow(),
+    },
+    simpleDb: {
+      accountSelector: {
+        getSelectedAccount: () => mockSimpleDbGetSelectedAccount(),
+        saveSelectedAccount: (params: unknown) =>
+          mockSimpleDbSaveSelectedAccount(params),
+      },
     },
   },
 }));
@@ -596,5 +628,110 @@ describe('AccountSelectorEffects same-scene remote event sync', () => {
       'hd-1--1',
     );
     expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+  });
+});
+
+describe('AccountSelectorEffects unmount selection flush', () => {
+  const sceneName = EAccountSelectorSceneName.home;
+
+  const buildHdSelectedAccount = () => ({
+    ...defaultSelectedAccount(),
+    walletId: 'hd-1',
+    indexedAccountId: 'hd-1--0',
+    networkId: 'tron--0x2b6653dc',
+    deriveType: 'default' as const,
+    focusedWallet: 'hd-1',
+  });
+
+  const mountReadyHomeEffects = () => {
+    const store = createStore();
+    store.set(accountSelectorStorageReadyAtom(), true);
+    store.set(selectedAccountsAtom(), { 0: defaultSelectedAccount() });
+    const rendered = render(
+      <AccountSelectorJotaiProvider store={store} config={{ sceneName }}>
+        <AccountSelectorEffects num={0} />
+      </AccountSelectorJotaiProvider>,
+    );
+    return { store, rendered };
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetGlobalDeriveType.mockResolvedValue('default');
+    mockShouldUseGlobalDeriveType.mockResolvedValue(true);
+    mockIsDeriveTypeAvailableForNetwork.mockResolvedValue(true);
+    mockIsInTransferImportOrBackupRestoreFlow.mockResolvedValue(false);
+    mockShouldSyncHomeAndSwapSelectedAccount.mockResolvedValue(false);
+    // ready:false active account keeps the auto-select hooks inert even
+    // though storage is ready in these tests.
+    mockBuildActiveAccountInfoFromSelectedAccount.mockResolvedValue({
+      activeAccount: defaultActiveAccountInfo(),
+    });
+    mockFixOthersWalletAccountNetworkPair.mockImplementation(
+      async ({ selectedAccount }) => selectedAccount,
+    );
+    mockSaveGlobalDeriveType.mockResolvedValue(undefined);
+    mockShouldSyncWithHomeSource.mockResolvedValue(false);
+    mockSimpleDbGetSelectedAccount.mockResolvedValue(undefined);
+    mockSimpleDbSaveSelectedAccount.mockResolvedValue({ persisted: true });
+  });
+
+  it('flushes an unsaved selection exactly once on unmount', async () => {
+    // The mirror-shrink window: a sibling writes this num's selection and the
+    // registry shrink unmounts the effects instance in the same React batch,
+    // so the auto-save effect never runs for the write. The unmount flush must
+    // read the store (not a render closure) and persist it exactly once.
+    const { store, rendered } = mountReadyHomeEffects();
+    await act(async () => {});
+    expect(mockSimpleDbSaveSelectedAccount).not.toHaveBeenCalled();
+
+    const selectedAccount = buildHdSelectedAccount();
+    await act(async () => {
+      store.set(selectedAccountsAtom(), { 0: selectedAccount });
+      rendered.unmount();
+    });
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(mockSimpleDbSaveSelectedAccount).toHaveBeenCalledTimes(1);
+    expect(mockSimpleDbSaveSelectedAccount).toHaveBeenCalledWith(
+      expect.objectContaining({
+        num: 0,
+        sceneName,
+        selectedAccount: expect.objectContaining({
+          indexedAccountId: 'hd-1--0',
+        }),
+        trigger: 'unmount-flush',
+      }),
+    );
+  });
+
+  it('does not flush again when the selection was already auto-saved', async () => {
+    const { store, rendered } = mountReadyHomeEffects();
+    await act(async () => {});
+
+    const selectedAccount = buildHdSelectedAccount();
+    await act(async () => {
+      store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    });
+    await waitFor(() => {
+      expect(mockSimpleDbSaveSelectedAccount).toHaveBeenCalledTimes(1);
+    });
+
+    await act(async () => {
+      rendered.unmount();
+    });
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    // The unmount flush recognizes the selection as already saved and stays
+    // quiet; a second write here would race confirmAccountSelect-style saves.
+    expect(mockSimpleDbSaveSelectedAccount).toHaveBeenCalledTimes(1);
   });
 });

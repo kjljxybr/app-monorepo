@@ -37,11 +37,21 @@
  *   6. Both measurements run back-to-back (x first, then candidate) with
  *      WEB_E2E_HEADLESS=true, on an otherwise idle machine; RENDER_BASELINE_*
  *      and WEB_E2E_* env knobs pass through to the harness.
- *   7. The two v2 artifacts are compared per phase (rendered components,
+ *   7. The two v3 artifacts are compared per phase (rendered components,
  *      commits, max rendered per commit, actualDuration; medians + % change,
- *      background-churn highlighted) and a machine-readable summary plus
- *      copies of both raw artifacts are written to .tmp/render-baseline/ in
- *      THIS repo. Recording a new baseline pair stays a manual, reviewed step.
+ *      background-churn highlighted) and a machine-readable summary (which
+ *      embeds the gate verdict from step 8) plus copies of both raw artifacts
+ *      are written to .tmp/render-baseline/ in THIS repo. Recording a new
+ *      baseline pair stays a manual, reviewed step.
+ *   8. Regression gate (default ON; RENDER_BASELINE_GATE=0 disables): for
+ *      every phase measured on both sides, the candidate's renderedComponents
+ *      and commits medians must not exceed the x medians of the SAME run by
+ *      more than RENDER_BASELINE_GATE_FACTOR (default 1.3). This is symmetric
+ *      regression detection - deliberately never "candidate must beat x",
+ *      which would go permanently stale the moment x is re-pinned onto a
+ *      commit that already contains the optimization under test.
+ *      actualDuration and wall-ms medians only warn (too noisy to gate). A
+ *      failed gate exits with code 2; measurement failures exit with code 1.
  *
  * This driver requires nothing beyond Node builtins.
  */
@@ -382,10 +392,10 @@ async function runMeasurement({ cloneDir, label, logFile, runArtifactDir }) {
   });
   const artifacts = fs
     .readdirSync(runArtifactDir)
-    .filter((name) => name.endsWith('-v2.json'));
+    .filter((name) => name.endsWith('-v3.json'));
   if (artifacts.length !== 1) {
     throw new Error(
-      `Expected exactly one -v2.json artifact in ${runArtifactDir}, found ` +
+      `Expected exactly one -v3.json artifact in ${runArtifactDir}, found ` +
         `${artifacts.length}`,
     );
   }
@@ -428,7 +438,8 @@ function phaseMedian(phase, metric) {
       ? phase.actualDurationMs.median
       : null;
   }
-  return phase[metric].median;
+  const stats = phase[metric];
+  return stats && typeof stats.median === 'number' ? stats.median : null;
 }
 
 function comparePhases(xArtifact, candidateArtifact) {
@@ -523,15 +534,20 @@ function compareBoot(xArtifact, candidateArtifact) {
 function comparabilityWarnings(xArtifact, candidateArtifact) {
   const warnings = [];
   if (
-    xArtifact.metricsVersion !== 2 ||
-    candidateArtifact.metricsVersion !== 2
+    xArtifact.metricsVersion !== 3 ||
+    candidateArtifact.metricsVersion !== 3
   ) {
     warnings.push(
       `metricsVersion mismatch: x=${xArtifact.metricsVersion} ` +
         `candidate=${candidateArtifact.metricsVersion}`,
     );
   }
-  for (const key of ['iterations', 'churnEmits', 'quietMs']) {
+  for (const key of [
+    'iterations',
+    'churnEmits',
+    'quietMs',
+    'warmupIterations',
+  ]) {
     if (xArtifact[key] !== candidateArtifact[key]) {
       warnings.push(
         `${key} mismatch: x=${xArtifact[key]} candidate=${candidateArtifact[key]}`,
@@ -550,6 +566,174 @@ function comparabilityWarnings(xArtifact, candidateArtifact) {
     log(`WARNING: ${warning} - the comparison may not be valid`);
   }
   return warnings;
+}
+
+// ---------------------------------------------------------------------------
+// Regression gate
+// ---------------------------------------------------------------------------
+
+// Default threshold for the regression gate. With the harness's v3 warm-up
+// removing the first-iteration lazy-mount spike, back-to-back 5-sample
+// medians of the gated count metrics vary within roughly 10% run to run on an
+// idle machine; 1.3 sits well above that noise while still failing on the
+// multi-x regressions this baseline exists to guard (see
+// render-baselines/README.md).
+const DEFAULT_GATE_FACTOR = 1.3;
+// Gated: the stable count metrics. Warn-only: duration and wall time are too
+// noisy to fail a run on.
+const GATE_METRICS = ['renderedComponents', 'commits'];
+const GATE_WARN_ONLY_METRICS = ['actualDurationMs', 'wallMs'];
+
+// Default ON; RENDER_BASELINE_GATE=0 disables the gate entirely.
+function isGateEnabled() {
+  const value = process.env.RENDER_BASELINE_GATE;
+  if (value === undefined) {
+    return true;
+  }
+  return parseBooleanEnv(value);
+}
+
+function resolveGateFactor() {
+  const raw = process.env.RENDER_BASELINE_GATE_FACTOR;
+  if (raw === undefined || raw.trim() === '') {
+    return DEFAULT_GATE_FACTOR;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(
+      `RENDER_BASELINE_GATE_FACTOR=${raw} must be a positive number ` +
+        `(default ${DEFAULT_GATE_FACTOR})`,
+    );
+  }
+  return value;
+}
+
+function round2(value) {
+  return Math.round(value * 100) / 100;
+}
+
+// Pure verdict function (exported below for self-tests). The gate is
+// deliberately SYMMETRIC regression detection: the candidate must not be
+// significantly worse than the x side measured in the SAME run. It is never
+// "candidate must beat x" - that one-directional claim would go permanently
+// stale the moment x is re-pinned onto a commit that already contains the
+// optimization under test. Phases or metrics missing on either side are
+// surfaced as warnings, never silently skipped. A zero x median leaves the
+// candidate no headroom at all (0 * factor = 0): factor scaling cannot
+// express slack above zero, and that strictness is intentional.
+function evaluateRegressionGate(xPhases, candidatePhases, factor) {
+  const xByName = new Map(xPhases.map((phase) => [phase.phase, phase]));
+  const candidateByName = new Map(
+    candidatePhases.map((phase) => [phase.phase, phase]),
+  );
+  const failures = [];
+  const warnings = [];
+  const phases = [];
+  for (const xPhase of xPhases) {
+    const phaseName = xPhase.phase;
+    const candidatePhase = candidateByName.get(phaseName);
+    if (!candidatePhase) {
+      warnings.push(
+        `phase ${phaseName}: present on x but missing on candidate - not gated`,
+      );
+    } else {
+      const checks = [];
+      for (const metric of GATE_METRICS) {
+        const xValue = phaseMedian(xPhase, metric);
+        const candidateValue = phaseMedian(candidatePhase, metric);
+        if (typeof xValue !== 'number' || typeof candidateValue !== 'number') {
+          warnings.push(
+            `phase ${phaseName} ${metric}: median unavailable on one side - not gated`,
+          );
+        } else {
+          const limit = xValue * factor;
+          const pass = candidateValue <= limit;
+          checks.push({
+            candidate: candidateValue,
+            limit: round2(limit),
+            metric,
+            pass,
+            x: xValue,
+          });
+          if (!pass) {
+            failures.push(
+              `phase ${phaseName} ${metric}: x median ${xValue} vs candidate ` +
+                `median ${candidateValue} ` +
+                `(${formatPct(pctChange(xValue, candidateValue))}) exceeds ` +
+                `gate factor ${factor} (limit ${round2(limit)})`,
+            );
+          }
+        }
+      }
+      for (const metric of GATE_WARN_ONLY_METRICS) {
+        const xValue = phaseMedian(xPhase, metric);
+        const candidateValue = phaseMedian(candidatePhase, metric);
+        // actualDuration is best-effort and may legitimately be unavailable;
+        // warn-only metrics stay silent about that.
+        if (
+          typeof xValue === 'number' &&
+          typeof candidateValue === 'number' &&
+          candidateValue > xValue * factor
+        ) {
+          warnings.push(
+            `phase ${phaseName} ${metric}: x median ${xValue} vs candidate ` +
+              `median ${candidateValue} ` +
+              `(${formatPct(pctChange(xValue, candidateValue))}) exceeds ` +
+              `factor ${factor} - WARNING ONLY, duration/wall metrics are too ` +
+              'noisy to gate',
+          );
+        }
+      }
+      phases.push({
+        checks,
+        pass: checks.every((check) => check.pass),
+        phase: phaseName,
+      });
+    }
+  }
+  for (const candidatePhase of candidatePhases) {
+    if (!xByName.has(candidatePhase.phase)) {
+      warnings.push(
+        `phase ${candidatePhase.phase}: present on candidate but missing on ` +
+          'x - not gated',
+      );
+    }
+  }
+  return {
+    factor,
+    failures,
+    pass: failures.length === 0,
+    phases,
+    warnings,
+  };
+}
+
+// Evaluates the gate against the two artifacts, logs the verdict, and returns
+// the object stored under `gate` in the summary JSON. Exit-code handling
+// stays in main so the summary is always written first.
+function applyRegressionGate(xArtifact, candidateArtifact, gateConfig) {
+  if (!gateConfig.enabled) {
+    return { enabled: false };
+  }
+  const verdict = evaluateRegressionGate(
+    xArtifact.phases,
+    candidateArtifact.phases,
+    gateConfig.factor,
+  );
+  for (const warning of verdict.warnings) {
+    log(`gate WARNING: ${warning}`);
+  }
+  if (verdict.pass) {
+    log(
+      'regression gate: PASS - no phase renderedComponents/commits median ' +
+        `exceeds x * ${verdict.factor}`,
+    );
+  } else {
+    for (const failure of verdict.failures) {
+      log(`gate REGRESSION: ${failure}`);
+    }
+  }
+  return { enabled: true, ...verdict };
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +771,21 @@ function pruneCloneCache(keepDirs) {
 async function main() {
   const startedAt = Date.now();
   assertNoConcurrentMeasurement();
+
+  // Validate the gate configuration up front: a bad
+  // RENDER_BASELINE_GATE_FACTOR must fail here, not after two ~4-minute
+  // measurements.
+  const gateConfig = isGateEnabled()
+    ? { enabled: true, factor: resolveGateFactor() }
+    : { enabled: false };
+  if (gateConfig.enabled) {
+    log(
+      `regression gate armed (factor ${gateConfig.factor}; ` +
+        'RENDER_BASELINE_GATE=0 disables)',
+    );
+  } else {
+    log('regression gate: DISABLED via RENDER_BASELINE_GATE');
+  }
 
   const pinned = resolvePinnedXCommit();
   const xSha = pinned.sha;
@@ -692,6 +891,7 @@ async function main() {
   );
   const phases = comparePhases(xArtifact, candidateArtifact);
   const boot = compareBoot(xArtifact, candidateArtifact);
+  const gate = applyRegressionGate(xArtifact, candidateArtifact, gateConfig);
 
   const pairName = `compare-${xSha.slice(0, 7)}-vs-${candidateSha.slice(0, 7)}-${runId}`;
   const xCopyPath = path.join(outputDir, `${pairName}-x-raw.json`);
@@ -722,8 +922,9 @@ async function main() {
       nodeVersion: process.version,
       platform: process.platform,
     },
+    gate,
     iterations: xArtifact.iterations,
-    metricsVersion: 2,
+    metricsVersion: 3,
     phases,
     warnings,
     worktreeDirty,
@@ -754,7 +955,29 @@ async function main() {
       'the table) and update that README - recording is a manual, reviewed ' +
       'step and is never done automatically.',
   );
+
+  if (gate.enabled === true && gate.pass === false) {
+    // Distinct exit path from a measurement failure (which throws and exits
+    // with code 1): both measurements succeeded, the comparison and summary
+    // were fully written, and THIS exit is the gate verdict.
+    banner([
+      'REGRESSION GATE FAILED (both measurements succeeded; this is the',
+      `gate verdict, not a run failure). Factor: ${gate.factor}.`,
+      ...gate.failures,
+      `Per-phase numbers: "gate" object in ${summaryPath}`,
+      'RENDER_BASELINE_GATE=0 disables the gate;',
+      'RENDER_BASELINE_GATE_FACTOR overrides the threshold.',
+    ]);
+    process.exitCode = 2;
+  }
 }
+
+// Exported for self-tests; requiring this file never runs main().
+module.exports = {
+  evaluateRegressionGate,
+  isGateEnabled,
+  resolveGateFactor,
+};
 
 if (require.main === module) {
   main().catch((error) => {

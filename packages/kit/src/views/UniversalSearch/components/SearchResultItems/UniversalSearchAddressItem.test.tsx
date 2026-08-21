@@ -7,6 +7,9 @@ import { act, render } from '@testing-library/react';
 import { UniversalSearchAddressItem } from './UniversalSearchAddressItem';
 
 let capturedOnPress: (() => Promise<void>) | undefined;
+// One entry per ListItem render; used to compare render-prop identity across
+// re-renders.
+let capturedRenderItemTexts: unknown[] = [];
 
 const mockConfirmAccountSelect = jest.fn(async (_params: unknown) => true);
 const mockAddIntoRecentSearchList = jest.fn((_params: unknown) => undefined);
@@ -65,8 +68,15 @@ jest.mock('@onekeyhq/kit/src/components/AccountAvatar', () => ({
 }));
 
 jest.mock('@onekeyhq/kit/src/components/ListItem', () => {
-  const ListItemMock = ({ onPress }: { onPress?: () => Promise<void> }) => {
+  const ListItemMock = ({
+    onPress,
+    renderItemText,
+  }: {
+    onPress?: () => Promise<void>;
+    renderItemText?: unknown;
+  }) => {
     capturedOnPress = onPress;
+    capturedRenderItemTexts.push(renderItemText);
     return null;
   };
   ListItemMock.Text = () => null;
@@ -81,11 +91,17 @@ jest.mock('@onekeyhq/kit/src/hooks/useAccountData', () => ({
   useAccountData: () => ({ vaultSettings: undefined }),
 }));
 
+// Identity-stable result, matching the real hook which memoizes what it
+// returns; a fresh object per render would defeat the render-prop identity
+// assertions below through the renderAccountValue dependency chain.
+const mockEnabledNetworksResult = {
+  enabledNetworksCompatibleWithWalletId: [],
+  networkInfoMap: {},
+};
+
 jest.mock('@onekeyhq/kit/src/hooks/useAllNetwork', () => ({
-  useEnabledNetworksCompatibleWithWalletIdInAllNetworks: () => ({
-    enabledNetworksCompatibleWithWalletId: [],
-    networkInfoMap: {},
-  }),
+  useEnabledNetworksCompatibleWithWalletIdInAllNetworks: () =>
+    mockEnabledNetworksResult,
 }));
 
 jest.mock('@onekeyhq/kit/src/hooks/useAppNavigation', () => ({
@@ -96,16 +112,25 @@ jest.mock('@onekeyhq/kit/src/hooks/useAppNavigation', () => ({
   }),
 }));
 
-jest.mock('@onekeyhq/kit/src/hooks/usePromiseResult', () => ({
-  usePromiseResult: (
-    _factory: unknown,
-    _deps: unknown,
-    options?: { initResult?: unknown },
-  ) => ({
-    result: options?.initResult,
-    isLoading: false,
-  }),
-}));
+jest.mock('@onekeyhq/kit/src/hooks/usePromiseResult', () => {
+  const { useRef } = jest.requireActual<typeof import('react')>('react');
+  return {
+    usePromiseResult: (
+      _factory: unknown,
+      _deps: unknown,
+      options?: { initResult?: unknown },
+    ) => {
+      // Mirror the real hook: the result lives in state, so its identity does
+      // not change just because the caller passes a fresh inline `initResult`
+      // array on every render.
+      const resultRef = useRef(options?.initResult);
+      return {
+        result: resultRef.current,
+        isLoading: false,
+      };
+    },
+  };
+});
 
 jest.mock(
   '@onekeyhq/kit/src/states/jotai/contexts/accountSelector/actions',
@@ -185,12 +210,42 @@ describe('UniversalSearchAddressItem account select', () => {
     jest.useFakeTimers();
     jest.clearAllMocks();
     capturedOnPress = undefined;
+    capturedRenderItemTexts = [];
     mockConfirmAccountSelect.mockImplementation(async () => true);
     mockIsOthersAccount.mockImplementation(() => false);
   });
 
   afterEach(() => {
     jest.useRealTimers();
+  });
+
+  it('keeps the renderItemText identity stable across unrelated re-renders', () => {
+    // ListItem renders renderItemText as a component type
+    // (`<Render {...props} />`), so a new function identity per render means
+    // React unmounts and remounts the whole text subtree. This guards the
+    // useCallback memoization: reverting it to an inline arrow would hand
+    // ListItem a fresh function on the second render and fail this test.
+    const getSearchInput = () => '0xabc';
+    const view = render(
+      <UniversalSearchAddressItem
+        item={item}
+        contextNetworkId="evm--1"
+        getSearchInput={getSearchInput}
+        source={'searchPage' as never}
+      />,
+    );
+    view.rerender(
+      <UniversalSearchAddressItem
+        item={item}
+        contextNetworkId="evm--1"
+        getSearchInput={getSearchInput}
+        source={'searchPage' as never}
+      />,
+    );
+
+    expect(capturedRenderItemTexts.length).toBeGreaterThanOrEqual(2);
+    expect(typeof capturedRenderItemTexts[0]).toBe('function');
+    expect(capturedRenderItemTexts[1]).toBe(capturedRenderItemTexts[0]);
   });
 
   it('toasts on a rejected confirmAccountSelect and still records the recent search', async () => {

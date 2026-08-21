@@ -22,13 +22,23 @@ export function isSameSelectedAccount(
 // The only selection fields an active account is built from. focusedWallet is
 // deliberately absent: it drives which wallet the selector panel highlights and
 // never changes the resolved account, so it must not invalidate a reload.
+//
+// Three places must agree on this list: this staleness check, the reload
+// scheduling deps in AccountSelectorEffects, and the fields
+// buildActiveAccountInfoFromSelectedAccount reads in the background. The
+// `satisfies` clause rejects entries that are not selection fields (and rejects
+// focusedWallet); exhaustiveness against future selection fields is enforced by
+// the key-set test in selectedAccountCompare.test.ts.
 export const ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS = [
   'walletId',
   'indexedAccountId',
   'othersWalletAccountId',
   'networkId',
   'deriveType',
-] as const;
+] as const satisfies readonly Exclude<
+  keyof IAccountSelectorSelectedAccount,
+  'focusedWallet'
+>[];
 
 // Reload staleness must be judged on exactly the fields that schedule a reload.
 // A wider comparison drops the in-flight reload for a change nothing will

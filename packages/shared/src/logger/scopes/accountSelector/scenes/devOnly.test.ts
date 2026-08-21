@@ -218,13 +218,24 @@ describe('account selector development-only logger scenes', () => {
         num: 0,
         sceneName: 'home',
       });
+      failureScene.buildActiveAccountStageFailed({
+        errorMessage: 'network not found',
+        errorName: 'OneKeyLocalError',
+        networkId: 'evm--1',
+        stage: 'network',
+      });
+      failureScene.hwWalletDeprecatedStatusUpdateFailed({
+        errorMessage: 'db busy',
+        errorName: 'OneKeyLocalError',
+        walletType: 'onekey-hardware',
+      });
 
       // These are the only trace a support report has for "I tapped an account
       // and nothing happened" — the app cannot show a toast from the state
       // layer, so silencing them in production would leave nothing at all. The
       // reload pair covers the quieter version of the same complaint: an empty
       // account that the UI already marked ready.
-      expect(failureEmit).toHaveBeenCalledTimes(6);
+      expect(failureEmit).toHaveBeenCalledTimes(8);
     } finally {
       process.env.NODE_ENV = previousNodeEnv;
     }

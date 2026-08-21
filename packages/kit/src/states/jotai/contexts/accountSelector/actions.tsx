@@ -233,7 +233,9 @@ type IActiveAccountReloadResult = {
   outcome: EActiveReloadOutcome;
 };
 
-const getNextSelectionUpdatedAt = ({
+// Exported for unit tests only: the clock-skew and cross-runtime revision
+// semantics below are locked in by getNextSelectionUpdatedAt.test.ts.
+export const getNextSelectionUpdatedAt = ({
   currentUpdatedAt,
   requestedUpdatedAt,
 }: {
@@ -1752,6 +1754,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         num: number;
         deriveType: IAccountDeriveTypes;
         expectedNetworkId?: string;
+        expectedPartialSelection?: Partial<IAccountSelectorSelectedAccount>;
         expectedSelection?: IAccountSelectorSelectedAccount;
         parentOperationId?: number;
         reason?: string;
@@ -1761,6 +1764,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         num,
         deriveType,
         expectedNetworkId,
+        expectedPartialSelection,
         expectedSelection,
         parentOperationId,
         reason,
@@ -1768,6 +1772,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       } = payload;
       return this.updateSelectedAccount.call(set, {
         expectedSelection,
+        expectedPartialSelection,
         updateMeta,
         num,
         parentOperationId,
@@ -1859,6 +1864,16 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       set,
       payload: {
         expectedSelection?: IAccountSelectorSelectedAccount;
+        /**
+         * Narrow CAS: drop the update as stale when any field listed here no
+         * longer holds its captured value. Unlike `expectedSelection` this
+         * compares only the fields the caller's decision was actually derived
+         * from, so a concurrent write to an unrelated field (focusedWallet
+         * when the selector panel opens) cannot drop the update. A key whose
+         * captured value is `undefined` must be listed explicitly — it asserts
+         * the field is still unset.
+         */
+        expectedPartialSelection?: Partial<IAccountSelectorSelectedAccount>;
         expectedUpdatedAt?: number | null;
         /**
          * Source revision carried by a cross-runtime/cross-scene sync event.
@@ -1916,6 +1931,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           // }
           const {
             expectedSelection,
+            expectedPartialSelection,
             expectedUpdatedAt,
             eventUpdatedAt,
             num,
@@ -1993,7 +2009,9 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               if (suppressedSinceLastLog !== undefined) {
                 defaultLogger.accountSelector.staleDrop.selectionUpdateDropped({
                   current: oldSelectedAccount,
-                  expected: expectedSelection,
+                  // At most one of the two CAS shapes is set per call; the
+                  // narrow one logs just the fields the caller pinned.
+                  expected: expectedSelection ?? expectedPartialSelection,
                   num,
                   reason: requestReason,
                   sceneName: sceneInfo?.sceneName,
@@ -2098,6 +2116,26 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               outcome: ESelectionUpdateOutcome.Stale,
               selectedAccount: oldSelectedAccount,
               staleGuard: ESelectionStaleGuard.Selection,
+            });
+          }
+          // Narrow CAS — judged inside the mutex like the guards above, but
+          // only over the fields the caller listed. Own keys with an
+          // `undefined` captured value participate: they assert the field is
+          // still unset. This never runs on a cross-runtime JSON hop (context
+          // methods are same-runtime calls), so the key set survives intact.
+          if (
+            expectedPartialSelection &&
+            Object.entries(expectedPartialSelection).some(
+              ([field, expectedValue]) =>
+                oldSelectedAccount[
+                  field as keyof IAccountSelectorSelectedAccount
+                ] !== expectedValue,
+            )
+          ) {
+            return logSelectionUpdateResult({
+              outcome: ESelectionUpdateOutcome.Stale,
+              selectedAccount: oldSelectedAccount,
+              staleGuard: ESelectionStaleGuard.PartialSelection,
             });
           }
           // Conditional apply for sync events (compare-if-newer). Unlike the
@@ -3765,11 +3803,20 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         if (result && Object.keys(willUpdateDeprecateMap).length > 0) {
           appEventBus.emit(EAppEventBusNames.WalletUpdate, undefined);
         }
-      } catch {
+      } catch (error) {
         defaultLogger.accountSelector.perf.trace(
           'walletDeprecatedStatusUpdateResult',
           {
             outcome: EWalletDeprecatedStatusUpdateOutcome.Error,
+            walletType: 'onekey-hardware',
+          },
+        );
+        // The perf trace above is dev/e2e-only; production support reports
+        // need the failure in the exported local log too.
+        defaultLogger.accountSelector.failure.hwWalletDeprecatedStatusUpdateFailed(
+          {
+            errorMessage: (error as Error | undefined)?.message,
+            errorName: (error as Error | undefined)?.name,
             walletType: 'onekey-hardware',
           },
         );
@@ -3826,11 +3873,20 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         if (result && Object.keys(willUpdateDeprecateMap).length > 0) {
           appEventBus.emit(EAppEventBusNames.WalletUpdate, undefined);
         }
-      } catch {
+      } catch (error) {
         defaultLogger.accountSelector.perf.trace(
           'walletDeprecatedStatusUpdateResult',
           {
             outcome: EWalletDeprecatedStatusUpdateOutcome.Error,
+            walletType: 'trezor',
+          },
+        );
+        // The perf trace above is dev/e2e-only; production support reports
+        // need the failure in the exported local log too.
+        defaultLogger.accountSelector.failure.hwWalletDeprecatedStatusUpdateFailed(
+          {
+            errorMessage: (error as Error | undefined)?.message,
+            errorName: (error as Error | undefined)?.name,
             walletType: 'trezor',
           },
         );
@@ -4274,7 +4330,21 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               },
               num,
               deriveType: globalDeriveType,
-              expectedSelection: selectedAccount,
+              // Narrow CAS instead of pinning the whole captured selection:
+              // (networkId, deriveType) is the minimal sufficient staleness
+              // condition here. The global derive type is stored per network,
+              // so an unchanged networkId proves the fetched value still
+              // applies; an unchanged deriveType proves no user action or peer
+              // sync changed it while getGlobalDeriveType was in flight, so
+              // nothing newer gets overwritten. The remaining fields
+              // (walletId/indexedAccountId/othersWalletAccountId/
+              // focusedWallet) play no part in deriving the value — pinning
+              // them let a mere selector-panel open (a focusedWallet-only
+              // write) drop the sync for good, since no event re-fires for it.
+              expectedPartialSelection: {
+                networkId: selectedAccount.networkId,
+                deriveType: selectedAccount.deriveType,
+              },
               parentOperationId: operationId,
               reason: 'autoDeriveGlobalSync',
             });
@@ -5265,6 +5335,41 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           inflightByScope.delete(inflightScopeKey);
         }
       }
+    },
+  );
+
+  // Final-flush entry for AccountSelectorEffects' unmount safety net (see the
+  // mirror-shrink comment there). Reads the authoritative selection and
+  // revision from the store instead of trusting the caller's render closure:
+  // the write that needs flushing may have landed in the same React batch as
+  // the unmount and never reached a committed render, leaving every closure in
+  // the component stale. All skip and staleness decisions stay inside
+  // saveToStorage (ready gate, default-selection gate, already-saved noop,
+  // isPayloadStillCurrent), so a redundant flush collapses into a no-op.
+  flushSelectionSaveForNum = contextAtomMethod(
+    async (
+      get,
+      set,
+      {
+        num,
+        sceneName,
+        sceneUrl,
+      }: {
+        num: number;
+        sceneName: EAccountSelectorSceneName;
+        sceneUrl?: string;
+      },
+    ) => {
+      const selectedAccount = this.getSelectedAccount.call(set, { num });
+      await this.saveToStorage.call(set, {
+        num,
+        sceneName,
+        sceneUrl,
+        selectedAccount,
+        selectedAccountUpdatedAt: get(accountSelectorUpdateMetaAtom())[num]
+          ?.updatedAt,
+        trigger: 'unmount-flush',
+      });
     },
   );
 
@@ -6276,6 +6381,7 @@ export function useAccountSelectorActions() {
   const getActiveAccount = actions.getActiveAccount.use();
   const initFromStorage = actions.initFromStorage.use();
   const saveToStorage = actions.saveToStorage.use();
+  const flushSelectionSaveForNum = actions.flushSelectionSaveForNum.use();
   const flushCurrentAccountSelectorColdStartSnapshot =
     actions.flushCurrentAccountSelectorColdStartSnapshot.use();
 
@@ -6329,6 +6435,7 @@ export function useAccountSelectorActions() {
     refresh,
     initFromStorage,
     saveToStorage,
+    flushSelectionSaveForNum,
     flushCurrentAccountSelectorColdStartSnapshot,
     clearSelectedAccount,
     updateSelectedAccountNetwork,

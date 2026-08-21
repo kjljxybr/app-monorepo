@@ -163,13 +163,27 @@ class ServiceAccountSelector extends ServiceBase {
         stageMs[stage] = Math.round(getPerfTimestamp() - startedAt);
       }
     };
-    const recordStageError = (stage: string) => {
-      if (nonce !== undefined && !errorStages.includes(stage)) {
+    // Together with `deriveType` below this reads exactly the fields in
+    // ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS (kit selectedAccountCompare.ts);
+    // its key-set test guards the agreement, since kit-bg cannot import the
+    // constant itself.
+    const { othersWalletAccountId, indexedAccountId, networkId, walletId } =
+      selectedAccount;
+    const recordStageError = (stage: string, error: unknown) => {
+      // Failure logging is deliberately NOT gated by the perf nonce: callers
+      // like ServiceDApp never pass one, and a silently degraded build is the
+      // only bg-side trace of a broken account/network switch. The nonce keeps
+      // gating only the timing stats (stageMs/perfTiming).
+      defaultLogger.accountSelector.failure.buildActiveAccountStageFailed({
+        errorMessage: (error as Error | undefined)?.message,
+        errorName: (error as Error | undefined)?.name,
+        networkId,
+        stage,
+      });
+      if (!errorStages.includes(stage)) {
         errorStages.push(stage);
       }
     };
-    const { othersWalletAccountId, indexedAccountId, networkId, walletId } =
-      selectedAccount;
     const deriveType = selectedAccount.deriveType;
 
     if (nonce !== undefined) {
@@ -198,8 +212,8 @@ class ServiceAccountSelector extends ServiceBase {
         wallet = await serviceAccount.getWallet({
           walletId,
         });
-      } catch (_error) {
-        recordStageError('wallet');
+      } catch (error) {
+        recordStageError('wallet', error);
       }
     }
 
@@ -208,8 +222,8 @@ class ServiceAccountSelector extends ServiceBase {
         indexedAccount = await serviceAccount.getIndexedAccount({
           id: indexedAccountId,
         });
-      } catch (_error) {
-        recordStageError('indexedAccount');
+      } catch (error) {
+        recordStageError('indexedAccount', error);
       }
     }
 
@@ -230,7 +244,7 @@ class ServiceAccountSelector extends ServiceBase {
             },
           );
       } catch (error) {
-        recordStageError('dbAccountId');
+        recordStageError('dbAccountId', error);
       }
     }
     finishStage('walletAndIndexed', walletAndIndexedStartedAt);
@@ -248,10 +262,10 @@ class ServiceAccountSelector extends ServiceBase {
             });
           }
         } catch (error) {
-          recordStageError('vaultSettings');
+          recordStageError('vaultSettings', error);
         }
-      } catch (_error) {
-        recordStageError('network');
+      } catch (error) {
+        recordStageError('network', error);
       }
     }
     finishStage('networkAndVault', networkAndVaultStartedAt);
@@ -271,9 +285,9 @@ class ServiceAccountSelector extends ServiceBase {
             networkId,
           });
           account = r;
-        } catch (_error) {
+        } catch (error) {
           // account may not compatible with network
-          recordStageError('networkAccount');
+          recordStageError('networkAccount', error);
         }
       }
 
@@ -285,7 +299,7 @@ class ServiceAccountSelector extends ServiceBase {
               deriveType,
             });
         } catch (error) {
-          recordStageError('deriveInfo');
+          recordStageError('deriveInfo', error);
         }
       }
     }
@@ -302,8 +316,8 @@ class ServiceAccountSelector extends ServiceBase {
           accountId: dbAccountId,
         });
         dbAccount = r;
-      } catch (_error) {
-        recordStageError('dbAccount');
+      } catch (error) {
+        recordStageError('dbAccount', error);
       }
     }
 
@@ -315,7 +329,7 @@ class ServiceAccountSelector extends ServiceBase {
           indexedAccount = undefined;
         }
       } catch (error) {
-        recordStageError('tempWalletState');
+        recordStageError('tempWalletState', error);
         throw error;
       }
     }
@@ -360,8 +374,8 @@ class ServiceAccountSelector extends ServiceBase {
         device = await serviceAccount.getDevice({
           dbDeviceId: wallet?.associatedDevice,
         });
-      } catch (_error) {
-        recordStageError('device');
+      } catch (error) {
+        recordStageError('device', error);
       }
     }
     // Mocked/deprecated wallets are "zombie" records still in DB but no
@@ -384,7 +398,7 @@ class ServiceAccountSelector extends ServiceBase {
         } catch (error) {
           account = undefined;
           canCreateAddress = true;
-          recordStageError('allNetworkMockAccount');
+          recordStageError('allNetworkMockAccount', error);
         }
       } else if (
         !isOthersWallet &&
@@ -433,7 +447,7 @@ class ServiceAccountSelector extends ServiceBase {
         networkId,
       });
     } catch (error) {
-      recordStageError('deriveInfoItems');
+      recordStageError('deriveInfoItems', error);
     }
     finishStage('deriveInfoItems', deriveInfoItemsStartedAt);
     const activeAccount: IAccountSelectorActiveAccountInfo = {

@@ -2966,6 +2966,100 @@ describe('useAccountSelectorActions', () => {
     expect(store.get(selectedAccountsAtom())[0]?.deriveType).toBe('ledgerLive');
   });
 
+  it('applies a global derive type when only focusedWallet moved under the sync', async () => {
+    // Opening the account selector panel writes focusedWallet and nothing
+    // else. The sync's decision is derived from (networkId, deriveType) only,
+    // so that unrelated write must not drop the sync as stale.
+    const globalDeriveDeferred = createDeferred<string>();
+    mockGetGlobalDeriveType.mockReturnValueOnce(globalDeriveDeferred.promise);
+    const initialSelection = {
+      ...createHdSelectedAccount('hd-1--0'),
+      networkId: 'evm--1',
+    };
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: initialSelection });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let syncPromise: Promise<unknown> | undefined;
+    await act(async () => {
+      syncPromise = result.current.syncLocalDeriveTypeFromGlobal({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+      });
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      store.set(selectedAccountsAtom(), {
+        0: { ...initialSelection, focusedWallet: 'hd-2' },
+      });
+      globalDeriveDeferred.resolve('ledger_live');
+      await syncPromise;
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      deriveType: 'ledger_live',
+      focusedWallet: 'hd-2',
+      networkId: 'evm--1',
+    });
+  });
+
+  it('drops a sync for a changed network but a re-sync against it succeeds', async () => {
+    // The stale drop is deliberately not retried by the sync itself: the
+    // network change that caused it re-runs useAutoSelectDeriveType's main
+    // effect, which issues a fresh sync against the new network. This locks
+    // the handover: the same call, made again after the change, must succeed.
+    const globalDeriveDeferred = createDeferred<string>();
+    mockGetGlobalDeriveType.mockReturnValueOnce(globalDeriveDeferred.promise);
+    const initialSelection = {
+      ...createHdSelectedAccount('hd-1--0'),
+      networkId: 'evm--1',
+    };
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: initialSelection });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let syncPromise: Promise<unknown> | undefined;
+    await act(async () => {
+      syncPromise = result.current.syncLocalDeriveTypeFromGlobal({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+      });
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      store.set(selectedAccountsAtom(), {
+        0: { ...initialSelection, networkId: 'btc--0' },
+      });
+      globalDeriveDeferred.resolve('ledger_live');
+      await syncPromise;
+    });
+
+    // The first sync was resolved for evm--1 and must not land on btc--0.
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      deriveType: 'default',
+      networkId: 'btc--0',
+    });
+
+    mockGetGlobalDeriveType.mockResolvedValueOnce('BIP86');
+    await act(async () => {
+      await result.current.syncLocalDeriveTypeFromGlobal({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+      });
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      deriveType: 'BIP86',
+      networkId: 'btc--0',
+    });
+  });
+
   it('does not let auto-select overwrite a selection changed while resolving a wallet', async () => {
     const walletDeferred = createDeferred<IWallet | undefined>();
     mockGetWalletSafe.mockReturnValueOnce(walletDeferred.promise);

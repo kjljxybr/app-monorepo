@@ -50,6 +50,22 @@ describe('startViewTransition', () => {
     expect(queueMicrotaskMock).not.toHaveBeenCalled();
   });
 
+  it('consumes AbortError rejections regardless of engine-specific message', async () => {
+    // Safari/Firefox reject skipped transitions with AbortError but different
+    // message text than Chromium; only the error name is specified.
+    const error = new Error('The operation was aborted.');
+    error.name = 'AbortError';
+    const queueMicrotaskMock = mockQueueMicrotask();
+    mockStartViewTransition(Promise.reject(error));
+    const callback = jest.fn();
+
+    startViewTransition(callback);
+    await Promise.resolve();
+
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(queueMicrotaskMock).not.toHaveBeenCalled();
+  });
+
   it('rethrows unexpected transition failures in a microtask', async () => {
     const error = new Error('Unexpected transition failure');
     const queueMicrotaskMock = mockQueueMicrotask();

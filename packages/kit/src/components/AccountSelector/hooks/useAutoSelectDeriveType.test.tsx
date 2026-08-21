@@ -62,6 +62,10 @@ jest.mock('../../../background/instance/backgroundApiProxy', () => ({
   },
 }));
 
+// Mutable so a test can move the active network and rerender, driving the
+// main effect's networkId dependency the way a real network switch does.
+let mockActiveNetworkId = 'evm--1';
+
 jest.mock('../../../states/jotai/contexts/accountSelector', () => ({
   useAccountSelectorSceneInfo: () => ({
     sceneName: 'home',
@@ -72,7 +76,7 @@ jest.mock('../../../states/jotai/contexts/accountSelector', () => ({
     activeAccount: {
       deriveInfo: undefined,
       isOthersWallet: false,
-      network: { id: 'evm--1' },
+      network: { id: mockActiveNetworkId },
     },
   }),
 }));
@@ -183,6 +187,7 @@ describe('useAutoSelectDeriveType global sync outcome', () => {
 describe('useAutoSelectDeriveType global derive type event', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockActiveNetworkId = 'evm--1';
     mockSyncLocalDeriveTypeFromGlobal.mockResolvedValue({
       globalDeriveType: 'default',
       selectionResult: { outcome: 'commit' },
@@ -226,6 +231,37 @@ describe('useAutoSelectDeriveType global derive type event', () => {
     });
     expect(mockSyncLocalDeriveTypeFromGlobal).toHaveBeenLastCalledWith(
       expect.objectContaining({ source: 'global-event' }),
+    );
+  });
+
+  it('does not retry a stale event sync; a network change re-syncs instead', async () => {
+    // The event sync is a level-triggered reconciliation with no retry by
+    // design: every change that can drop it as stale ships its own successor.
+    // This locks both halves: no second sync fires for the stale result, and
+    // the networkId dependency of the main effect issues the fresh one.
+    const rendered = await mountAndSettleInitialSync();
+    mockSyncLocalDeriveTypeFromGlobal.mockResolvedValue({
+      globalDeriveType: 'default',
+      selectionResult: { outcome: 'stale' },
+    });
+
+    getLastGlobalDeriveTypeListener()?.({ networkImpl: 'evm' });
+    await waitFor(() => {
+      expect(mockSyncLocalDeriveTypeFromGlobal).toHaveBeenCalledTimes(1);
+    });
+    // Let any hypothetical retry win its microtask/timer race before asserting.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(mockSyncLocalDeriveTypeFromGlobal).toHaveBeenCalledTimes(1);
+
+    mockActiveNetworkId = 'btc--0';
+    rendered.rerender();
+    await waitFor(() => {
+      expect(mockSyncLocalDeriveTypeFromGlobal).toHaveBeenCalledTimes(2);
+    });
+    expect(mockSyncLocalDeriveTypeFromGlobal).toHaveBeenLastCalledWith(
+      expect.objectContaining({ source: 'network-change' }),
     );
   });
 

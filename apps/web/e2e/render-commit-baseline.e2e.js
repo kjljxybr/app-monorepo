@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /*
- * Cross-branch React render baseline for account-selector UI flows (v2).
+ * Cross-branch React render baseline for account-selector UI flows (v3).
  *
  * Purpose
  * -------
@@ -28,9 +28,12 @@
  *     beyond the reload throttle) and measure what each no-op reload cycle
  *     costs between quiescent points. This is the decisive phase for reload
  *     dedup work: a branch that gates deep-equal rebuilds writes nothing.
- * Interactive phases run RENDER_BASELINE_ITERATIONS times (default 5);
+ * Interactive phases first run 1 unmeasured warm-up iteration (v3: the first
+ * pass through a phase pays one-time lazy-mount spikes that distorted v2
+ * medians), then RENDER_BASELINE_ITERATIONS measured iterations (default 5);
  * background-churn performs RENDER_BASELINE_CHURN_EMITS emits (default 10),
- * one measured iteration per emit.
+ * one measured iteration per emit and no warm-up (its first emit shows no
+ * systematic spike).
  *
  * Fixture: 3 HD wallets x 2 indexed accounts (public BIP39 test mnemonics),
  * chain accounts on evm--1 + btc--0 with the default derive type = 12 chain
@@ -55,7 +58,7 @@
  *      "test:e2e:web:render-baseline": "node apps/web/e2e/render-commit-baseline.e2e.js"
  * 2. Run `yarn test:e2e:web:render-baseline` there exactly as here.
  * 3. Diff the two JSON artifacts written to .tmp/render-baseline/
- *    (<git-short-sha>-<branch>-v2.json) phase by phase.
+ *    (<git-short-sha>-<branch>-v3.json) phase by phase.
  *
  * Comparability caveats
  * ---------------------
@@ -84,12 +87,18 @@ const artifactDir =
   process.env.RENDER_BASELINE_ARTIFACT_DIR ||
   path.join(repoRoot, '.tmp', 'render-baseline');
 
-const METRICS_VERSION = 2;
+const METRICS_VERSION = 3;
 
 const RENDERER_TIMEOUT_MS =
   Number(process.env.WEB_E2E_RENDERER_TIMEOUT_MS) || 180_000;
 const PAGE_TIMEOUT_MS = Number(process.env.WEB_E2E_PAGE_TIMEOUT_MS) || 120_000;
 const ITERATIONS = Number(process.env.RENDER_BASELINE_ITERATIONS) || 5;
+// v3: unmeasured warm-up iterations before each interactive phase's measured
+// iterations. The first pass through a phase systematically pays one-time
+// lazy-mount spikes (modal contents, tab pages), which distorted v2 medians;
+// warming the phase up removes that spike from the measured samples.
+// background-churn opts out (its first emit shows no systematic spike).
+const WARMUP_ITERATIONS = 1;
 // Commit quiescence: a phase (or the pre-phase settle) is considered rendered
 // out when no new React commit landed for this long.
 const QUIET_MS = Number(process.env.RENDER_BASELINE_QUIET_MS) || 800;
@@ -1064,9 +1073,11 @@ async function measurePhase(
   page,
   phaseName,
   runIteration,
-  { iterations = ITERATIONS } = {},
+  { iterations = ITERATIONS, warmupIterations = WARMUP_ITERATIONS } = {},
 ) {
-  log(`phase ${phaseName}: ${iterations} iterations`);
+  log(
+    `phase ${phaseName}: ${warmupIterations} warm-up + ${iterations} measured iterations`,
+  );
   const commitDeltas = [];
   const renderedComponentDeltas = [];
   const maxRenderedInCommitPerIteration = [];
@@ -1074,7 +1085,25 @@ async function measurePhase(
   const longTaskDeltas = [];
   const wallMs = [];
   let missingDurationCommits = 0;
-  for (let iteration = 0; iteration < iterations; iteration += 1) {
+  // The flow-iteration index keeps counting across warm-up and measured
+  // iterations, so the alternating flows (account-switch, network-switch)
+  // keep alternating seamlessly instead of repeating the warm-up target as a
+  // degenerate same-target switch in the first measured iteration. A warm-up
+  // failure intentionally fails the phase exactly like a measured-iteration
+  // failure: if the flow cannot complete, the environment is broken and any
+  // measured numbers would be meaningless.
+  // Warm-up: run the same flow and settle the same way, record nothing.
+  for (let warmup = 0; warmup < warmupIterations; warmup += 1) {
+    await page.waitForTimeout(PHASE_SETTLE_MS);
+    await waitForCommitQuiescence(page);
+    await runIteration(warmup);
+    await waitForCommitQuiescence(page);
+  }
+  for (
+    let iteration = warmupIterations;
+    iteration < warmupIterations + iterations;
+    iteration += 1
+  ) {
     await page.waitForTimeout(PHASE_SETTLE_MS);
     await waitForCommitQuiescence(page);
     const before = await readCounters(page);
@@ -1124,6 +1153,7 @@ async function measurePhase(
     renderedComponentDeltas,
     renderedComponents: summarize(renderedComponentDeltas),
     wallMs: summarize(wallMs),
+    warmupIterations,
   };
   log(
     `phase ${phaseName}: commits/iter median=${result.commits.median} ` +
@@ -1236,7 +1266,7 @@ async function main() {
         page,
         'background-churn',
         () => flowBackgroundChurn(page),
-        { iterations: CHURN_EMITS },
+        { iterations: CHURN_EMITS, warmupIterations: 0 },
       ),
     );
 
@@ -1270,6 +1300,7 @@ async function main() {
       totalRenderedComponents: finalCounters.renderedComponents,
       walkErrors: finalCounters.walkErrors,
       walkOverflows: finalCounters.walkOverflows,
+      warmupIterations: WARMUP_ITERATIONS,
     };
     const sanitizedBranch = git.branch.replace(/[^a-zA-Z0-9._-]+/g, '_');
     const artifactPath = path.join(

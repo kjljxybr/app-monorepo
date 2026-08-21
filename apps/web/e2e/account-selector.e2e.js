@@ -2346,6 +2346,63 @@ async function selectNetwork(
   }
 }
 
+// Production keeps the single-network tab identical to a plain chain list —
+// it renders no All Networks row — so the unified selector's only real UI
+// gesture that moves a single-chain selection to All Networks is the
+// portfolio tab's confirm flow: handlePortfolioDone
+// (UnifiedNetworkSelector/index.tsx) commits the selection with reason
+// 'unifiedNetworkEnableFlow' and closes the modal via resetChainSelectorModal.
+async function selectAllNetworksViaPortfolioDone(page) {
+  const trigger = await getUniqueVisibleByTestIDs(page, [
+    AccountSelectorTestIDs.networkTrigger,
+    AccountSelectorTestIDs.allNetworksTrigger,
+  ]);
+  await trigger.click({ timeout: pageTimeoutMs });
+
+  const portfolioTab = await getUniqueVisibleByTestID(
+    page,
+    'unified-network-selector-portfolio-tab',
+  );
+  await portfolioTab.click({ timeout: pageTimeoutMs });
+
+  // ChainSelectorTestIDs.unifiedPortfolioConfirmBtn renders the footer button
+  // as a real <button>, so disabled/aria-disabled mirror isConfirmDisabled.
+  // The label must read exactly "Done" before the press: any other label means
+  // the confirm would do more than switch the selection — "No networks
+  // selected" means the enabled set never resolved, and the create-address
+  // variant would mutate the fixture wallet with new addresses. Both are setup
+  // bugs this scenario must fail on rather than absorb into the click.
+  const confirmButton = await getUniqueVisibleByTestID(
+    page,
+    'page-footer-confirm',
+  );
+  const deadline = Date.now() + pageTimeoutMs;
+  for (;;) {
+    const state = await confirmButton.evaluate((node) => ({
+      disabled:
+        node.hasAttribute('disabled') ||
+        node.getAttribute('aria-disabled') === 'true',
+      label: node.textContent?.trim() ?? '',
+    }));
+    if (!state.disabled) {
+      assert.equal(
+        state.label,
+        'Done',
+        'Portfolio confirm must be a pure selection switch; another label means it would create addresses or has nothing enabled',
+      );
+      break;
+    }
+    assert.ok(
+      Date.now() < deadline,
+      `Portfolio confirm button stayed disabled (label: ${state.label})`,
+    );
+    await page.waitForTimeout(50);
+  }
+  await confirmButton.click({ timeout: pageTimeoutMs });
+  await waitForNoVisibleTestID(page, 'unified-network-selector-portfolio-tab');
+  await waitForPersistedSelection(page, { networkId: allNetworksNetworkId });
+}
+
 function getAccountDerivationSettingsNetworkId(networkId) {
   if (networkId.startsWith('evm--')) {
     return 'evm--1';
@@ -3835,6 +3892,19 @@ function selectedAccountIdentity(selection) {
   };
 }
 
+// Every num a connection persists, not just one: assertions that must prove an
+// event changed nothing need the whole map, since a stray write can land on a
+// num the scenario never rendered.
+async function readDAppAccountSelectorMap(page, origin) {
+  return page.evaluate(
+    ({ sceneUrl }) =>
+      globalThis.$$appGlobals.$backgroundApiProxy.simpleDb.dappConnection.getAccountSelectorMap(
+        { sceneUrl },
+      ),
+    { sceneUrl: origin },
+  );
+}
+
 async function openDAppConnectionList(page) {
   await page.evaluate(() => {
     globalThis.$$appGlobals.$rootAppNavigation.pushModal(
@@ -4215,6 +4285,10 @@ async function runSimulatedDAppScenario(page, devOnlyPassword, fixture) {
     sceneUrl: simulatedDAppOrigin,
   });
 
+  const dappMapBeforeIgnoredEvents = await readDAppAccountSelectorMap(
+    page,
+    simulatedDAppOrigin,
+  );
   await page.evaluate(
     ({ origin }) => {
       const eventBus = globalThis.$$appGlobals.$appEventBus;
@@ -4235,15 +4309,42 @@ async function runSimulatedDAppScenario(page, devOnlyPassword, fixture) {
   );
   await page.waitForTimeout(500);
   const ignoredEventTrace = await drainPerfTrace(page, devOnlyPassword);
+  // The two events above are rejected by different mechanisms, so they are
+  // asserted separately rather than as one "no request at all" check.
+  //
+  // The wrong-origin event carries num 0 — this instance's OWN num — so the
+  // only thing that can stop it is the sceneUrl guard in
+  // AccountSelectorEffects' updateNetwork handler. A 'dappNetworkEvent'
+  // request on num 0 therefore means one DApp origin steered another origin's
+  // selection, which is the cross-origin isolation this phase exists to
+  // protect.
+  //
+  // The origin-matching event carries num 1 and is deliberately NOT filtered
+  // by num: updateNetwork routes on scene identity alone so that whichever
+  // instance is mounted applies the event on behalf of params.num, because the
+  // instance for that num may not be mounted at all (see the comment on
+  // updateNetwork in AccountSelectorEffects.tsx). It may therefore legitimately
+  // enter updateSelectedAccount — what it must never do is change a persisted
+  // selection, which the map comparison below covers for every num.
   assert.deepEqual(
     ignoredEventTrace.events.filter(
       (event) =>
         event.event === 'selectionUpdateRequested' &&
-        event.reason === 'dappNetworkEvent',
+        event.reason === 'dappNetworkEvent' &&
+        event.num !== 1,
     ),
     [],
-    'Mismatched DApp sceneUrl/num events must not update selection',
+    'A DApp network event must only reach the num it targets; a request on any other num means the wrong-origin event crossed the sceneUrl guard',
   );
+  assert.deepEqual(
+    await readDAppAccountSelectorMap(page, simulatedDAppOrigin),
+    dappMapBeforeIgnoredEvents,
+    'Neither a wrong-origin nor a wrong-num DApp network event may change any persisted connection selection',
+  );
+  await assertAccountSelectorStateConsistent(page, target, {
+    sceneName: 'discover',
+    sceneUrl: simulatedDAppOrigin,
+  });
 
   await page.evaluate(
     async ({ origin }) => {
@@ -5406,7 +5507,11 @@ async function runStressInteractions(page, fixture, devOnlyPassword) {
 }
 
 // All Networks (onekeyall--0) round-trip through the real UI:
-// 1. select All Networks in the unified network selector (userSelectNetwork),
+// 1. enter All Networks through the portfolio tab's confirm flow — the
+//    product keeps the single-network tab free of any All Networks row, so
+//    the unified selector's only real entry is handlePortfolioDone, which
+//    commits with reason 'unifiedNetworkEnableFlow'
+//    (UnifiedNetworkSelector/index.tsx),
 // 2. select a different account while All Networks is active — this walks
 //    confirmAccountSelect's all-networks fallback end-to-end (the HD fixture
 //    wallet has compatible enabled networks, so getAllNetworksFallbackNetworkId
@@ -5457,9 +5562,9 @@ async function runAllNetworksSelectionScenario(page, fixture, devOnlyPassword) {
     }),
   );
 
-  log('all-networks: select All Networks via the unified network selector');
+  log('all-networks: enable All Networks via the portfolio tab confirm flow');
   await drainResidualPerfTrace(page, devOnlyPassword);
-  await selectNetwork(page, allNetworksNetworkId);
+  await selectAllNetworksViaPortfolioDone(page);
   await assertAccountSelectorStateConsistent(page, firstTarget, {
     expectAllNetworks: true,
   });
@@ -5468,14 +5573,14 @@ async function runAllNetworksSelectionScenario(page, fixture, devOnlyPassword) {
     devOnlyPassword,
     {
       expectActiveReload: true,
-      reason: 'userSelectNetwork',
+      reason: 'unifiedNetworkEnableFlow',
     },
   );
   assertSelectionOperationBudget(enterTrace, {
     expectedActiveReloads: 1,
     expectedSelectionUpdates: 1,
-    label: 'all-networks network selection',
-    reason: 'userSelectNetwork',
+    label: 'all-networks portfolio enable flow',
+    reason: 'unifiedNetworkEnableFlow',
   });
   traces.push(enterTrace);
 

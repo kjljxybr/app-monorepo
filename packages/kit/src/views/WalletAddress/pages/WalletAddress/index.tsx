@@ -109,7 +109,13 @@ function WalletAddressListItemIcon({
 }
 const WalletAddressListItemIconMemo = memo(WalletAddressListItemIcon);
 
-function SingleWalletAddressListItem({ network }: { network: IServerNetwork }) {
+// Exported for tests only (render-prop identity guard in
+// SingleWalletAddressListItem.test.tsx).
+export function SingleWalletAddressListItem({
+  network,
+}: {
+  network: IServerNetwork;
+}) {
   const intl = useIntl();
   const [loading, setLoading] = useState(false);
   const {
