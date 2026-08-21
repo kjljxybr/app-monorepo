@@ -82,7 +82,6 @@ const PUBLIC_TEST_MNEMONIC =
 const WALLET_MODE_STORAGE_KEY = '$onekey_web_dapp_mode';
 const TEST_IDS = {
   accountItem: (index) => `account-item-index-${index}`,
-  accountName: 'account-name',
   accountTrigger: 'AccountSelectorTriggerBase',
   networkTrigger: 'account-network-trigger-button',
   networkTriggerText: 'account-network-trigger-button-text',
@@ -747,14 +746,20 @@ async function flowAccountSwitch(page, fixture, iteration) {
   await waitForPersistedSelection(page, {
     indexedAccountId: fixture.indexedAccountIds[targetIndex],
   });
+  // The desktop-web header renders the trigger in horizontal layout, and on
+  // origin/x that layout's account label carries no "account-name" testID
+  // (feature branches tag both layouts). Read the trigger container instead:
+  // it exists on both branches and always wraps the displayed account label.
   await page.waitForFunction(
     ({ expectedName, selector }) => {
-      const node = globalThis.document.querySelector(selector);
-      return Boolean(node && node.textContent?.includes(expectedName));
+      const nodes = globalThis.document.querySelectorAll(selector);
+      return Array.from(nodes).some((node) =>
+        node.textContent?.includes(expectedName),
+      );
     },
     {
       expectedName: targetName,
-      selector: `[data-testid=${JSON.stringify(TEST_IDS.accountName)}]`,
+      selector: `[data-testid=${JSON.stringify(TEST_IDS.accountTrigger)}]`,
     },
     { timeout: PAGE_TIMEOUT_MS },
   );
