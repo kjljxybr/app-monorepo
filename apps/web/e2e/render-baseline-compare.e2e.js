@@ -11,18 +11,24 @@
  *   2. Candidate target: the current repo's committed HEAD. A dirty worktree
  *      only produces a warning: the clones measure the COMMIT, never
  *      uncommitted changes (by design - numbers must describe a sha).
- *   3. Both targets are measured in disposable shallow clones created from the
- *      LOCAL repository over file:// (no network), under
- *      .tmp/render-baseline-clones/ in this repo (gitignored). Clones for the
- *      same sha are reused across invocations when node_modules is present
- *      (saves ~4 minutes per rerun); RENDER_BASELINE_FRESH=1 forces fresh
- *      clones. Each clone costs roughly 8GB of disk; purge with
+ *   3. Both targets are measured in disposable local clones under
+ *      .tmp/render-baseline-clones/ in this repo (gitignored). Each clone is a
+ *      `git clone --no-checkout <localRepoPath>` (plain path, NOT file://, so
+ *      git's local transport hardlinks the object database - near-instant and
+ *      near-zero additional disk for .git) followed by a detached
+ *      `git checkout <sha>`. Because the object store is shared, ANY commit
+ *      present in the local repository is directly checkoutable - no fetch,
+ *      no deepening. Never `git clone -b x` (the local x branch is often
+ *      stale - the number one pitfall); the pinned sha is checked out
+ *      directly. Clones for the same sha are reused across invocations when
+ *      node_modules is present (saves ~4 minutes per rerun);
+ *      RENDER_BASELINE_FRESH=1 forces fresh clones. Each clone still costs
+ *      roughly 8GB of disk (working tree + node_modules); purge with
  *      `rm -rf .tmp/render-baseline-clones` (or RENDER_BASELINE_CLEANUP=1).
- *   4. The x clone cannot use `git clone -b x` (the local x branch is often
- *      stale - the number one pitfall): it is built with git init + a depth-1
- *      fetch of refs/remotes/origin/x, then deepened progressively
- *      (--deepen 50 -> --deepen 500 -> --unshallow) until the pinned sha is
- *      present, and checked out detached at the pinned sha.
+ *   4. Hardlink caveat: the clones share the main repo's object files via
+ *      hardlinks. An aggressive `git gc --prune` in the main repo could only
+ *      race the brief clone step itself; once a clone exists its hardlinks
+ *      keep the objects alive independently. Negligible for a ~10-minute run.
  *   5. The harness is copied from the CANDIDATE CLONE (the committed version)
  *      into the x clone byte-identical, and the one-line
  *      test:e2e:web:render-baseline script is injected into the x clone's
@@ -40,7 +46,7 @@
  * This driver requires nothing beyond Node builtins.
  */
 
-// cspell:ignore pgrep
+// cspell:ignore pgrep hardlink hardlinks checkoutable
 
 const { execFileSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
@@ -224,27 +230,33 @@ function resolvePinnedXCommit() {
 }
 
 function assertPinnedShaReachable(xSha) {
+  // Hard requirement: the clones hardlink this repo's object store, so the
+  // pinned commit must exist HERE for the detached checkout to work.
   if (!hasCommit(repoRoot, xSha)) {
     throw new Error(
       `Pinned x commit ${xSha} is not present in the local repository. Run ` +
         `\`git fetch origin x\` in ${repoRoot} and retry.`,
     );
   }
+  // Soft sanity check only: with direct checkout, ancestry of origin/x is no
+  // longer needed for reachability, but a pinned commit that is not on the
+  // local origin/x usually means a typo'd sha or a stale remote-tracking ref,
+  // so it is worth a warning.
   const originX = tryGit(['rev-parse', 'refs/remotes/origin/x'], repoRoot);
   if (!originX) {
-    throw new Error(
-      `refs/remotes/origin/x does not exist in ${repoRoot}; the x clone is ` +
-        'built from that remote-tracking ref. Run `git fetch origin x` first.',
+    log(
+      'WARNING: refs/remotes/origin/x does not exist locally; cannot sanity ' +
+        'check that the pinned commit is on x',
     );
+    return null;
   }
   const isAncestor =
     tryGit(['merge-base', '--is-ancestor', xSha, originX], repoRoot) !== null;
   if (!isAncestor && xSha !== originX) {
-    throw new Error(
-      `Pinned x commit ${xSha} is not an ancestor of local origin/x ` +
-        `(${originX}), so deepening a fetch of refs/remotes/origin/x can ` +
-        'never reach it. Run `git fetch origin x` to update the ' +
-        'remote-tracking ref, or override RENDER_BASELINE_X_COMMIT.',
+    log(
+      `WARNING: pinned x commit ${xSha} is not an ancestor of local ` +
+        `origin/x (${originX}) - measuring it anyway, but verify it really ` +
+        'is an x commit (or run `git fetch origin x` to refresh the ref)',
     );
   }
   return originX;
@@ -265,132 +277,28 @@ function cloneHasInstall(dir) {
   return fs.existsSync(path.join(dir, 'node_modules'));
 }
 
-async function prepareCandidateClone({ branch, logFile, sha }) {
-  const dir = path.join(clonesRoot, `candidate-${sha.slice(0, 7)}`);
+// One strategy for both targets: a --no-checkout clone of the LOCAL repo by
+// plain path (git's local transport hardlinks the object database -
+// near-instant, near-zero additional disk for .git) followed by a detached
+// checkout of the exact sha. Because the object store is shared, any commit
+// present in the local repository is directly checkoutable - branch names
+// (including the often-stale local `x`) are never trusted, and a source HEAD
+// moving mid-run cannot invalidate the clone.
+function prepareClone({ label, sha }) {
+  const dir = path.join(clonesRoot, `${label}-${sha.slice(0, 7)}`);
   if (!FRESH_CLONES && cloneIsAtSha(dir, sha)) {
-    log(`candidate clone reused at ${dir}`);
+    log(`${label} clone reused at ${dir}`);
     return { dir, reusedClone: true };
   }
   fs.rmSync(dir, { force: true, recursive: true });
-  const fileUrl = `file://${repoRoot}`;
-  const fetchDetached = async (refOrSha) => {
-    fs.mkdirSync(dir, { recursive: true });
-    git(['init', '-q'], dir);
-    await runStreaming({
-      args: ['fetch', '--progress', '--depth', '1', fileUrl, refOrSha],
-      command: 'git',
-      cwd: dir,
-      env: process.env,
-      logFile,
-      prefix: '[candidate]',
-    });
-    git(
-      ['-c', 'advice.detachedHead=false', 'checkout', '-q', 'FETCH_HEAD'],
-      dir,
-    );
-  };
-  if (branch) {
-    log(`candidate clone: shallow clone of branch ${branch}`);
-    await runStreaming({
-      args: ['clone', '--progress', '--depth', '1', '-b', branch, fileUrl, dir],
-      command: 'git',
-      cwd: repoRoot,
-      env: process.env,
-      logFile,
-      prefix: '[candidate]',
-    });
-  } else {
-    // Detached HEAD in the source repo: no branch to clone, fetch HEAD itself.
-    log('candidate clone: detached HEAD, fetching HEAD directly');
-    await fetchDetached('HEAD');
-  }
+  log(`${label} clone: local hardlink clone + detached checkout of ${sha}`);
+  git(['clone', '--no-checkout', '--quiet', repoRoot, dir], repoRoot);
+  git(
+    ['-c', 'advice.detachedHead=false', 'checkout', '--detach', '--quiet', sha],
+    dir,
+  );
   if (!cloneIsAtSha(dir, sha)) {
-    // The branch tip moved between rev-parse and clone (a commit landed
-    // mid-run). Retry once with a direct sha fetch; local repos refuse
-    // unadvertised shas by default, so this may still fail - then the run
-    // must simply be restarted from the new HEAD.
-    log(`candidate clone HEAD mismatch, retrying with direct sha fetch`);
-    fs.rmSync(dir, { force: true, recursive: true });
-    try {
-      await fetchDetached(sha);
-    } catch (error) {
-      throw new Error(
-        `Candidate clone could not be pinned to ${sha}: the source HEAD ` +
-          'appears to have moved during the run. Re-run the compare.',
-        { cause: error },
-      );
-    }
-  }
-  if (!cloneIsAtSha(dir, sha)) {
-    throw new Error(`Candidate clone at ${dir} is not at expected ${sha}`);
-  }
-  return { dir, reusedClone: false };
-}
-
-async function prepareXClone({ logFile, sha }) {
-  const dir = path.join(clonesRoot, `x-${sha.slice(0, 7)}`);
-  if (!FRESH_CLONES && cloneIsAtSha(dir, sha)) {
-    log(`x clone reused at ${dir}`);
-    return { dir, reusedClone: true };
-  }
-  fs.rmSync(dir, { force: true, recursive: true });
-  fs.mkdirSync(dir, { recursive: true });
-  git(['init', '-q'], dir);
-  const fileUrl = `file://${repoRoot}`;
-  const fetchX = async (depthArgs) => {
-    await runStreaming({
-      args: [
-        'fetch',
-        '--progress',
-        ...depthArgs,
-        fileUrl,
-        'refs/remotes/origin/x',
-      ],
-      command: 'git',
-      cwd: dir,
-      env: process.env,
-      logFile,
-      prefix: '[x]',
-    });
-  };
-  log('x clone: depth-1 fetch of refs/remotes/origin/x');
-  try {
-    await fetchX(['--depth', '1']);
-  } catch (error) {
-    throw new Error(
-      'Fetching refs/remotes/origin/x from the local repository failed. Run ' +
-        `\`git fetch origin x\` in ${repoRoot} and retry.`,
-      { cause: error },
-    );
-  }
-  // If origin/x moved past the pinned sha, the depth-1 fetch only holds the
-  // newer tip; deepen progressively until the pinned commit is present.
-  const deepenSteps = [
-    ['--deepen', '50'],
-    ['--deepen', '500'],
-    ['--unshallow'],
-  ];
-  for (const step of deepenSteps) {
-    if (hasCommit(dir, sha)) {
-      break;
-    }
-    if (tryGit(['rev-parse', '--is-shallow-repository'], dir) !== 'true') {
-      break; // full history already fetched; deepening further is impossible
-    }
-    log(`x clone: pinned sha not yet present, fetching ${step.join(' ')}`);
-    // eslint-disable-next-line no-await-in-loop
-    await fetchX(step);
-  }
-  if (!hasCommit(dir, sha)) {
-    throw new Error(
-      `Pinned x commit ${sha} is unreachable from local origin/x even after ` +
-        `a full fetch. Run \`git fetch origin x\` in ${repoRoot} first, or ` +
-        'override RENDER_BASELINE_X_COMMIT.',
-    );
-  }
-  git(['-c', 'advice.detachedHead=false', 'checkout', '-q', sha], dir);
-  if (!cloneIsAtSha(dir, sha)) {
-    throw new Error(`x clone at ${dir} is not at expected ${sha}`);
+    throw new Error(`${label} clone at ${dir} is not at expected ${sha}`);
   }
   return { dir, reusedClone: false };
 }
@@ -724,15 +632,11 @@ async function main() {
   if (FRESH_CLONES) {
     log('RENDER_BASELINE_FRESH=1: ignoring any cached clones');
   }
-  const candidateClone = await prepareCandidateClone({
-    branch: candidateBranch,
-    logFile: prepareLog('candidate'),
+  const candidateClone = prepareClone({
+    label: 'candidate',
     sha: candidateSha,
   });
-  const xClone = await prepareXClone({
-    logFile: prepareLog('x'),
-    sha: xSha,
-  });
+  const xClone = prepareClone({ label: 'x', sha: xSha });
   const candidateInstall = await installDependencies({
     dir: candidateClone.dir,
     logFile: prepareLog('candidate'),

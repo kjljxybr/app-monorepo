@@ -104,16 +104,21 @@ What the driver does, in order:
    describe a commit.
 2. Refuses to start while another render measurement or account-selector e2e
    is running (`pgrep`), and prints the idle-machine requirement.
-3. Prepares two disposable shallow clones under `.tmp/render-baseline-clones/`
-   in this repo (gitignored), cloning from the LOCAL repository over
-   `file://` - no network. The candidate side is a plain `--depth 1 -b
-   <branch>` clone (detached HEAD is handled by fetching `HEAD` directly).
-   The x side never trusts the often-stale local `x` branch: it is built with
-   `git init` plus a depth-1 fetch of `refs/remotes/origin/x`, deepened
-   progressively (`--deepen 50` -> `--deepen 500` -> `--unshallow`) until the
-   pinned sha is present, then checked out detached at the pinned sha - the
-   robust path for a pinned commit behind a moving origin/x. If the sha is
-   unreachable, it fails telling you to `git fetch origin x` first.
+3. Prepares two disposable local clones under `.tmp/render-baseline-clones/`
+   in this repo (gitignored). Each side is `git clone --no-checkout
+   <repoPath>` (a plain path, not `file://`, so git's local transport
+   hardlinks the object database - near-instant and near-zero additional
+   disk for `.git`) followed by a detached `git checkout <sha>`. The shared
+   object store makes any commit present in the local repository directly
+   checkoutable, so branch names (including the often-stale local `x`) are
+   never trusted and no fetching or deepening is involved. Pre-flight
+   requires the pinned sha to exist locally (`git cat-file -e`) and fails
+   with `git fetch origin x` guidance when it does not; a pinned sha that is
+   not an ancestor of local origin/x only warns - with direct checkout that
+   check is a typo guard, not a reachability requirement. Hardlink caveat:
+   an aggressive `git gc --prune` in the main repo could only race the brief
+   clone step itself; once a clone exists, its hardlinks keep the objects
+   alive independently of the main repo.
 4. Runs `yarn install` in each clone as needed (~2 minutes each with a warm
    cache).
 5. Copies the harness from the CANDIDATE CLONE (the committed version) into
@@ -134,8 +139,10 @@ What the driver does, in order:
    are printed) for diagnosis. Per-step logs live under
    `.tmp/render-baseline/runs/`.
 
-Expect roughly 40-50 minutes for a cold run (two clones, two installs, two
-measured runs). Reruns reuse cached clones and skip clone+install.
+With a warm yarn cache a cold run takes roughly 10-12 minutes (clones are
+near-instant, the two installs run ~2 minutes each, the two measurements ~4
+minutes each); a cold yarn cache adds package download time. Reruns reuse
+cached clones and skip clone+install (~8 minutes total).
 
 Env knobs:
 
@@ -144,14 +151,16 @@ Env knobs:
 | `RENDER_BASELINE_X_COMMIT` | pinned constant | Baseline commit. Full 40-char shas are used as-is; anything else is resolved in the local repo (prefer `origin/x` after a fetch - a bare `x` resolves the often-stale local branch). |
 | `RENDER_BASELINE_FRESH` | unset | `1` ignores cached clones and rebuilds them from scratch. |
 | `RENDER_BASELINE_CLEANUP` | unset | `1` deletes the clone cache after a successful run. |
-| `RENDER_BASELINE_CLONES_DIR` | `.tmp/render-baseline-clones` | Where the clones live (put them on another disk if needed). |
+| `RENDER_BASELINE_CLONES_DIR` | `.tmp/render-baseline-clones` | Where the clones live. On the same volume as the repo git hardlinks the object store; a different volume falls back to copying it. |
 | `RENDER_BASELINE_ITERATIONS`, other `RENDER_BASELINE_*`, `WEB_E2E_*` | harness defaults | Passed through unchanged to BOTH measured runs. |
 
 Clone cache: after a successful run the two clones for the current sha pair
 are kept for reuse (a rerun on the same shas skips clone+install, saving
 about 4 minutes per clone) and clones for any other shas are pruned. Each
-clone costs about 8GB of disk; purge with
-`rm -rf .tmp/render-baseline-clones` or `RENDER_BASELINE_CLEANUP=1`.
+clone costs about 8GB of disk - almost entirely node_modules plus the
+checked-out working tree; the hardlinked `.git` object store adds nearly
+nothing. Purge with `rm -rf .tmp/render-baseline-clones` or
+`RENDER_BASELINE_CLEANUP=1`.
 
 Pinned-commit policy: the x side is pinned so that every future run compares
 against the same baseline the recorded pair describes, even as origin/x moves
@@ -166,7 +175,11 @@ automatically.
 ## Appendix: manual recipe (kept for debugging the driver)
 
 Both recorded pairs were produced with this manual protocol before it was
-codified into the driver above. Never run a measurement inside a development
+codified into the driver above. (The driver initially codified this exact
+protocol - `file://` shallow clones plus a progressive `--deepen` ladder -
+and was later simplified to local hardlink clones with direct detached
+checkout; the recipe below is kept as history and as a fallback for
+debugging.) Never run a measurement inside a development
 worktree that has uncommitted changes: the dev server compiles whatever is on
 disk, so the numbers stop describing any commit, and the run competes with
 in-progress work.
