@@ -36,6 +36,18 @@ export enum ESelectionUpdateOutcome {
   Error = 'error',
   Noop = 'noop',
   SkipEmpty = 'skip-empty',
+  // Compare-if-newer drops for event-driven updates (`eventUpdatedAt`): the
+  // event's own source revision lost against the revision already committed,
+  // which is the sync protocol converging, not a caller losing its update.
+  // Kept apart from Stale so they never feed the repeated-stale-drop alert.
+  SkipEqualEventConflict = 'skip-equal-event-conflict',
+  SkipOlderEvent = 'skip-older-event',
+  // An event that carried no source revision (`eventUpdatedAt: null`) arrived
+  // while this runtime already holds a committed revision. Such events are
+  // cold-start replays of a disk snapshot, not user actions, so they may only
+  // fill a slot that has no revision at all. Same family as the two skips
+  // above: protocol convergence, never counted toward the stale-drop alert.
+  SkipUnversionedEvent = 'skip-unversioned-event',
   Stale = 'stale',
 }
 
@@ -60,6 +72,10 @@ export enum EAccountSelectOutcome {
 export enum ECrossSceneSyncOutcome {
   Error = 'error',
   SkipPolicy = 'skip-policy',
+  // Only for a same-scene event that is this runtime's own local echo (no
+  // $$isRemoteEvent). A same-scene event from a peer runtime is applied
+  // through compare-if-newer and forwards the selection-update verdict
+  // (commit/noop/skip-*) instead.
   SkipSameScene = 'skip-same-scene',
   StaleBeforeFix = 'stale-before-fix',
 }

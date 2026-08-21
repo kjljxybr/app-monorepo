@@ -235,7 +235,13 @@ export function useAccountSelectorAvailableNetworksByNum(num: number) {
 }
 export type IAccountSelectorUpdateMeta = {
   eventEmitDisabled: boolean;
-  updatedAt: number;
+  // The selection's committed revision. Undefined means the slot holds a value
+  // that was applied from an unversioned source (cold-start storage apply, an
+  // event that carried no revision) and therefore claims no ordering: any
+  // event with a real revision may replace it, and the next local commit mints
+  // a fresh revision. Never backfill it with a receive time - that would make
+  // the unversioned value outrank every revision emitted before "now".
+  updatedAt?: number;
 };
 export const {
   atom: accountSelectorUpdateMetaAtom,

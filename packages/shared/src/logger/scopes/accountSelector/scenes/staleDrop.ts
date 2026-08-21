@@ -72,6 +72,39 @@ export class AccountSelectorStaleDropScene extends BaseScene {
     ];
   }
 
+  // Documented theoretical edge of the compare-if-newer sync: two runtimes
+  // committed different selections with the same millisecond revision, so
+  // there is no ordering to decide a winner and each side keeps its own value.
+  // No tie-break on purpose - any extra input (runtime id, random) would make
+  // the two sides converge on a value neither user necessarily picked. The
+  // divergence heals on the next selection commit; this entry exists so a
+  // report of "two windows disagree" can be traced to it.
+  @LogToLocal({ level: 'warn' })
+  public equalRevisionConflictKeptLocal({
+    current,
+    incoming,
+    num,
+    reason,
+    sceneName,
+  }: {
+    current: ISelectedAccountLike | undefined;
+    incoming: ISelectedAccountLike | undefined;
+    num: number;
+    reason: string;
+    sceneName: string | undefined;
+  }) {
+    return [
+      'accountSelector cross-runtime event carried the same revision as the local selection but a different value; keeping local',
+      {
+        current: buildSelectionShape(current),
+        incoming: buildSelectionShape(incoming),
+        num,
+        reason,
+        sceneName,
+      },
+    ];
+  }
+
   @LogToLocal({ level: 'warn' })
   public storageSideEffectDropped({
     eventEmitDisabled,

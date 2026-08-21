@@ -258,11 +258,15 @@ function describeConnectionKind(
 }
 
 function useExternalAccountActivate({
-  effectInstanceId,
+  effectInstanceIdRef,
   num,
   sceneName,
 }: {
-  effectInstanceId?: number;
+  // Passed as a ref on purpose: the id is diagnostics-only and gets assigned
+  // lazily when perf debugging turns on mid-session. Depending on its value
+  // would cancel and re-run the activation effect (repeating
+  // activateConnector + syncAccountFromPeerWallet) on that flip.
+  effectInstanceIdRef: { readonly current: number | undefined };
   num: number;
   sceneName: EAccountSelectorSceneName;
 }) {
@@ -308,7 +312,7 @@ function useExternalAccountActivate({
       resultLogged = true;
       defaultLogger.accountSelector.perf.trace('externalActivationResult', {
         activeReloadId: activeMeta?.reloadId,
-        effectInstanceId,
+        effectInstanceId: effectInstanceIdRef.current,
         num,
         operationId,
         outcome,
@@ -322,7 +326,7 @@ function useExternalAccountActivate({
     if (perfEnabled) {
       defaultLogger.accountSelector.perf.trace('externalActivationRequested', {
         activeReloadId: activeMeta?.reloadId,
-        effectInstanceId,
+        effectInstanceId: effectInstanceIdRef.current,
         num,
         operationId,
         sceneName,
@@ -398,7 +402,7 @@ function useExternalAccountActivate({
       cancelled = true;
       logResult(EExternalActivateOutcome.Cancelled);
     };
-  }, [accountId, effectInstanceId, num, networkId, sceneName]);
+  }, [accountId, effectInstanceIdRef, num, networkId, sceneName]);
 }
 
 function AccountSelectorEffectsCmp({ num }: { num: number }) {
@@ -449,7 +453,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
   useAutoSelectAccount({ num });
   useAutoSelectNetwork({ num });
   useAutoSelectDeriveType({ num });
-  useExternalAccountActivate({ effectInstanceId, num, sceneName });
+  useExternalAccountActivate({ effectInstanceIdRef, num, sceneName });
 
   // Must list exactly ACTIVE_ACCOUNT_RELOAD_SELECTION_FIELDS: reload staleness
   // is judged on those fields, so anything scheduled on a narrower set would be
@@ -498,7 +502,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
             defaultLogger.accountSelector.perf.trace('activeReloadDispatch', {
               coalescedCount: request.coalescedCount,
               coalescedTriggers: request.coalescedTriggers,
-              effectInstanceId,
+              effectInstanceId: effectInstanceIdRef.current,
               num,
               scheduleId: request.scheduleId,
               sceneName,
@@ -612,7 +616,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
               perfContext: {
                 coalescedCount: request.coalescedCount,
                 coalescedTriggers: request.coalescedTriggers,
-                effectInstanceId,
+                effectInstanceId: effectInstanceIdRef.current,
                 perfEnabled: request.perfEnabled,
                 scheduleId: request.scheduleId,
                 sceneName,
@@ -646,7 +650,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
                 'activeReloadPostProcessResult',
                 {
                   actionOutcome: reloadOutcome,
-                  effectInstanceId,
+                  effectInstanceId: effectInstanceIdRef.current,
                   num,
                   outcome: EActiveReloadPostProcessOutcome.SkipStaleAction,
                   scheduleId: request.scheduleId,
@@ -665,7 +669,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
               defaultLogger.accountSelector.perf.trace(
                 'activeReloadPostProcessResult',
                 {
-                  effectInstanceId,
+                  effectInstanceId: effectInstanceIdRef.current,
                   num,
                   outcome: EActiveReloadPostProcessOutcome.SkipStaleScheduler,
                   scheduleId: request.scheduleId,
@@ -705,7 +709,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
               'activeReloadPostProcessResult',
               {
                 num,
-                effectInstanceId,
+                effectInstanceId: effectInstanceIdRef.current,
                 outcome:
                   snapshotOutcome === 'success'
                     ? 'completed'
@@ -727,7 +731,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
           trailing: true,
         },
       ),
-    [actions, effectInstanceId, isReady, num, sceneName],
+    [actions, isReady, num, sceneName],
   );
   const scheduleActiveAccountReload = useCallback(
     (trigger: string) => {
@@ -789,7 +793,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
         defaultLogger.accountSelector.perf.trace('activeReloadCoalesced', {
           coalescedCount: request.coalescedCount,
           coalescedTriggers,
-          effectInstanceId,
+          effectInstanceId: effectInstanceIdRef.current,
           num,
           replacementScheduleId: scheduleId,
           replacementTrigger: trigger,
@@ -812,7 +816,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
           changedFields: transitionMeta?.changedFields,
           coalescedCount: request.coalescedCount,
           coalescedTriggers,
-          effectInstanceId,
+          effectInstanceId: effectInstanceIdRef.current,
           num,
           reason: transitionMeta?.reason,
           scheduleId,
@@ -823,7 +827,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
       }
       void throttledReloadActiveAccountInfo(request);
     },
-    [effectInstanceId, num, sceneName, throttledReloadActiveAccountInfo],
+    [num, sceneName, throttledReloadActiveAccountInfo],
   );
 
   useEffect(
@@ -834,7 +838,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
       pendingActiveReloadRequestRef.current = undefined;
       if (pendingRequest?.perfEnabled) {
         defaultLogger.accountSelector.perf.trace('activeReloadCancelled', {
-          effectInstanceId,
+          effectInstanceId: effectInstanceIdRef.current,
           num,
           outcome: ESelectionStorageEffectOutcome.CancelledCleanup,
           sceneName,
@@ -843,7 +847,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
         });
       }
     },
-    [effectInstanceId, num, sceneName, throttledReloadActiveAccountInfo],
+    [num, sceneName, throttledReloadActiveAccountInfo],
   );
 
   const lastAutoSavedUpdatedAtRef = useRef<number | undefined>(undefined);
@@ -855,7 +859,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
     if (!isReady) {
       if (isAccountSelectorPerfDebugEnabled()) {
         defaultLogger.accountSelector.perf.trace('selectionStorageSkipped', {
-          effectInstanceId,
+          effectInstanceId: effectInstanceIdRef.current,
           num,
           outcome: ESelectionStorageEffectOutcome.SkipNotReady,
           sceneName,
@@ -876,7 +880,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
     ) {
       if (isAccountSelectorPerfDebugEnabled()) {
         defaultLogger.accountSelector.perf.trace('selectionStorageSkipped', {
-          effectInstanceId,
+          effectInstanceId: effectInstanceIdRef.current,
           num,
           outcome: ESelectionStorageEffectOutcome.SkipDuplicateRevision,
           sceneName,
@@ -938,7 +942,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
     } else {
       if (isAccountSelectorPerfDebugEnabled()) {
         defaultLogger.accountSelector.perf.trace('selectionStorageSkipped', {
-          effectInstanceId,
+          effectInstanceId: effectInstanceIdRef.current,
           num,
           outcome: ESelectionStorageEffectOutcome.SkipDefaultSelection,
           sceneName,
@@ -948,7 +952,6 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
     }
   }, [
     actions,
-    effectInstanceId,
     isReady,
     isSelectedAccountDefaultValue,
     num,
@@ -989,14 +992,14 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
     ) {
       defaultLogger.accountSelector.perf.trace('activeReloadNotRequired', {
         changedFields: transitionMeta.changedFields,
-        effectInstanceId,
+        effectInstanceId: effectInstanceIdRef.current,
         num,
         reason: transitionMeta.reason,
         sceneName,
         transitionId: transitionMeta.transitionId,
       });
     }
-  }, [effectInstanceId, num, sceneName, selectedAccount]);
+  }, [num, sceneName, selectedAccount]);
 
   useEffect(() => {
     const updateNetwork = (params: {
@@ -1005,10 +1008,13 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
       sceneUrl: string;
       num: number;
     }) => {
+      // Deliberately not filtered by this instance's num: the event targets
+      // params.num, and any mounted sibling instance must be able to apply it
+      // in case the instance for that num does not exist. Duplicate handling
+      // by multiple instances collapses into a noop in updateSelectedAccount.
       if (
         params.sceneName === sceneNameRef.current &&
-        params.sceneUrl === sceneUrlRef.current &&
-        params.num === num
+        params.sceneUrl === sceneUrlRef.current
       ) {
         void actions.current.updateSelectedAccountNetwork({
           num: params.num,
@@ -1042,7 +1048,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
       );
       appEventBus.off(EAppEventBusNames.DAppNetworkUpdate, updateNetwork);
     };
-  }, [actions, num, scheduleActiveAccountReload]);
+  }, [actions, scheduleActiveAccountReload]);
 
   const syncHomeAndSwap = useCallback(
     (eventPayload: {
@@ -1081,7 +1087,11 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
         eventPayload.selectedAccount &&
         eventPayload.sceneName === sceneName &&
         eventPayload.sceneUrl === sceneUrl &&
-        eventPayload.num === num &&
+        // Not filtered by this instance's num on purpose: every read and write
+        // below is keyed by eventPayload.num, so any mounted sibling instance
+        // handles the event correctly when the instance for that num does not
+        // exist. Duplicates and out-of-order bursts are absorbed by the
+        // compare-if-newer guard (`eventUpdatedAt`) inside the update mutex.
         // @ts-ignore
         eventPayload?.$$isRemoteEvent // ext background event emit
       ) {
@@ -1089,9 +1099,6 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
         const currentUpdatedAt = store?.get(accountSelectorUpdateMetaAtom())?.[
           eventPayload.num
         ]?.updatedAt;
-        const expectedSelection = actions.current.getSelectedAccount({
-          num: eventPayload.num,
-        });
 
         defaultLogger.accountSelector.storage.syncSceneData({
           selectedAccount: eventPayload.selectedAccount,
@@ -1099,6 +1106,10 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
           currentUpdatedAt,
         });
 
+        // Cheap early exit for an event already visibly older than the
+        // committed selection. Only an optimization: this read happens outside
+        // the update mutex and can go stale, so the authoritative verdict is
+        // the `eventUpdatedAt` comparison inside the mutex.
         let shouldUpdateAtom = true;
         if (
           eventPayloadUpdatedAt &&
@@ -1110,15 +1121,23 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
 
         if (shouldUpdateAtom) {
           await actions.current.updateSelectedAccount({
-            expectedSelection,
-            expectedUpdatedAt: currentUpdatedAt ?? null,
+            // An event without a revision maps to null: apply only into an
+            // unversioned slot, never over a committed revision.
+            eventUpdatedAt: eventPayloadUpdatedAt ?? null,
             num: eventPayload.num,
             parentOperationId: eventPayload.sourceOperationId,
             reason: 'syncSceneData',
             builder: () => eventPayload.selectedAccount,
             updateMeta: {
               eventEmitDisabled: true, // avoid infinite loop: event -> updateSelectedAccount -> event
-              updatedAt: eventPayloadUpdatedAt ?? Date.now(),
+              // The source revision, not the receive time: later events from
+              // the peer runtime are only comparable against what we commit
+              // here if this revision is the one the event was emitted with.
+              // No Date.now() fallback - an unversioned event stays
+              // unversioned (the commit path leaves the revision unset for
+              // eventUpdatedAt: null), so a later event carrying a real
+              // revision can still win instead of losing to our receive time.
+              updatedAt: eventPayloadUpdatedAt,
             },
           });
         }
@@ -1126,7 +1145,7 @@ function AccountSelectorEffectsCmp({ num }: { num: number }) {
 
       await syncHomeAndSwap(eventPayload);
     },
-    [actions, num, sceneName, sceneUrl, store, syncHomeAndSwap],
+    [actions, sceneName, sceneUrl, store, syncHomeAndSwap],
   );
 
   useEffect(() => {

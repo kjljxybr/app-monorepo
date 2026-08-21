@@ -293,6 +293,7 @@ jest.mock('@onekeyhq/shared/src/platformEnv', () => ({
   default: {
     isDesktop: true,
     isDev: false,
+    isExtension: false,
     isExtensionBackgroundServiceWorker: false,
     isJest: true,
     isNative: false,
@@ -408,15 +409,29 @@ jest.mock('@onekeyhq/kit/src/background/instance/backgroundApiProxy', () => ({
 }));
 
 jest.mock('@onekeyhq/shared/src/logger/logger', () => {
-  const noopLogger = new Proxy(jest.fn(), {
-    apply: () => undefined,
-    get: () => noopLogger,
-  });
+  // Every call stays a noop, but the dotted path of each called method is
+  // recorded so tests can assert that a specific log fired. Read it via
+  // jest.requireMock('@onekeyhq/shared/src/logger/logger').__loggerCallPaths.
+  const loggerCallPaths: string[] = [];
+  const buildNode = (path: string): unknown =>
+    new Proxy(function noop() {}, {
+      apply: () => {
+        loggerCallPaths.push(path);
+        return undefined;
+      },
+      get: (_target, prop) =>
+        buildNode(path ? `${path}.${String(prop)}` : String(prop)),
+    });
 
   return {
-    defaultLogger: noopLogger,
+    __loggerCallPaths: loggerCallPaths,
+    defaultLogger: buildNode(''),
   };
 });
+
+const { __loggerCallPaths: loggerCallPaths } = jest.requireMock(
+  '@onekeyhq/shared/src/logger/logger',
+) as { __loggerCallPaths: string[] };
 
 function createWrapper(
   config?: EAccountSelectorSceneName | IAccountSelectorContextData,
@@ -467,6 +482,7 @@ function bridgeThroughBackground<T>(value: T): T {
 describe('useAccountSelectorActions', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    loggerCallPaths.length = 0;
     jest.spyOn(timerUtils, 'wait').mockResolvedValue(undefined);
     mockColdStartCacheStorageData.clear();
     mockGetDappAccountSelectorMap.mockResolvedValue(undefined);
@@ -836,6 +852,324 @@ describe('useAccountSelectorActions', () => {
       // The actions instance is a module-level singleton shared across tests.
       counts.clear();
     }
+  });
+
+  it('drops an event older than the committed revision without arming the stale alert', async () => {
+    // A late cross-runtime event losing against an already-committed newer
+    // selection is the sync protocol converging, not a caller losing a race,
+    // so the drop must never feed the repeated-stale-drop alert.
+    jest.replaceProperty(platformEnv, 'isDev', true);
+    const consoleErrorSpy = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--1'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 2000 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const staleCounts =
+      getAccountSelectorActions().consecutiveStaleDropCountMap;
+    staleCounts.clear();
+
+    await act(async () => {
+      // Well past the alert threshold on purpose: repeated correct drops from
+      // the same caller must stay silent.
+      for (let i = 0; i < 4; i += 1) {
+        const dropped = await result.current.updateSelectedAccount({
+          eventUpdatedAt: 1000,
+          num: 0,
+          reason: 'older-event-drop-test',
+          builder: () => createHdSelectedAccount('hd-1--0'),
+          updateMeta: { eventEmitDisabled: true, updatedAt: 1000 },
+        });
+        expect(dropped.outcome).toBe('skip-older-event');
+      }
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+    expect(staleCounts.size).toBe(0);
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+  });
+
+  it('applies an event newer than the committed revision and lands its revision', async () => {
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--0'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 1000 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.updateSelectedAccount({
+          eventUpdatedAt: 2000,
+          num: 0,
+          reason: 'newer-event-apply-test',
+          builder: () => createHdSelectedAccount('hd-1--1'),
+          updateMeta: { eventEmitDisabled: true, updatedAt: 2000 },
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('commit');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    // The event's source revision is committed verbatim - later events from
+    // the peer runtime are only comparable against it, not our receive time.
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+  });
+
+  it('converges an out-of-order event burst on the newest revision', async () => {
+    // Two rapid switches on the peer runtime arrive out of order: B (newer)
+    // lands first, A (older) trails. Unconditional apply would let A win with
+    // a monotonic-floor-bumped revision; the exact-match CAS dropped whichever
+    // event entered the mutex second regardless of age. Compare-if-newer must
+    // keep B deterministically.
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--2'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 500 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const applyEvent = (indexedAccountId: string, eventUpdatedAt: number) =>
+      result.current.updateSelectedAccount({
+        eventUpdatedAt,
+        num: 0,
+        reason: 'out-of-order-burst-test',
+        builder: () => createHdSelectedAccount(indexedAccountId),
+        updateMeta: { eventEmitDisabled: true, updatedAt: eventUpdatedAt },
+      });
+
+    await act(async () => {
+      expect((await applyEvent('hd-1--1', 2000)).outcome).toBe('commit');
+      expect((await applyEvent('hd-1--0', 1000)).outcome).toBe(
+        'skip-older-event',
+      );
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+  });
+
+  it('collapses an equal-revision event with the same value into a noop', async () => {
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--1'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 2000 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.updateSelectedAccount({
+          eventUpdatedAt: 2000,
+          num: 0,
+          reason: 'equal-revision-noop-test',
+          builder: () => createHdSelectedAccount('hd-1--1'),
+          updateMeta: { eventEmitDisabled: true, updatedAt: 2000 },
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('noop');
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+  });
+
+  it('keeps the local value and logs when an equal-revision event differs', async () => {
+    // The documented theoretical boundary: two runtimes committed different
+    // values in the same millisecond. No tie-break - each side keeps its own
+    // value - but the conflict must leave a trace in the exportable log.
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--1'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 2000 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const staleCounts =
+      getAccountSelectorActions().consecutiveStaleDropCountMap;
+    staleCounts.clear();
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.updateSelectedAccount({
+          eventUpdatedAt: 2000,
+          num: 0,
+          reason: 'equal-revision-conflict-test',
+          builder: () => createHdSelectedAccount('hd-1--0'),
+          updateMeta: { eventEmitDisabled: true, updatedAt: 2000 },
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('skip-equal-event-conflict');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+    expect(loggerCallPaths).toContain(
+      'accountSelector.staleDrop.equalRevisionConflictKeptLocal',
+    );
+    expect(staleCounts.size).toBe(0);
+  });
+
+  it('drops an unversioned event against a committed revision without arming the stale alert', async () => {
+    // eventUpdatedAt: null marks an event that carried no source revision (a
+    // cold-start replay). It may never overwrite a slot that holds a real
+    // committed revision, and like the other compare-if-newer skips it is the
+    // protocol converging, so it must not feed the repeated-stale-drop alert
+    // or the conflict log.
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--1'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 2000 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const staleCounts =
+      getAccountSelectorActions().consecutiveStaleDropCountMap;
+    staleCounts.clear();
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.updateSelectedAccount({
+          eventUpdatedAt: null,
+          num: 0,
+          reason: 'unversioned-event-drop-test',
+          builder: () => createHdSelectedAccount('hd-1--0'),
+          updateMeta: { eventEmitDisabled: true, updatedAt: undefined },
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('skip-unversioned-event');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+    expect(staleCounts.size).toBe(0);
+    expect(loggerCallPaths).not.toContain(
+      'accountSelector.staleDrop.equalRevisionConflictKeptLocal',
+    );
+  });
+
+  it('collapses a duplicate delivery healed by the global derive correction into a noop', async () => {
+    // The first delivery of this event changed networks, so its commit
+    // corrected the deriveType from global storage; a sibling instance
+    // re-delivers the SAME event still carrying the emitter's original
+    // deriveType. Equal revision, different value - but semantically the same
+    // selection once the correction is applied, so it must land on noop
+    // instead of being misreported as a cross-runtime conflict.
+    const committed = createHdSelectedAccount('hd-1--1'); // deriveType 'default'
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: committed });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: true, updatedAt: 2000 },
+    });
+    // The global derive type the first delivery committed.
+    mockGetGlobalDeriveType.mockResolvedValue('default');
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.updateSelectedAccount({
+          eventUpdatedAt: 2000,
+          num: 0,
+          reason: 'duplicate-delivery-derive-heal-test',
+          builder: () => ({
+            ...createHdSelectedAccount('hd-1--1'),
+            deriveType: 'ledgerLive',
+          }),
+          updateMeta: { eventEmitDisabled: true, updatedAt: 2000 },
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('noop');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      deriveType: 'default',
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+    expect(loggerCallPaths).not.toContain(
+      'accountSelector.staleDrop.equalRevisionConflictKeptLocal',
+    );
+  });
+
+  it('still reports a conflict when the derive correction does not explain the difference', async () => {
+    // Same shape as the healed-duplicate case above, but the global derive
+    // type disagrees with the committed value: the difference is a genuine
+    // same-millisecond divergence and must keep the conflict verdict.
+    const committed = createHdSelectedAccount('hd-1--1'); // deriveType 'default'
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: committed });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: true, updatedAt: 2000 },
+    });
+    mockGetGlobalDeriveType.mockResolvedValue('ledgerLegacy');
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.updateSelectedAccount({
+          eventUpdatedAt: 2000,
+          num: 0,
+          reason: 'duplicate-delivery-derive-conflict-test',
+          builder: () => ({
+            ...createHdSelectedAccount('hd-1--1'),
+            deriveType: 'ledgerLive',
+          }),
+          updateMeta: { eventEmitDisabled: true, updatedAt: 2000 },
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('skip-equal-event-conflict');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      deriveType: 'default',
+    });
+    expect(loggerCallPaths).toContain(
+      'accountSelector.staleDrop.equalRevisionConflictKeptLocal',
+    );
   });
 
   it('syncs account, available network, and derive type in one atom update', async () => {
@@ -2381,6 +2715,116 @@ describe('useAccountSelectorActions', () => {
     );
   });
 
+  it('replays side effects for an already-saved selection on extension', async () => {
+    // The extension popup can be reclaimed by the browser between the primary
+    // write and its side effects, and the pending-side-effect record is
+    // memory-only there, so the skip optimization must never fire.
+    jest.replaceProperty(platformEnv, 'isExtension', true);
+    const selectedAccount = createHdSelectedAccount('hd-1--0');
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 1000 },
+    });
+    mockGetSelectedAccount.mockResolvedValue(selectedAccount);
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const emitSpy = jest.spyOn(appEventBus, 'emit').mockReturnValue(true);
+
+    await act(async () => {
+      await result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount,
+        selectedAccountUpdatedAt: 1000,
+        trigger: 'selection-effect',
+      });
+    });
+
+    // The primary record is already on disk, so no second write, but the side
+    // effects (global derive save, change event) must still run.
+    expect(mockSaveSelectedAccount).not.toHaveBeenCalled();
+    expect(mockSaveGlobalDeriveType).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith(
+      EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+      expect.objectContaining({ selectedAccount }),
+    );
+  });
+
+  it('suppresses the change event of an unversioned extension replay with nothing to broadcast', async () => {
+    // Extension cold start: the meta atom holds no revision (initFromStorage
+    // applies storage as 'untracked' and the recent cache is a no-op there),
+    // so the auto-save cannot short-circuit and the replay runs for the plain
+    // disk value. Already saved + no revision = no delta to broadcast:
+    // re-announcing the snapshot as an unversioned event could overwrite a
+    // peer that holds no revision yet. Only the event is suppressed - the
+    // derive/home-sync replay is the killed-popup recovery channel and must
+    // still run.
+    jest.replaceProperty(platformEnv, 'isExtension', true);
+    const selectedAccount = createHdSelectedAccount('hd-1--0');
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    store.set(accountSelectorUpdateMetaAtom(), {});
+    mockGetSelectedAccount.mockResolvedValue(selectedAccount);
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const emitSpy = jest.spyOn(appEventBus, 'emit').mockReturnValue(true);
+
+    await act(async () => {
+      await result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount,
+        selectedAccountUpdatedAt: undefined,
+        trigger: 'selection-effect',
+      });
+    });
+
+    expect(mockSaveSelectedAccount).not.toHaveBeenCalled();
+    expect(mockSaveGlobalDeriveType).toHaveBeenCalledTimes(1);
+    expect(emitSpy).not.toHaveBeenCalledWith(
+      EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+      expect.anything(),
+    );
+  });
+
+  it('still emits an unversioned event whose primary write carried a delta', async () => {
+    // An unversioned save that actually wrote the primary (e.g. an init
+    // repair changed the record) is a real delta and must reach the peers.
+    // Receivers guard themselves: the unversioned event applies only where no
+    // committed revision exists.
+    jest.replaceProperty(platformEnv, 'isExtension', true);
+    const selectedAccount = createHdSelectedAccount('hd-1--0');
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    store.set(accountSelectorUpdateMetaAtom(), {});
+    mockGetSelectedAccount.mockResolvedValue(
+      createHdSelectedAccount('hd-1--1'),
+    );
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const emitSpy = jest.spyOn(appEventBus, 'emit').mockReturnValue(true);
+
+    await act(async () => {
+      await result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount,
+        selectedAccountUpdatedAt: undefined,
+        trigger: 'selection-effect',
+      });
+    });
+
+    expect(mockSaveSelectedAccount).toHaveBeenCalledTimes(1);
+    expect(emitSpy).toHaveBeenCalledWith(
+      EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+      expect.objectContaining({ selectedAccount }),
+    );
+  });
+
   it('short circuits a saved selection that background returned without its undefined keys', async () => {
     const selectedAccount = createHdSelectedAccount('hd-1--0');
     const { store, Wrapper } = createWrapper();
@@ -2668,7 +3112,10 @@ describe('useAccountSelectorActions', () => {
     });
   });
 
-  it('applies a different home-swap selection with the same timestamp', async () => {
+  it('keeps the local value when a home-swap event ties on revision with a different value', async () => {
+    // Same-millisecond commits on both sides cannot be ordered, so neither
+    // side may overwrite the other: each keeps its own value and the conflict
+    // is logged (symmetric judgment - the peer drops our event the same way).
     mockShouldSyncHomeAndSwapSelectedAccount.mockResolvedValue(true);
 
     const { store, Wrapper } = createWrapper();
@@ -2685,10 +3132,314 @@ describe('useAccountSelectorActions', () => {
       wrapper: Wrapper,
     });
 
+    let outcome: string | undefined;
     await act(async () => {
-      await result.current.syncHomeAndSwapSelectedAccount({
+      outcome = (
+        await result.current.syncHomeAndSwapSelectedAccount({
+          eventPayload: {
+            selectedAccount: createHdSelectedAccount('hd-1--0'),
+            selectedAccountUpdatedAt: 2000,
+            sceneName: EAccountSelectorSceneName.swap,
+            num: 0,
+          },
+          sceneName: EAccountSelectorSceneName.home,
+          num: 0,
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('skip-equal-event-conflict');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(loggerCallPaths).toContain(
+      'accountSelector.staleDrop.equalRevisionConflictKeptLocal',
+    );
+  });
+
+  it('drops a home-swap event without a source revision when a revision is committed', async () => {
+    // An unversioned event is a cold-start replay of a disk snapshot, not a
+    // user action. The legacy always-apply semantics let it overwrite a live
+    // selection; now it may only fill a slot with no committed revision.
+    mockShouldSyncHomeAndSwapSelectedAccount.mockResolvedValue(true);
+
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--1'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: {
+        eventEmitDisabled: false,
+        updatedAt: 2000,
+      },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.syncHomeAndSwapSelectedAccount({
+          eventPayload: {
+            selectedAccount: createHdSelectedAccount('hd-1--0'),
+            selectedAccountUpdatedAt: undefined,
+            sceneName: EAccountSelectorSceneName.swap,
+            num: 0,
+          },
+          sceneName: EAccountSelectorSceneName.home,
+          num: 0,
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('skip-unversioned-event');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+  });
+
+  it('applies an unversioned home-swap event to a cold slot and lets a real revision win later', async () => {
+    // The A1 stuck-rollback regression: an extension popup cold start used to
+    // broadcast the disk snapshot without a revision, receivers applied it
+    // unconditionally and stamped their receive time as its revision, and the
+    // genuine update that followed (emitted at T1 < now) lost the
+    // compare-if-newer forever. The unversioned apply must leave the slot
+    // unversioned so the later versioned event still wins - restoring the
+    // `?? Date.now()` fallback at the call site makes this test fail.
+    mockShouldSyncHomeAndSwapSelectedAccount.mockResolvedValue(true);
+
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--2'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {});
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const syncEvent = (
+      indexedAccountId: string,
+      selectedAccountUpdatedAt: number | undefined,
+    ) =>
+      result.current.syncHomeAndSwapSelectedAccount({
         eventPayload: {
-          selectedAccount: createHdSelectedAccount('hd-1--0'),
+          selectedAccount: createHdSelectedAccount(indexedAccountId),
+          selectedAccountUpdatedAt,
+          sceneName: EAccountSelectorSceneName.swap,
+          num: 0,
+        },
+        sceneName: EAccountSelectorSceneName.home,
+        num: 0,
+      });
+
+    await act(async () => {
+      expect((await syncEvent('hd-1--0', undefined)).outcome).toBe('commit');
+    });
+
+    // Applied, but without minting a revision: the slot stays unversioned.
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--0',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(
+      undefined,
+    );
+    expect(
+      store.get(accountSelectorUpdateMetaAtom())[0]?.eventEmitDisabled,
+    ).toBe(true);
+
+    await act(async () => {
+      // A real revision far in the past relative to the receive time above -
+      // exactly the event the stamped Date.now() used to outrank.
+      expect((await syncEvent('hd-1--1', 1000)).outcome).toBe('commit');
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(1000);
+  });
+
+  it('applies a same-scene event from a peer runtime and emits no echo', async () => {
+    // Two extension windows on the same scene (popup home vs expanded home)
+    // never converged while the same-scene branch skipped unconditionally.
+    // A remote same-scene event now applies through compare-if-newer - no
+    // home-merge, no sync policy: the event's selection IS the target value.
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--0'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 1000 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const emitSpy = jest.spyOn(appEventBus, 'emit').mockReturnValue(true);
+    const peerSelection = createHdSelectedAccount('hd-1--1');
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.syncHomeAndSwapSelectedAccount({
+          eventPayload: {
+            $$isRemoteEvent: true,
+            selectedAccount: peerSelection,
+            selectedAccountUpdatedAt: 2000,
+            sceneName: EAccountSelectorSceneName.home,
+            num: 0,
+          },
+          sceneName: EAccountSelectorSceneName.home,
+          num: 0,
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('commit');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    // The source revision is committed verbatim and the echo is disarmed.
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]).toMatchObject({
+      eventEmitDisabled: true,
+      updatedAt: 2000,
+    });
+    // Same-scene needs no cross-scene policy decision.
+    expect(mockShouldSyncHomeAndSwapSelectedAccount).not.toHaveBeenCalled();
+
+    // No ping-pong: the auto-save that follows the applied selection persists
+    // it but must not broadcast a new event (eventEmitDisabled came from the
+    // sync above).
+    await act(async () => {
+      await result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount: peerSelection,
+        selectedAccountUpdatedAt: 2000,
+        trigger: 'selection-effect',
+      });
+    });
+    expect(mockSaveSelectedAccount).toHaveBeenCalledTimes(1);
+    expect(emitSpy).not.toHaveBeenCalledWith(
+      EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+      expect.anything(),
+    );
+  });
+
+  it('drops an older same-scene event from a peer runtime', async () => {
+    // Last-writer-wins symmetry for the same-scene path: a stale broadcast
+    // from the peer window must not roll back a newer local commit.
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--1'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 2000 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.syncHomeAndSwapSelectedAccount({
+          eventPayload: {
+            $$isRemoteEvent: true,
+            selectedAccount: createHdSelectedAccount('hd-1--0'),
+            selectedAccountUpdatedAt: 1000,
+            sceneName: EAccountSelectorSceneName.home,
+            num: 0,
+          },
+          sceneName: EAccountSelectorSceneName.home,
+          num: 0,
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('skip-older-event');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+  });
+
+  it('keeps skipping the local echo of a same-scene event without touching the store', async () => {
+    // Every emit fires the local listeners too, and all mirrors of one scene
+    // share one jotai store in a runtime - a local echo can carry nothing the
+    // store does not already hold, so it skips before the update mutex even
+    // when its payload looks different (e.g. a fix-adjusted emitted value).
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--1'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: { eventEmitDisabled: false, updatedAt: 2000 },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.syncHomeAndSwapSelectedAccount({
+          eventPayload: {
+            selectedAccount: createHdSelectedAccount('hd-1--0'),
+            selectedAccountUpdatedAt: 2000,
+            sceneName: EAccountSelectorSceneName.home,
+            num: 0,
+          },
+          sceneName: EAccountSelectorSceneName.home,
+          num: 0,
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('skip-same-scene');
+    expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
+      indexedAccountId: 'hd-1--1',
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+    expect(loggerCallPaths).not.toContain(
+      'accountSelector.staleDrop.equalRevisionConflictKeptLocal',
+    );
+  });
+
+  it('applies a newer home-swap event that raced with a concurrent local commit', async () => {
+    // The exact-match CAS read its expected revision before the async
+    // merge/fix work; a local commit landing during that work made the CAS
+    // drop the sync even though the event was NEWER, and nothing retried it.
+    // The compare-if-newer verdict is taken inside the update mutex, so the
+    // newer event must survive the same race.
+    mockShouldSyncHomeAndSwapSelectedAccount.mockResolvedValue(true);
+    const fixDeferred = createDeferred<void>();
+    mockFixOthersWalletAccountNetworkPair.mockImplementationOnce(
+      async ({ selectedAccount }) => {
+        await fixDeferred.promise;
+        return selectedAccount;
+      },
+    );
+
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), {
+      0: createHdSelectedAccount('hd-1--0'),
+    });
+    store.set(accountSelectorUpdateMetaAtom(), {
+      0: {
+        eventEmitDisabled: false,
+        updatedAt: 500,
+      },
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    let syncOutcome: string | undefined;
+    await act(async () => {
+      const syncPromise = result.current.syncHomeAndSwapSelectedAccount({
+        eventPayload: {
+          selectedAccount: createHdSelectedAccount('hd-1--1'),
           selectedAccountUpdatedAt: 2000,
           sceneName: EAccountSelectorSceneName.swap,
           num: 0,
@@ -2696,11 +3447,26 @@ describe('useAccountSelectorActions', () => {
         sceneName: EAccountSelectorSceneName.home,
         num: 0,
       });
+      // The sync has read its pre-check revision (500) and is now blocked in
+      // the account/network fix; a local commit lands under it.
+      await waitFor(() => {
+        expect(mockFixOthersWalletAccountNetworkPair).toHaveBeenCalled();
+      });
+      await result.current.updateSelectedAccount({
+        num: 0,
+        reason: 'concurrent-local-commit-test',
+        builder: () => createHdSelectedAccount('hd-1--2'),
+        updateMeta: { eventEmitDisabled: false, updatedAt: 1500 },
+      });
+      fixDeferred.resolve(undefined);
+      syncOutcome = (await syncPromise).outcome;
     });
 
+    expect(syncOutcome).toBe('commit');
     expect(store.get(selectedAccountsAtom())[0]).toMatchObject({
-      indexedAccountId: 'hd-1--0',
+      indexedAccountId: 'hd-1--1',
     });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
   });
 
   it('keeps a restored indexed account when active account is temporarily incomplete', async () => {

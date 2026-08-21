@@ -3589,13 +3589,15 @@ async function openAndApproveSimulatedDAppConnection(
     );
     for (const syncResult of sceneSyncResults) {
       // A dropped sync leaves the modal on its own previously persisted account
-      // while Home shows another one, and the sync has no retry. Asserted
-      // directly so a regression names the cause instead of only showing an
-      // unexpected selection-update count below.
-      assert.notEqual(
-        syncResult.outcome,
-        'stale',
-        'DApp connection scene sync must not be dropped as stale',
+      // while Home shows another one, and the sync has no retry. Asserted as an
+      // allow-list rather than notEqual('stale'): every other outcome in the
+      // selection-update vocabulary ('stale', 'skip-older-event',
+      // 'skip-equal-event-conflict', 'skip-unversioned-event', 'skip-empty',
+      // 'error') means the sync was discarded, and an exclusion check would
+      // silently pass any drop outcome added after it was written.
+      assert.ok(
+        ['commit', 'noop'].includes(syncResult.outcome),
+        `DApp connection scene sync must apply or noop, got '${syncResult.outcome}'`,
       );
     }
     const initializationSelectionUpdates = initializationTrace.events.filter(
@@ -5892,10 +5894,11 @@ async function runSwapInlineDeriveTypeScenario(page, devOnlyPassword, fixture) {
 //   Both merge ONLY the account identity (walletId/indexedAccountId/
 //   othersWalletAccountId/focusedWallet), never the target's networkId or
 //   deriveType. On swap num 0 the race winner commits and the loser settles
-//   as a no-op or 'stale-before-fix' drop (the revision guard in
-//   syncHomeAndSwapSelectedAccount), so WHICH reason commits is timing — but
-//   the TOTAL is exactly one commit and one reload. Swap num 1 has only path
-//   2, so its reason is deterministic.
+//   as a no-op, a 'stale-before-fix' drop (the pre-mutex early exit in
+//   syncHomeAndSwapSelectedAccount), or a 'skip-older-event' drop (the
+//   compare-if-newer guard inside the update mutex), so WHICH reason commits
+//   is timing — but the TOTAL is exactly one commit and one reload. Swap num 1
+//   has only path 2, so its reason is deterministic.
 // - Because the account-manager wallet row writes focusedWallet with its own
 //   'userSelectWallet' update (which also fans out to swap), the switch target
 //   stays in the SAME wallet as the normalized account: the wallet click is

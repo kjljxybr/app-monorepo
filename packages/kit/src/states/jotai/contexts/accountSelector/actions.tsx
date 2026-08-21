@@ -1149,7 +1149,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             ready: true,
           };
         }
-        if (buildOutcome !== 'error-fallback') {
+        if (buildOutcome !== EBuildActiveAccountOutcome.ErrorFallback) {
           const failuresBeforeRecovery = takeActiveReloadRecoveryLogSlot(
             buildActiveReloadFailureKey({
               num,
@@ -1860,6 +1860,23 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       payload: {
         expectedSelection?: IAccountSelectorSelectedAccount;
         expectedUpdatedAt?: number | null;
+        /**
+         * Source revision carried by a cross-runtime/cross-scene sync event.
+         * Enables conditional apply (compare-if-newer) inside the mutex: the
+         * update is dropped iff the committed revision is already newer (or
+         * equal with a different value), so a burst of out-of-order events
+         * converges on the newest one instead of racing an exact-match CAS
+         * read taken outside the mutex.
+         *
+         * Undefined means "not an event": local callers (user taps, auto
+         * select) apply unconditionally, guarded by their own CAS fields.
+         *
+         * Null means "an event that carried no revision" (a cold-start replay
+         * of a disk snapshot). Such an update may only fill a slot that holds
+         * no committed revision, and its commit deliberately leaves the
+         * revision unset - see the skip-unversioned-event guard in the mutex.
+         */
+        eventUpdatedAt?: number | null;
         updateMeta?: IAccountSelectorUpdateMeta;
         num: number;
         parentOperationId?: number;
@@ -1900,6 +1917,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           const {
             expectedSelection,
             expectedUpdatedAt,
+            eventUpdatedAt,
             num,
             builder,
             parentOperationId,
@@ -1956,11 +1974,16 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               sceneInfo?.sceneUrl ?? ''
             }__${num}__${requestReason ?? ''}`;
             // Reset on the negated condition rather than on an allow-list of
-            // outcomes: 'stale' is the only outcome that discards the update, so
-            // every other one (including any added later) ends the run. Listing
-            // the resetting outcomes instead would let a new outcome fall through
-            // both branches and turn the counter into "stale drops since the last
-            // commit", which trips the alert on unrelated drops spread over time.
+            // outcomes: 'stale' is the only outcome that means this caller LOST
+            // its update to a race, so every other one (including any added
+            // later) ends the run. Listing the resetting outcomes instead would
+            // let a new outcome fall through both branches and turn the counter
+            // into "stale drops since the last commit", which trips the alert on
+            // unrelated drops spread over time. The compare-if-newer skips
+            // (skip-older-event, skip-equal-event-conflict,
+            // skip-unversioned-event) also discard their update, but they are
+            // the sync protocol converging as designed - counting them would
+            // alert on correct behavior, so they end the run like a noop does.
             if (outcome !== ESelectionUpdateOutcome.Stale) {
               this.consecutiveStaleDropCountMap.delete(staleCountKey);
             } else {
@@ -2052,10 +2075,14 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               sceneName: sceneInfo?.sceneName,
             });
           }
+          // Re-read inside the mutex: this is the authoritative revision every
+          // guard below compares against, and it cannot move again before the
+          // commit because judgment and write share this critical section.
+          const committedUpdatedAt = get(accountSelectorUpdateMetaAtom())[num]
+            ?.updatedAt;
           if (
             expectedUpdatedAt !== undefined &&
-            get(accountSelectorUpdateMetaAtom())[num]?.updatedAt !==
-              (expectedUpdatedAt ?? undefined)
+            committedUpdatedAt !== (expectedUpdatedAt ?? undefined)
           ) {
             return logSelectionUpdateResult({
               outcome: ESelectionUpdateOutcome.Stale,
@@ -2071,6 +2098,46 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               outcome: ESelectionUpdateOutcome.Stale,
               selectedAccount: oldSelectedAccount,
               staleGuard: ESelectionStaleGuard.Selection,
+            });
+          }
+          // Conditional apply for sync events (compare-if-newer). Unlike the
+          // exact-match CAS above - whose expected value is read outside the
+          // mutex and can go stale before the guard runs, discarding the
+          // NEWER of two burst events with nothing to retry it - this pairs
+          // the event's own source revision with the revision read inside the
+          // mutex, so the verdict cannot expire. Both sides of a concurrent
+          // change broadcast symmetrically and judge symmetrically, so the
+          // newer revision wins on both runtimes (last-writer-wins) and the
+          // event chain stays one hop (eventEmitDisabled stops the echo).
+          // A strictly older event is dropped for good: the committed
+          // selection already reflects a newer write.
+          //
+          // An event with no source revision (null) cannot claim to be newer
+          // than anything. Before this guard such events applied
+          // unconditionally: an extension cold-start replay broadcasting the
+          // disk snapshot overwrote live selections, and once the receive time
+          // was stamped as its revision the stale value outranked every real
+          // update emitted before "now" and stuck for good. Now it only fills
+          // a slot that holds no committed revision at all (a receiver that is
+          // itself cold), and its commit below deliberately leaves the
+          // revision unset so any later event with a real revision still wins.
+          // Checked before the numeric comparison on purpose - `> null`
+          // coerces null to 0 and would misreport this as skip-older-event.
+          if (eventUpdatedAt === null && committedUpdatedAt !== undefined) {
+            return logSelectionUpdateResult({
+              outcome: ESelectionUpdateOutcome.SkipUnversionedEvent,
+              selectedAccount: oldSelectedAccount,
+            });
+          }
+          if (
+            eventUpdatedAt !== undefined &&
+            eventUpdatedAt !== null &&
+            committedUpdatedAt !== undefined &&
+            committedUpdatedAt > eventUpdatedAt
+          ) {
+            return logSelectionUpdateResult({
+              outcome: ESelectionUpdateOutcome.SkipOlderEvent,
+              selectedAccount: oldSelectedAccount,
             });
           }
 
@@ -2100,6 +2167,68 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           if (isSameSelectedAccount(oldSelectedAccount, newSelectedAccount)) {
             return logSelectionUpdateResult({
               outcome: ESelectionUpdateOutcome.Noop,
+              selectedAccount: oldSelectedAccount,
+            });
+          }
+
+          // Equal source revision, different value: two runtimes committed
+          // different selections within the same millisecond, which no
+          // timestamp comparison can order (the same-value case already fell
+          // into the Noop above). Deliberately no tie-break - each side keeps
+          // its own value and the divergence heals on the next commit; the
+          // dedicated log documents this theoretical boundary.
+          if (
+            eventUpdatedAt !== undefined &&
+            committedUpdatedAt !== undefined &&
+            committedUpdatedAt === eventUpdatedAt
+          ) {
+            // Not a conflict when the only difference is a deriveType the
+            // global correction has already fixed locally. The first delivery
+            // of this event changed networks, so its commit corrected the
+            // deriveType from global storage (fixDeriveTypeByGlobal below);
+            // a sibling instance re-delivering the SAME event still carries
+            // the emitter's original deriveType, ties on revision, and used
+            // to be misreported as a cross-runtime conflict. Re-check
+            // equality with the correction applied and collapse the benign
+            // replay into a noop. The equality pre-check keeps the service
+            // round-trip off every genuine conflict, and any lookup failure
+            // conservatively keeps the conflict verdict.
+            if (
+              isSameSelectedAccount(oldSelectedAccount, {
+                ...newSelectedAccount,
+                deriveType: oldSelectedAccount.deriveType,
+              })
+            ) {
+              let correctedDeriveType: IAccountDeriveTypes | undefined;
+              try {
+                correctedDeriveType =
+                  await backgroundApiProxy.serviceAccountSelector.getGlobalDeriveType(
+                    {
+                      selectedAccount: newSelectedAccount,
+                      sceneName: sceneInfo?.sceneName,
+                    },
+                  );
+              } catch {
+                correctedDeriveType = undefined;
+              }
+              if (correctedDeriveType === oldSelectedAccount.deriveType) {
+                return logSelectionUpdateResult({
+                  outcome: ESelectionUpdateOutcome.Noop,
+                  selectedAccount: oldSelectedAccount,
+                });
+              }
+            }
+            defaultLogger.accountSelector.staleDrop.equalRevisionConflictKeptLocal(
+              {
+                current: oldSelectedAccount,
+                incoming: newSelectedAccount,
+                num,
+                reason: requestReason,
+                sceneName: sceneInfo?.sceneName,
+              },
+            );
+            return logSelectionUpdateResult({
+              outcome: ESelectionUpdateOutcome.SkipEqualEventConflict,
               selectedAccount: oldSelectedAccount,
             });
           }
@@ -2239,10 +2368,20 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             ...v,
             [num]: {
               eventEmitDisabled: Boolean(updateMeta?.eventEmitDisabled),
-              updatedAt: getNextSelectionUpdatedAt({
-                currentUpdatedAt: v[num]?.updatedAt,
-                requestedUpdatedAt: updateMeta?.updatedAt,
-              }),
+              // An unversioned-event apply (eventUpdatedAt: null, see the
+              // guard above) must not advance the revision: the slot had no
+              // committed revision, and minting the receive time here would
+              // outrank every real revision emitted before "now", so the
+              // stopgap value could never be replaced by the genuine update
+              // that follows. The slot stays unversioned until a versioned
+              // event or a local commit lands.
+              updatedAt:
+                eventUpdatedAt === null
+                  ? undefined
+                  : getNextSelectionUpdatedAt({
+                      currentUpdatedAt: v[num]?.updatedAt,
+                      requestedUpdatedAt: updateMeta?.updatedAt,
+                    }),
             },
           }));
           return logSelectionUpdateResult({
@@ -3786,6 +3925,11 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           sourceRuntimeId?: string;
           sourceTransitionId?: number;
           trigger?: string;
+          // Stamped by the event bus on payloads that crossed a process
+          // boundary (extension background re-broadcast). The same-scene
+          // branch below reads it to tell a peer runtime's event apart from
+          // this runtime's own local echo.
+          $$isRemoteEvent?: boolean;
         };
       },
     ) => {
@@ -3854,10 +3998,58 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               scene2: eventPayload,
             })
           ) {
-            logCrossSceneResult({
-              outcome: ECrossSceneSyncOutcome.SkipSameScene,
+            // Same scene, same runtime: the event is this runtime's own local
+            // echo (the bus fires local listeners for every emit; only
+            // background re-broadcasts carry $$isRemoteEvent). Every mirror of
+            // one scene shares one jotai store here, so the store already
+            // holds what the event describes - skip without entering the
+            // update mutex. This also keeps single-runtime targets
+            // (desktop/web) on the cheap path for every event.
+            if (!eventPayload.$$isRemoteEvent) {
+              logCrossSceneResult({
+                outcome: ECrossSceneSyncOutcome.SkipSameScene,
+              });
+              return { outcome: ECrossSceneSyncOutcome.SkipSameScene };
+            }
+            // Same scene on ANOTHER runtime (extension popup vs expanded tab
+            // both on home): separate JS heaps, so the stores drifted forever
+            // while this branch skipped unconditionally. The event's selection
+            // IS the target value - same scene needs no home-merge, and the
+            // emitter already ran fixOthersWalletAccountNetworkPair before
+            // broadcasting - so apply it through the same compare-if-newer
+            // gate as any cross-runtime event. Safety:
+            // - a newer source revision applies, an older one drops
+            //   (skip-older-event), so concurrent changes converge on
+            //   last-writer-wins instead of overwriting each other;
+            // - a re-delivered event ties on revision with the committed
+            //   value and lands on noop;
+            // - eventEmitDisabled breaks the echo: the receiver's auto-save
+            //   replays derive/home side effects (equal-value writes are
+            //   no-ops) but emits no further event, so there is no ping-pong;
+            // - an unversioned cold-start broadcast follows the
+            //   eventUpdatedAt: null rule and never overwrites a committed
+            //   revision.
+            const sameSceneResult = await this.updateSelectedAccount.call(set, {
+              eventUpdatedAt: eventPayload.selectedAccountUpdatedAt ?? null,
+              parentOperationId: operationId,
+              updateMeta: {
+                eventEmitDisabled: true, // stop update infinite loop here
+                // The source revision, not the receive time - and an
+                // unversioned event stays unversioned (the commit path
+                // leaves the revision unset for eventUpdatedAt: null).
+                updatedAt: eventPayload.selectedAccountUpdatedAt,
+              },
+              num,
+              reason: 'syncSameSceneSelectedAccount',
+              builder(v) {
+                return eventPayload.selectedAccount || v;
+              },
             });
-            return { outcome: ECrossSceneSyncOutcome.SkipSameScene };
+            logCrossSceneResult({
+              outcome: sameSceneResult.outcome,
+              transitionId: sameSceneResult.transitionId,
+            });
+            return sameSceneResult;
           }
 
           phase = 'sync-policy';
@@ -3876,8 +4068,11 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             return { outcome: ECrossSceneSyncOutcome.SkipPolicy };
           }
           if (shouldSync) {
-            // Drop stale cross-scene sync events: a slow swap<->home event must
-            // not overwrite a selection the user has changed since it was sent.
+            // Cheap early exit for an event that is already visibly older than
+            // the committed selection - it skips the merge and fix work below.
+            // Only an optimization: the authoritative compare-if-newer verdict
+            // is `eventUpdatedAt` inside the update mutex, which re-reads the
+            // committed revision after the awaits below.
             const eventPayloadUpdatedAt = eventPayload.selectedAccountUpdatedAt;
             const currentUpdatedAt = get(accountSelectorUpdateMetaAtom())[num]
               ?.updatedAt;
@@ -3905,12 +4100,23 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               });
             phase = 'selection-update';
             const selectionResult = await this.updateSelectedAccount.call(set, {
-              expectedSelection: current,
-              expectedUpdatedAt: currentUpdatedAt ?? null,
+              // Compare-if-newer instead of the exact-match CAS: a CAS keyed on
+              // `current`/`currentUpdatedAt` (both read before the awaits
+              // above) dropped whichever of two burst events entered the mutex
+              // second - even when it was the newer one - with no retry.
+              // An event without a revision maps to null: apply only into an
+              // unversioned slot, never over a committed revision.
+              eventUpdatedAt: eventPayloadUpdatedAt ?? null,
               parentOperationId: operationId,
               updateMeta: {
                 eventEmitDisabled: true, // stop update infinite loop here
-                updatedAt: eventPayload.selectedAccountUpdatedAt ?? Date.now(),
+                // The source revision, not the receive time: cross-runtime
+                // comparability of later events depends on committing the
+                // revision the event was emitted with. No Date.now() fallback
+                // - an unversioned event stays unversioned (the commit path
+                // leaves the revision unset for eventUpdatedAt: null), so a
+                // later event carrying a real revision can still win.
+                updatedAt: eventPayload.selectedAccountUpdatedAt,
               },
               num,
               reason: 'syncHomeAndSwapSelectedAccount',
@@ -4825,7 +5031,19 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               pendingSideEffectSelection,
               selectedAccount,
             );
-            if (primaryAlreadySaved && !shouldReplaySideEffects) {
+            // Never skip side effects on extension: the popup JS heap can be
+            // reclaimed by the browser at any moment, the pending-side-effect
+            // map above is memory-only, and coldStartCacheStorage is a no-op
+            // stub on extension targets. A primary write that reached disk with
+            // its side effects (global derive save, home sync, change event)
+            // still pending would therefore lose them permanently, so the
+            // extension always replays side effects even for an already-saved
+            // selection.
+            if (
+              primaryAlreadySaved &&
+              !shouldReplaySideEffects &&
+              !platformEnv.isExtension
+            ) {
               // console.log(
               //   'AccountSelector.saveToStorage skip, selectedAccount not changed',
               // );
@@ -4927,7 +5145,27 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
 
             // **** emit event
             storagePhase = 'emit-event';
-            if (!eventEmitDisabled) {
+            // Extension cold starts reach this point with an already-saved
+            // primary and no revision: initFromStorage applies storage with
+            // the 'untracked' policy, the recent-selection cache is a no-op
+            // on extension, so the meta atom holds nothing and the auto-save
+            // cannot short-circuit - the unconditional side-effect replay
+            // above then runs for the plain disk value. Re-announcing that
+            // value as an unversioned event has no delta to broadcast (every
+            // peer reads the same disk) but can overwrite a peer that holds
+            // no revision yet, so suppress the event and keep only the
+            // derive/home-sync replay - the recovery channel for a killed
+            // popup, which must NOT be silenced here. A save whose primary
+            // actually wrote (a real delta, e.g. an init repair) still emits
+            // even without a revision; receivers apply it only when they hold
+            // no committed revision themselves.
+            const suppressUnversionedReplayEvent =
+              platformEnv.isExtension &&
+              primaryAlreadySaved &&
+              payload.selectedAccountUpdatedAt === undefined;
+            const shouldEmitEvent =
+              !eventEmitDisabled && !suppressUnversionedReplayEvent;
+            if (shouldEmitEvent) {
               if (
                 networkUtils.isAllNetwork({
                   networkId: payload.selectedAccount?.networkId,
@@ -4956,7 +5194,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               successOutcome = EStorageSaveOutcome.ReplayedSideEffects;
             }
             logStorageResult({
-              eventEmitted: !eventEmitDisabled,
+              eventEmitted: shouldEmitEvent,
               eventEmitDisabled,
               outcome: successOutcome,
               syncedHome,

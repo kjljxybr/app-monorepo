@@ -12,6 +12,7 @@ import { EAccountSelectorSceneName } from '@onekeyhq/shared/types';
 import {
   AccountSelectorJotaiProvider,
   accountSelectorStorageReadyAtom,
+  accountSelectorUpdateMetaAtom,
   defaultSelectedAccount,
   selectedAccountsAtom,
 } from '../../states/jotai/contexts/accountSelector/atoms';
@@ -134,7 +135,7 @@ jest.mock('@onekeyhq/shared/src/logger/logger', () => {
   };
 });
 
-describe('AccountSelectorEffects num-filtered events', () => {
+describe('AccountSelectorEffects cross-num event fallback', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetGlobalDeriveType.mockResolvedValue('default');
@@ -144,7 +145,7 @@ describe('AccountSelectorEffects num-filtered events', () => {
     mockShouldSyncHomeAndSwapSelectedAccount.mockResolvedValue(false);
   });
 
-  it('drops a DAppNetworkUpdate for an unmounted num and applies one for its own num once', async () => {
+  it('applies a DAppNetworkUpdate for an unmounted num through the mounted sibling', async () => {
     const sceneName = EAccountSelectorSceneName.home;
     const sceneUrl = '';
     const store = createStore();
@@ -168,12 +169,12 @@ describe('AccountSelectorEffects num-filtered events', () => {
     const unsubscribe = store.sub(selectedAccountsAtom(), () => {
       selectionWriteCount += 1;
     });
-    const selectionsBeforeEvents = store.get(selectedAccountsAtom());
 
     try {
       // Only a num-0 effects instance is mounted (the registry shrink covered
-      // in jotaiContextStore.test.ts is what makes this state reachable), so a
-      // matching event addressed to num 1 must be dropped entirely.
+      // in jotaiContextStore.test.ts is what makes this state reachable). The
+      // event addressed to num 1 must still land: any mounted instance in the
+      // scene acts as the fallback handler for its siblings.
       await act(async () => {
         appEventBus.emit(EAppEventBusNames.DAppNetworkUpdate, {
           networkId: 'evm--1',
@@ -181,16 +182,15 @@ describe('AccountSelectorEffects num-filtered events', () => {
           sceneName,
           sceneUrl,
         });
-        await new Promise((resolve) => {
-          setTimeout(resolve, 0);
-        });
+      });
+      await waitFor(() => {
+        expect(store.get(selectedAccountsAtom())[1]?.networkId).toBe('evm--1');
       });
 
-      expect(mockGetGlobalDeriveType).not.toHaveBeenCalled();
-      expect(store.get(selectedAccountsAtom())).toBe(selectionsBeforeEvents);
-      expect(selectionWriteCount).toBe(0);
+      expect(selectionWriteCount).toBe(1);
+      expect(store.get(selectedAccountsAtom())[0]?.networkId).toBeUndefined();
 
-      // The same event addressed to the mounted num commits exactly once.
+      // An event addressed to the mounted num commits exactly once too.
       await act(async () => {
         appEventBus.emit(EAppEventBusNames.DAppNetworkUpdate, {
           networkId: 'evm--1',
@@ -203,11 +203,398 @@ describe('AccountSelectorEffects num-filtered events', () => {
         expect(store.get(selectedAccountsAtom())[0]?.networkId).toBe('evm--1');
       });
 
-      expect(selectionWriteCount).toBe(1);
-      expect(mockGetGlobalDeriveType).toHaveBeenCalledTimes(1);
-      expect(store.get(selectedAccountsAtom())[1]).toBeUndefined();
+      expect(selectionWriteCount).toBe(2);
     } finally {
       unsubscribe();
     }
+  });
+
+  it('collapses duplicate handling into a noop when sibling instances share one event', async () => {
+    const sceneName = EAccountSelectorSceneName.home;
+    const sceneUrl = '';
+    const store = createStore();
+    store.set(accountSelectorStorageReadyAtom(), false);
+    store.set(selectedAccountsAtom(), {
+      0: defaultSelectedAccount(),
+      1: defaultSelectedAccount(),
+    });
+
+    render(
+      <AccountSelectorJotaiProvider
+        store={store}
+        config={{ sceneName, sceneUrl }}
+      >
+        <AccountSelectorEffects num={0} />
+        <AccountSelectorEffects num={1} />
+      </AccountSelectorJotaiProvider>,
+    );
+    await act(async () => {});
+
+    let selectionWriteCount = 0;
+    const unsubscribe = store.sub(selectedAccountsAtom(), () => {
+      selectionWriteCount += 1;
+    });
+
+    try {
+      await act(async () => {
+        appEventBus.emit(EAppEventBusNames.DAppNetworkUpdate, {
+          networkId: 'evm--1',
+          num: 1,
+          sceneName,
+          sceneUrl,
+        });
+      });
+      await waitFor(() => {
+        expect(store.get(selectedAccountsAtom())[1]?.networkId).toBe('evm--1');
+      });
+      // Let the second instance's serialized update finish before counting.
+      await act(async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 0);
+        });
+      });
+
+      // Both mounted instances handled the event; the duplicate application
+      // must collapse into an equal-value noop instead of a second atom write.
+      expect(selectionWriteCount).toBe(1);
+      expect(store.get(selectedAccountsAtom())[0]?.networkId).toBeUndefined();
+    } finally {
+      unsubscribe();
+    }
+  });
+});
+
+describe('AccountSelectorEffects discover remote event sync', () => {
+  const sceneName = EAccountSelectorSceneName.discover;
+  const sceneUrl = 'https://dapp.burst-order.test';
+
+  const buildRemoteSelectedAccountUpdate = ({
+    indexedAccountId,
+    selectedAccountUpdatedAt,
+  }: {
+    indexedAccountId: string;
+    selectedAccountUpdatedAt: number | undefined;
+  }) => ({
+    // Simulates the ext background bridge: a real remote payload keeps this
+    // flag only when re-emitted with isRemote, so emitToSelf below is used
+    // instead of emit (which strips it from locally originated payloads).
+    $$isRemoteEvent: true,
+    num: 0,
+    sceneName,
+    sceneUrl,
+    selectedAccount: {
+      ...defaultSelectedAccount(),
+      walletId: 'hd-1',
+      indexedAccountId,
+      networkId: 'tron--0x2b6653dc',
+      deriveType: 'default' as const,
+      focusedWallet: 'hd-1',
+    },
+    selectedAccountUpdatedAt,
+  });
+
+  const mountDiscoverEffects = () => {
+    const store = createStore();
+    store.set(accountSelectorStorageReadyAtom(), false);
+    store.set(selectedAccountsAtom(), { 0: defaultSelectedAccount() });
+    render(
+      <AccountSelectorJotaiProvider
+        store={store}
+        config={{ sceneName, sceneUrl }}
+      >
+        <AccountSelectorEffects num={0} />
+      </AccountSelectorJotaiProvider>,
+    );
+    return store;
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetGlobalDeriveType.mockResolvedValue('default');
+    mockShouldUseGlobalDeriveType.mockResolvedValue(true);
+    mockIsDeriveTypeAvailableForNetwork.mockResolvedValue(true);
+    mockIsInTransferImportOrBackupRestoreFlow.mockResolvedValue(false);
+    mockShouldSyncHomeAndSwapSelectedAccount.mockResolvedValue(false);
+  });
+
+  it('converges a remote event burst arriving in emit order on the newest revision', async () => {
+    // The core race of the compare-if-newer fix: two rapid switches on the
+    // peer runtime, both handlers read the pre-mutex revision before either
+    // commits. The exact-match CAS dropped whichever event entered the update
+    // mutex second - here the NEWER one - and nothing retried it, leaving
+    // this runtime on the older selection until the next event.
+    const store = mountDiscoverEffects();
+    await act(async () => {});
+
+    await act(async () => {
+      appEventBus.emitToSelf({
+        type: EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+        payload: buildRemoteSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--0',
+          selectedAccountUpdatedAt: 1000,
+        }),
+        isRemote: true,
+      });
+      // Emitted before the first handler committed, so both handlers hold the
+      // same pre-mutex snapshot - the burst shape that broke the CAS.
+      appEventBus.emitToSelf({
+        type: EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+        payload: buildRemoteSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--1',
+          selectedAccountUpdatedAt: 2000,
+        }),
+        isRemote: true,
+      });
+    });
+
+    await waitFor(() => {
+      expect(store.get(selectedAccountsAtom())[0]?.indexedAccountId).toBe(
+        'hd-1--1',
+      );
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+  });
+
+  it('drops the older event of a burst arriving out of emit order', async () => {
+    // Reversed arrival: the newer event lands first. Unconditional apply (the
+    // pre-guard behavior) would let the older trailing event overwrite it with
+    // a monotonic-floor-bumped revision; it must be dropped instead.
+    const store = mountDiscoverEffects();
+    await act(async () => {});
+
+    await act(async () => {
+      appEventBus.emitToSelf({
+        type: EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+        payload: buildRemoteSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--1',
+          selectedAccountUpdatedAt: 2000,
+        }),
+        isRemote: true,
+      });
+      appEventBus.emitToSelf({
+        type: EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+        payload: buildRemoteSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--0',
+          selectedAccountUpdatedAt: 1000,
+        }),
+        isRemote: true,
+      });
+    });
+
+    await waitFor(() => {
+      expect(store.get(selectedAccountsAtom())[0]?.indexedAccountId).toBe(
+        'hd-1--1',
+      );
+    });
+    // The older event must not have overwritten the committed revision either.
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+  });
+
+  it('drops a remote event without a revision once a revision is committed', async () => {
+    // An unversioned remote event is a cold-start replay of a peer's disk
+    // snapshot. It must never overwrite a slot that already holds a committed
+    // revision - the legacy always-apply semantics rolled the selection back
+    // and (with the receive-time stamp) kept it stuck.
+    const store = mountDiscoverEffects();
+    await act(async () => {});
+    await act(async () => {
+      store.set(selectedAccountsAtom(), {
+        0: buildRemoteSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--1',
+          selectedAccountUpdatedAt: 2000,
+        }).selectedAccount,
+      });
+      store.set(accountSelectorUpdateMetaAtom(), {
+        0: { eventEmitDisabled: false, updatedAt: 2000 },
+      });
+    });
+
+    await act(async () => {
+      appEventBus.emitToSelf({
+        type: EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+        payload: buildRemoteSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--0',
+          selectedAccountUpdatedAt: undefined,
+        }),
+        isRemote: true,
+      });
+    });
+    // Let the serialized handler chain finish before asserting the negative.
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]?.indexedAccountId).toBe(
+      'hd-1--1',
+    );
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
+  });
+
+  it('fills a cold slot from an unversioned event and lets a later revision win', async () => {
+    // The A1 stuck-rollback regression at the effects layer: the unversioned
+    // apply must leave the slot unversioned, so the genuine update emitted at
+    // T1 < now still wins afterwards. Restoring the `?? Date.now()` fallback
+    // in syncSceneData makes the second event lose and this test fail.
+    const store = mountDiscoverEffects();
+    await act(async () => {});
+
+    await act(async () => {
+      appEventBus.emitToSelf({
+        type: EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+        payload: buildRemoteSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--0',
+          selectedAccountUpdatedAt: undefined,
+        }),
+        isRemote: true,
+      });
+    });
+    await waitFor(() => {
+      expect(store.get(selectedAccountsAtom())[0]?.indexedAccountId).toBe(
+        'hd-1--0',
+      );
+    });
+    // Applied without minting a revision.
+    expect(
+      store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt,
+    ).toBeUndefined();
+
+    await act(async () => {
+      appEventBus.emitToSelf({
+        type: EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+        payload: buildRemoteSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--1',
+          selectedAccountUpdatedAt: 1000,
+        }),
+        isRemote: true,
+      });
+    });
+    await waitFor(() => {
+      expect(store.get(selectedAccountsAtom())[0]?.indexedAccountId).toBe(
+        'hd-1--1',
+      );
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(1000);
+  });
+});
+
+describe('AccountSelectorEffects same-scene remote event sync', () => {
+  const sceneName = EAccountSelectorSceneName.home;
+
+  const buildRemoteHomeSelectedAccountUpdate = ({
+    indexedAccountId,
+    selectedAccountUpdatedAt,
+  }: {
+    indexedAccountId: string;
+    selectedAccountUpdatedAt: number;
+  }) => ({
+    $$isRemoteEvent: true,
+    num: 0,
+    sceneName,
+    selectedAccount: {
+      ...defaultSelectedAccount(),
+      walletId: 'hd-1',
+      indexedAccountId,
+      networkId: 'tron--0x2b6653dc',
+      deriveType: 'default' as const,
+      focusedWallet: 'hd-1',
+    },
+    selectedAccountUpdatedAt,
+  });
+
+  const mountHomeEffects = () => {
+    const store = createStore();
+    store.set(accountSelectorStorageReadyAtom(), false);
+    store.set(selectedAccountsAtom(), { 0: defaultSelectedAccount() });
+    render(
+      <AccountSelectorJotaiProvider store={store} config={{ sceneName }}>
+        <AccountSelectorEffects num={0} />
+      </AccountSelectorJotaiProvider>,
+    );
+    return store;
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetGlobalDeriveType.mockResolvedValue('default');
+    mockShouldUseGlobalDeriveType.mockResolvedValue(true);
+    mockIsDeriveTypeAvailableForNetwork.mockResolvedValue(true);
+    mockIsInTransferImportOrBackupRestoreFlow.mockResolvedValue(false);
+    mockShouldSyncHomeAndSwapSelectedAccount.mockResolvedValue(false);
+  });
+
+  it('converges onto a peer runtime event for the very scene this instance renders', async () => {
+    // Extension popup and expanded tab both mount the home scene in separate
+    // JS runtimes. The same-scene branch used to skip these events outright,
+    // so the two windows never converged; now the peer's event applies
+    // through compare-if-newer with its source revision, and the committed
+    // eventEmitDisabled flag keeps the follow-up auto-save from echoing.
+    const store = mountHomeEffects();
+    await act(async () => {});
+    await act(async () => {
+      store.set(accountSelectorUpdateMetaAtom(), {
+        0: { eventEmitDisabled: false, updatedAt: 1000 },
+      });
+    });
+
+    await act(async () => {
+      appEventBus.emitToSelf({
+        type: EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+        payload: buildRemoteHomeSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--1',
+          selectedAccountUpdatedAt: 2000,
+        }),
+        isRemote: true,
+      });
+    });
+
+    await waitFor(() => {
+      expect(store.get(selectedAccountsAtom())[0]?.indexedAccountId).toBe(
+        'hd-1--1',
+      );
+    });
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]).toMatchObject({
+      eventEmitDisabled: true,
+      updatedAt: 2000,
+    });
+  });
+
+  it('keeps a newer local commit against a stale same-scene peer event', async () => {
+    const store = mountHomeEffects();
+    await act(async () => {});
+    await act(async () => {
+      store.set(selectedAccountsAtom(), {
+        0: buildRemoteHomeSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--1',
+          selectedAccountUpdatedAt: 2000,
+        }).selectedAccount,
+      });
+      store.set(accountSelectorUpdateMetaAtom(), {
+        0: { eventEmitDisabled: false, updatedAt: 2000 },
+      });
+    });
+
+    await act(async () => {
+      appEventBus.emitToSelf({
+        type: EAppEventBusNames.AccountSelectorSelectedAccountUpdate,
+        payload: buildRemoteHomeSelectedAccountUpdate({
+          indexedAccountId: 'hd-1--0',
+          selectedAccountUpdatedAt: 1000,
+        }),
+        isRemote: true,
+      });
+    });
+    // Let the serialized handler chain finish before asserting the negative.
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(store.get(selectedAccountsAtom())[0]?.indexedAccountId).toBe(
+      'hd-1--1',
+    );
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]?.updatedAt).toBe(2000);
   });
 });
