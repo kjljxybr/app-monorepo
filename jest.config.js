@@ -142,6 +142,8 @@ module.exports = async () => {
       // CLI integration/smoke tests require a built binary and must not run in unit-test CI.
       '\\.integration\\.test\\.ts$',
       '-smoke\\.test\\.ts$',
+      // Browser benchmark self-tests use node:test through an explicit script.
+      '<rootDir>/apps/web/e2e/.*\\.test\\.js$',
       '<rootDir>/\\.claude/worktrees/',
       '<rootDir>/\\.tmp/',
       '<rootDir>/\\.worktree/',

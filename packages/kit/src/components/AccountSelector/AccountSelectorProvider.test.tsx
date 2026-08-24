@@ -2,7 +2,7 @@
 
 import { memo } from 'react';
 
-import { render } from '@testing-library/react';
+import { act, render } from '@testing-library/react';
 import { cloneDeep } from 'lodash';
 
 import { getJotaiContextTrackerMap } from '@onekeyhq/kit-bg/src/states/jotai/atoms';
@@ -11,8 +11,11 @@ import { EAccountSelectorSceneName } from '@onekeyhq/shared/types';
 
 import {
   accountSelectorAvailableNetworksAtom,
+  defaultSelectedAccount,
+  selectedAccountsAtom,
   useAccountSelectorAvailableNetworksByNum,
   useAccountSelectorContextData,
+  useSelectedAccount,
 } from '../../states/jotai/contexts/accountSelector/atoms';
 import { jotaiContextStore } from '../../states/jotai/utils/jotaiContextStore';
 
@@ -23,6 +26,31 @@ import type {
   IAccountSelectorAvailableNetworksMap,
 } from '../../states/jotai/contexts/accountSelector/atoms';
 import type { IJotaiContextStore } from '../../states/jotai/utils/createJotaiContext';
+
+const mockPerfTrace = jest.fn();
+const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+
+jest.mock('@onekeyhq/shared/src/logger/logger', () => {
+  const loggerProxy: unknown = new Proxy(jest.fn(), {
+    apply: () => undefined,
+    get: (_target, property) =>
+      property === 'trace' ? mockPerfTrace : loggerProxy,
+  });
+  return { defaultLogger: loggerProxy };
+});
+
+jest.mock('../../states/jotai/contexts/accountSelector/perfDebug', () => ({
+  getActiveAccountPerfCommitMeta: () => undefined,
+  getNextAccountSelectorPerfOperationId: () => 1,
+  getSelectedAccountPerfCommitMeta: () => ({
+    changedFields: ['networkId'],
+    num: 0,
+    reason: 'test-selection',
+    stateUpdatedAt: performance.now() - 5,
+    transitionId: 1,
+  }),
+  isAccountSelectorPerfDebugEnabled: () => true,
+}));
 
 // AccountSelectorProvider imports JotaiContextStoreMirrorTracker, whose module
 // graph reaches JotaiContextRootProviderRenderer and every root provider view.
@@ -165,5 +193,75 @@ describe('AccountSelectorProviderMirror availableNetworksMap init guard', () => 
     expect(observedAvailableNetworks).toEqual({
       networkIds: ['evm--1', 'evm--137'],
     });
+  });
+});
+
+describe('AccountSelectorProviderMirror paint attribution', () => {
+  beforeEach(() => {
+    jotaiContextStore.storeCache.clear();
+    jotaiContextStore.storeResetRequests.clear();
+    clearJotaiContextTrackerMap();
+    mockPerfTrace.mockClear();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+    jotaiContextStore.storeCache.clear();
+    jotaiContextStore.storeResetRequests.clear();
+    clearJotaiContextTrackerMap();
+  });
+
+  it('reports selection state-to-paint latency after a tracked provider commit', () => {
+    let contextStore: IJotaiContextStore | undefined;
+    globalThis.requestAnimationFrame = (callback: FrameRequestCallback) => {
+      callback(performance.now() + 16);
+      return 1;
+    };
+
+    function Consumer() {
+      contextStore = useAccountSelectorContextData().store;
+      useSelectedAccount({ num: 0 });
+      return null;
+    }
+
+    render(
+      <AccountSelectorProviderMirror
+        config={{ sceneName: EAccountSelectorSceneName.home }}
+        enabledNum={[0]}
+        perfDebugName="provider-paint-test"
+        waitForStorageReady={false}
+      >
+        <Consumer />
+      </AccountSelectorProviderMirror>,
+    );
+
+    if (!contextStore) {
+      throw new OneKeyLocalError('context store not captured');
+    }
+    const store = contextStore;
+    mockPerfTrace.mockClear();
+
+    act(() => {
+      store.set(selectedAccountsAtom(), {
+        0: { ...defaultSelectedAccount(), networkId: 'evm--1' },
+      });
+    });
+
+    expect(mockPerfTrace).toHaveBeenCalledWith(
+      'providerSubtreePaint',
+      expect.objectContaining({
+        commitToPaintMs: expect.any(Number),
+        perfDebugName: 'provider-paint-test',
+        stateChanges: expect.arrayContaining([
+          expect.objectContaining({
+            num: 0,
+            selectedChanged: true,
+            selectionStateToPaintMs: expect.any(Number),
+            selectionTransitionId: 1,
+          }),
+        ]),
+      }),
+    );
   });
 });

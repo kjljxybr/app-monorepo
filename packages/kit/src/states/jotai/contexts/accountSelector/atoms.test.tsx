@@ -2,7 +2,7 @@
 
 import type { ReactNode } from 'react';
 
-import { act, renderHook } from '@testing-library/react';
+import { act, render, renderHook } from '@testing-library/react';
 import { createStore } from 'jotai';
 
 import { EAccountSelectorSceneName } from '@onekeyhq/shared/types';
@@ -127,5 +127,64 @@ describe('account selector atom hooks', () => {
     });
 
     expect(renderCount).toBeGreaterThan(initialRenderCount);
+  });
+
+  it('keeps update cost isolated with many enabled nums', () => {
+    const slotCount = 64;
+    const targetNum = 37;
+    const store = createStore();
+    store.set(
+      selectedAccountsAtom(),
+      Object.fromEntries(
+        Array.from({ length: slotCount }, (_value, num) => [
+          num,
+          defaultSelectedAccount(),
+        ]),
+      ),
+    );
+
+    function Wrapper({ children }: { children?: ReactNode }) {
+      return (
+        <AccountSelectorJotaiProvider
+          store={store}
+          config={{ sceneName: EAccountSelectorSceneName.home }}
+        >
+          {children}
+        </AccountSelectorJotaiProvider>
+      );
+    }
+
+    const renderCounts = Array.from({ length: slotCount }, () => 0);
+    function Slot({ num }: { num: number }) {
+      renderCounts[num] += 1;
+      useSelectedAccount({ num });
+      return null;
+    }
+
+    render(
+      <Wrapper>
+        {Array.from({ length: slotCount }, (_value, num) => (
+          <Slot key={num} num={num} />
+        ))}
+      </Wrapper>,
+    );
+    const initialRenderCounts = [...renderCounts];
+
+    act(() => {
+      store.set(selectedAccountsAtom(), (current) => ({
+        ...current,
+        [targetNum]: {
+          ...defaultSelectedAccount(),
+          networkId: 'evm--1',
+        },
+      }));
+    });
+
+    expect(renderCounts[targetNum]).toBe(initialRenderCounts[targetNum] + 1);
+    for (let num = 0; num < slotCount; num += 1) {
+      if (num !== targetNum) {
+        expect(renderCounts[num]).toBe(initialRenderCounts[num]);
+      }
+    }
   });
 });

@@ -54,6 +54,7 @@ export type TAccountSelectorPerfEventName =
   | 'mirrorTrackerCommit'
   | 'mirrorTrackerRegistration'
   | 'providerSubtreeCommit'
+  | 'providerSubtreePaint'
   | 'providerUntrackedCommitBatch'
   | 'selectionStateUpdated'
   | 'selectionRefresh'

@@ -296,6 +296,7 @@ export function AccountSelectorProviderMirror({
           activeChangedFields: activeMeta?.changedFields,
           activeReloadId: activeMeta?.reloadId,
           activeScheduleId: activeMeta?.scheduleId,
+          activeStateUpdatedAt: activeMeta?.stateUpdatedAt,
           activeStateToProviderCommitMs: activeMeta
             ? Math.round(commitTime - activeMeta.stateUpdatedAt)
             : undefined,
@@ -309,6 +310,7 @@ export function AccountSelectorProviderMirror({
           selectionStateToProviderCommitMs: selectionMeta
             ? Math.round(commitTime - selectionMeta.stateUpdatedAt)
             : undefined,
+          selectionStateUpdatedAt: selectionMeta?.stateUpdatedAt,
           selectionTransitionId: selectionMeta?.transitionId,
           syncLoading: Boolean(syncLoading[num]?.isLoading),
           syncLoadingChanged,
@@ -329,6 +331,10 @@ export function AccountSelectorProviderMirror({
             change.updateMetaChanged,
         );
       const slow = actualDuration > 16;
+      const traceStateChanges = stateChanges.map(
+        ({ activeStateUpdatedAt, selectionStateUpdatedAt, ...change }) =>
+          change,
+      );
       if (trackedStateChanged || slow) {
         flushProviderUntrackedBatch();
         let attribution = 'untracked-subtree-or-parent';
@@ -354,7 +360,7 @@ export function AccountSelectorProviderMirror({
           scopeChanged,
           slow,
           startTime: Math.round(startTime * 100) / 100,
-          stateChanges,
+          stateChanges: traceStateChanges,
           storageReadyChanged,
           trackedStateChanged,
         });
@@ -388,6 +394,45 @@ export function AccountSelectorProviderMirror({
             flushProviderUntrackedBatch();
           }, 250);
         }
+      }
+      if (
+        trackedStateChanged &&
+        !initialObservation &&
+        typeof requestAnimationFrame === 'function'
+      ) {
+        requestAnimationFrame((paintTime) => {
+          if (!isAccountSelectorPerfDebugEnabled()) {
+            return;
+          }
+          defaultLogger.accountSelector.perf.trace('providerSubtreePaint', {
+            commitIndex,
+            commitToPaintMs:
+              Math.round(Math.max(0, paintTime - commitTime) * 100) / 100,
+            enabledNum: stableEnabledNum,
+            perfDebugName,
+            providerInstanceId: providerInstanceIdRef.current,
+            sceneName: stableConfig.sceneName,
+            stateChanges: stateChanges.map((change) => ({
+              activeChanged: change.activeChanged,
+              activeReloadId: change.activeReloadId,
+              activeStateToPaintMs:
+                change.activeChanged &&
+                change.activeStateUpdatedAt !== undefined
+                  ? Math.round(paintTime - change.activeStateUpdatedAt)
+                  : undefined,
+              activeTrigger: change.activeTrigger,
+              num: change.num,
+              selectedChanged: change.selectedChanged,
+              selectionReason: change.selectionReason,
+              selectionStateToPaintMs:
+                change.selectedChanged &&
+                change.selectionStateUpdatedAt !== undefined
+                  ? Math.round(paintTime - change.selectionStateUpdatedAt)
+                  : undefined,
+              selectionTransitionId: change.selectionTransitionId,
+            })),
+          });
+        });
       }
       providerPerfStateRef.current = {
         activeAccounts,

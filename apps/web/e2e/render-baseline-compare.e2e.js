@@ -2,15 +2,16 @@
 
 /*
  * One-command cross-branch A/B driver for the render commit baseline
- * (render-commit-baseline.e2e.js). Codifies the manual recipe from
- * apps/web/e2e/render-baselines/README.md ("Reproducing a future x baseline"):
+ * (render-commit-baseline.e2e.js). The whole protocol lives here, in the code
+ * that actually runs it, so it cannot drift from a prose description:
  *
  *   1. Baseline target: a PINNED x commit (constant below, overridable via
- *      RENDER_BASELINE_X_COMMIT). Pinning keeps future runs comparable against
- *      the recorded pair even after origin/x moves on.
- *   2. Candidate target: the current repo's committed HEAD. A dirty worktree
- *      only produces a warning: the clones measure the COMMIT, never
- *      uncommitted changes (by design - numbers must describe a sha).
+ *      RENDER_BASELINE_X_COMMIT). Pinning keeps successive candidate runs
+ *      comparable with each other even after origin/x moves on.
+ *   2. Candidate target: the current repo's committed HEAD, or the exact
+ *      RENDER_BASELINE_CANDIDATE_COMMIT override. Product code always comes
+ *      from that commit; the benchmark harness comes from this worktree and
+ *      its SHA-256 is recorded in the summary.
  *   3. Both targets are measured in disposable local clones under
  *      .tmp/render-baseline-clones/ in this repo (gitignored). Each clone is a
  *      `git clone --no-checkout <localRepoPath>` (plain path, NOT file://, so
@@ -29,20 +30,20 @@
  *      hardlinks. An aggressive `git gc --prune` in the main repo could only
  *      race the brief clone step itself; once a clone exists its hardlinks
  *      keep the objects alive independently. Negligible for a ~10-minute run.
- *   5. The harness is copied from the CANDIDATE CLONE (the committed version)
- *      into the x clone byte-identical, and the one-line
- *      test:e2e:web:render-baseline script is injected into the x clone's
- *      package.json. Nothing ever requires x's local-secret-envelope.e2e.js
- *      (it executes its whole suite on require).
+ *   5. The harness is copied from THIS DRIVER'S WORKTREE into both clones
+ *      byte-identical, and the one-line test:e2e:web:render-baseline script is
+ *      injected into each clone's package.json. This permits fair historical
+ *      commit comparisons after a harness fix without changing product code.
  *   6. Both measurements run back-to-back (x first, then candidate) with
  *      WEB_E2E_HEADLESS=true, on an otherwise idle machine; RENDER_BASELINE_*
  *      and WEB_E2E_* env knobs pass through to the harness.
- *   7. The two v3 artifacts are compared per phase (rendered components,
+ *   7. The two v4 artifacts are compared per phase (rendered components,
  *      commits, max rendered per commit, actualDuration; medians + % change,
  *      background-churn highlighted) and a machine-readable summary (which
  *      embeds the gate verdict from step 8) plus copies of both raw artifacts
- *      are written to .tmp/render-baseline/ in THIS repo. Recording a new
- *      baseline pair stays a manual, reviewed step.
+ *      are written to .tmp/render-baseline/ in THIS repo. Nothing is recorded
+ *      into the repository: both sides are re-measured live in every run, so
+ *      there is no stored baseline that could go stale against the code.
  *   8. Regression gate (default ON; RENDER_BASELINE_GATE=0 disables): for
  *      every phase measured on both sides, the candidate's renderedComponents
  *      and commits medians must not exceed the x medians of the SAME run by
@@ -59,22 +60,27 @@
 // cspell:ignore pgrep hardlink hardlinks checkoutable
 
 const { execFileSync, spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
 const repoRoot = path.resolve(__dirname, '../../..');
 
-// The recorded v2 baseline pair was measured at this origin/x commit (see
-// apps/web/e2e/render-baselines/README.md). Re-pinning policy: when the team
-// decides to move the baseline, update this constant AND record a new artifact
-// pair in render-baselines/ in the same change.
+// origin/x commit the candidate is compared against by default. Pinning keeps
+// successive candidate runs comparable with each other as origin/x moves on.
+// It is NOT a stored measurement: the x side is re-measured live in every run,
+// so re-pinning is a one-line change with no recorded artifact to keep in
+// sync. Re-pin once x has drifted far enough that the comparison stops
+// describing the regression this baseline guards.
 const DEFAULT_PINNED_X_COMMIT = 'a830dee4bbcee70217c127ec369432cd15c4b14e';
 
 const HARNESS_RELATIVE_PATH = 'apps/web/e2e/render-commit-baseline.e2e.js';
+const METRICS_VERSION = 5;
 const RUN_SCRIPT_NAME = 'test:e2e:web:render-baseline';
 const RUN_SCRIPT_COMMAND = 'node apps/web/e2e/render-commit-baseline.e2e.js';
 const DECISIVE_PHASE = 'background-churn';
+const RETENTION_PHASE = 'selector-retention';
 
 const clonesRoot =
   process.env.RENDER_BASELINE_CLONES_DIR ||
@@ -239,6 +245,24 @@ function resolvePinnedXCommit() {
   return { sha: resolved, source: `RENDER_BASELINE_X_COMMIT (${override})` };
 }
 
+function resolveCandidateCommit() {
+  const target = process.env.RENDER_BASELINE_CANDIDATE_COMMIT || 'HEAD';
+  const sha = tryGit(['rev-parse', `${target}^{commit}`], repoRoot);
+  if (!sha) {
+    throw new Error(
+      `RENDER_BASELINE_CANDIDATE_COMMIT=${target} does not resolve to a ` +
+        `commit in ${repoRoot}`,
+    );
+  }
+  return {
+    sha,
+    source:
+      target === 'HEAD'
+        ? 'HEAD'
+        : `RENDER_BASELINE_CANDIDATE_COMMIT (${target})`,
+  };
+}
+
 function assertPinnedShaReachable(xSha) {
   // Hard requirement: the clones hardlink this repo's object store, so the
   // pinned commit must exist HERE for the detached checkout to work.
@@ -346,25 +370,33 @@ function ensureRunScript(cloneDir, label) {
   log(`${label}: injected ${RUN_SCRIPT_NAME} script into package.json`);
 }
 
-function propagateHarness(candidateDir, xDir) {
-  const source = path.join(candidateDir, HARNESS_RELATIVE_PATH);
+function propagateHarness(sourceRoot, targetClones) {
+  const source = path.join(sourceRoot, HARNESS_RELATIVE_PATH);
   if (!fs.existsSync(source)) {
     throw new Error(
-      `Candidate commit does not contain ${HARNESS_RELATIVE_PATH}; the ` +
-        'harness must be committed on the candidate branch.',
+      `Harness source does not contain ${HARNESS_RELATIVE_PATH}: ${sourceRoot}`,
     );
   }
-  const target = path.join(xDir, HARNESS_RELATIVE_PATH);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.copyFileSync(source, target);
-  if (!fs.readFileSync(source).equals(fs.readFileSync(target))) {
-    throw new Error('Harness copy into the x clone is not byte-identical');
+  for (const { dir, label } of targetClones) {
+    const target = path.join(dir, HARNESS_RELATIVE_PATH);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(source, target);
+    if (!fs.readFileSync(source).equals(fs.readFileSync(target))) {
+      throw new Error(
+        `Harness copy into the ${label} clone is not byte-identical`,
+      );
+    }
+    ensureRunScript(dir, `[${label}]`);
   }
-  log('harness propagated byte-identical from candidate clone into x clone');
-  ensureRunScript(xDir, '[x]');
-  // The candidate branch commits the script line already; ensureRunScript is
-  // a no-op there, but keeps arbitrary candidate commits runnable.
-  ensureRunScript(candidateDir, '[candidate]');
+  const sha256 = crypto
+    .createHash('sha256')
+    .update(fs.readFileSync(source))
+    .digest('hex');
+  log(
+    `harness propagated byte-identical from worktree into all clones ` +
+      `(sha256 ${sha256})`,
+  );
+  return { path: source, sha256 };
 }
 
 // ---------------------------------------------------------------------------
@@ -392,11 +424,11 @@ async function runMeasurement({ cloneDir, label, logFile, runArtifactDir }) {
   });
   const artifacts = fs
     .readdirSync(runArtifactDir)
-    .filter((name) => name.endsWith('-v3.json'));
+    .filter((name) => name.endsWith(`-v${METRICS_VERSION}.json`));
   if (artifacts.length !== 1) {
     throw new Error(
-      `Expected exactly one -v3.json artifact in ${runArtifactDir}, found ` +
-        `${artifacts.length}`,
+      `Expected exactly one -v${METRICS_VERSION}.json artifact in ` +
+        `${runArtifactDir}, found ${artifacts.length}`,
     );
   }
   const artifactPath = path.join(runArtifactDir, artifacts[0]);
@@ -438,6 +470,11 @@ function phaseMedian(phase, metric) {
       ? phase.actualDurationMs.median
       : null;
   }
+  if (metric.startsWith('diagnostics.')) {
+    const diagnostic = metric.slice('diagnostics.'.length);
+    const stats = phase.diagnostics?.[diagnostic];
+    return stats && typeof stats.median === 'number' ? stats.median : null;
+  }
   const stats = phase[metric];
   return stats && typeof stats.median === 'number' ? stats.median : null;
 }
@@ -460,6 +497,28 @@ function comparePhases(xArtifact, candidateArtifact) {
     ['commits', 'React commits / iteration (median)'],
     ['maxRenderedInCommit', 'max rendered in one commit (median)'],
     ['actualDurationMs', 'actualDuration ms / iteration (median)'],
+    [
+      'maxInteractionLatencyMs',
+      'max Event Timing latency ms / iteration (median)',
+    ],
+    [
+      'maxLongAnimationFrameMs',
+      'max Long Animation Frame ms / iteration (median)',
+    ],
+    ['diagnostics.reloadsStarted', 'reload calls / churn emit (median)'],
+    [
+      'diagnostics.reloadDurationTotalMs',
+      'reload duration ms / churn emit (median)',
+    ],
+    ['diagnostics.retainedDomNodes', 'retained DOM nodes / cycle (median)'],
+    [
+      'diagnostics.retainedEventListeners',
+      'retained event listeners / cycle (median)',
+    ],
+    [
+      'diagnostics.retainedJsHeapBytes',
+      'retained JS heap bytes / cycle (median)',
+    ],
   ];
   const rows = phaseNames.map((phaseName) => {
     const entry = { phase: phaseName };
@@ -534,8 +593,8 @@ function compareBoot(xArtifact, candidateArtifact) {
 function comparabilityWarnings(xArtifact, candidateArtifact) {
   const warnings = [];
   if (
-    xArtifact.metricsVersion !== 3 ||
-    candidateArtifact.metricsVersion !== 3
+    xArtifact.metricsVersion !== METRICS_VERSION ||
+    candidateArtifact.metricsVersion !== METRICS_VERSION
   ) {
     warnings.push(
       `metricsVersion mismatch: x=${xArtifact.metricsVersion} ` +
@@ -546,6 +605,7 @@ function comparabilityWarnings(xArtifact, candidateArtifact) {
     'iterations',
     'churnEmits',
     'quietMs',
+    'retentionIterations',
     'warmupIterations',
   ]) {
     if (xArtifact[key] !== candidateArtifact[key]) {
@@ -553,6 +613,24 @@ function comparabilityWarnings(xArtifact, candidateArtifact) {
         `${key} mismatch: x=${xArtifact[key]} candidate=${candidateArtifact[key]}`,
       );
     }
+  }
+  if (
+    JSON.stringify(xArtifact.fixture) !==
+    JSON.stringify(candidateArtifact.fixture)
+  ) {
+    warnings.push(
+      `fixture mismatch: x=${JSON.stringify(xArtifact.fixture)} ` +
+        `candidate=${JSON.stringify(candidateArtifact.fixture)}`,
+    );
+  }
+  if (
+    JSON.stringify(xArtifact.churnState) !==
+    JSON.stringify(candidateArtifact.churnState)
+  ) {
+    warnings.push(
+      `churnState mismatch: x=${JSON.stringify(xArtifact.churnState)} ` +
+        `candidate=${JSON.stringify(candidateArtifact.churnState)}`,
+    );
   }
   if (
     xArtifact.environment.headless !== candidateArtifact.environment.headless
@@ -572,17 +650,29 @@ function comparabilityWarnings(xArtifact, candidateArtifact) {
 // Regression gate
 // ---------------------------------------------------------------------------
 
-// Default threshold for the regression gate. With the harness's v3 warm-up
+// Default threshold for the regression gate. With the harness's warm-up
 // removing the first-iteration lazy-mount spike, back-to-back 5-sample
 // medians of the gated count metrics vary within roughly 10% run to run on an
 // idle machine; 1.3 sits well above that noise while still failing on the
-// multi-x regressions this baseline exists to guard (see
-// render-baselines/README.md).
+// multi-x regressions this baseline exists to guard.
 const DEFAULT_GATE_FACTOR = 1.3;
 // Gated: the stable count metrics. Warn-only: duration and wall time are too
 // noisy to fail a run on.
 const GATE_METRICS = ['renderedComponents', 'commits'];
-const GATE_WARN_ONLY_METRICS = ['actualDurationMs', 'wallMs'];
+const GATE_WARN_ONLY_METRICS = [
+  'actualDurationMs',
+  'maxInteractionLatencyMs',
+  'maxLongAnimationFrameMs',
+  'wallMs',
+];
+const CHURN_GATE_METRICS = ['diagnostics.reloadsStarted'];
+const CHURN_WARN_ONLY_METRICS = ['diagnostics.reloadDurationTotalMs'];
+const RETENTION_WARN_ONLY_METRICS = [
+  'diagnostics.retainedDocuments',
+  'diagnostics.retainedDomNodes',
+  'diagnostics.retainedEventListeners',
+  'diagnostics.retainedJsHeapBytes',
+];
 
 // Default ON; RENDER_BASELINE_GATE=0 disables the gate entirely.
 function isGateEnabled() {
@@ -638,7 +728,11 @@ function evaluateRegressionGate(xPhases, candidatePhases, factor) {
       );
     } else {
       const checks = [];
-      for (const metric of GATE_METRICS) {
+      const gatedMetrics =
+        phaseName === DECISIVE_PHASE
+          ? [...GATE_METRICS, ...CHURN_GATE_METRICS]
+          : GATE_METRICS;
+      for (const metric of gatedMetrics) {
         const xValue = phaseMedian(xPhase, metric);
         const candidateValue = phaseMedian(candidatePhase, metric);
         if (typeof xValue !== 'number' || typeof candidateValue !== 'number') {
@@ -665,7 +759,14 @@ function evaluateRegressionGate(xPhases, candidatePhases, factor) {
           }
         }
       }
-      for (const metric of GATE_WARN_ONLY_METRICS) {
+      let warnOnlyMetrics = GATE_WARN_ONLY_METRICS;
+      if (phaseName === DECISIVE_PHASE) {
+        warnOnlyMetrics = [...warnOnlyMetrics, ...CHURN_WARN_ONLY_METRICS];
+      }
+      if (phaseName === RETENTION_PHASE) {
+        warnOnlyMetrics = [...warnOnlyMetrics, ...RETENTION_WARN_ONLY_METRICS];
+      }
+      for (const metric of warnOnlyMetrics) {
         const xValue = phaseMedian(xPhase, metric);
         const candidateValue = phaseMedian(candidatePhase, metric);
         // actualDuration is best-effort and may legitimately be unavailable;
@@ -679,8 +780,8 @@ function evaluateRegressionGate(xPhases, candidatePhases, factor) {
             `phase ${phaseName} ${metric}: x median ${xValue} vs candidate ` +
               `median ${candidateValue} ` +
               `(${formatPct(pctChange(xValue, candidateValue))}) exceeds ` +
-              `factor ${factor} - WARNING ONLY, duration/wall metrics are too ` +
-              'noisy to gate',
+              `factor ${factor} - WARNING ONLY, this metric is not stable ` +
+              'enough to gate',
           );
         }
       }
@@ -790,8 +891,13 @@ async function main() {
   const pinned = resolvePinnedXCommit();
   const xSha = pinned.sha;
   const localOriginX = assertPinnedShaReachable(xSha);
-  const candidateSha = git(['rev-parse', 'HEAD'], repoRoot);
-  const candidateBranch = git(['branch', '--show-current'], repoRoot);
+  const candidate = resolveCandidateCommit();
+  const candidateSha = candidate.sha;
+  const currentHeadSha = git(['rev-parse', 'HEAD'], repoRoot);
+  const candidateBranch =
+    candidateSha === currentHeadSha
+      ? git(['branch', '--show-current'], repoRoot)
+      : '(historical detached target)';
   const worktreeDirty = git(['status', '--porcelain'], repoRoot) !== '';
 
   log(`baseline (x): ${xSha} [${pinned.source}]`);
@@ -801,7 +907,7 @@ async function main() {
   }
   log(
     `candidate:    ${candidateSha} ` +
-      `[HEAD${candidateBranch ? ` of ${candidateBranch}` : ', detached'}]`,
+      `[${candidate.source}${candidateBranch ? `; ${candidateBranch}` : ''}]`,
   );
   log(`  ${commitSubject(repoRoot, candidateSha)}`);
   if (xSha === candidateSha) {
@@ -809,10 +915,10 @@ async function main() {
   }
   if (worktreeDirty) {
     banner([
-      'WORKTREE IS DIRTY: only the committed HEAD is measured.',
-      'Uncommitted changes are excluded BY DESIGN - the numbers',
-      'must describe a commit. Commit your changes first if they',
-      'are meant to be part of the candidate measurement.',
+      'WORKTREE IS DIRTY: product code still comes from exact commits.',
+      'The benchmark harness intentionally comes from this worktree;',
+      'its SHA-256 is recorded so every target uses identifiable,',
+      'byte-identical benchmark code.',
     ]);
   }
 
@@ -847,9 +953,12 @@ async function main() {
     prefix: '[x]',
   });
 
-  // Re-propagated on every run (even with cached clones) so the x clone always
-  // carries the candidate commit's harness byte-identical.
-  propagateHarness(candidateClone.dir, xClone.dir);
+  // Re-propagated on every run (even with cached clones) so historical product
+  // commits are measured by the same corrected worktree harness.
+  const harness = propagateHarness(repoRoot, [
+    { dir: candidateClone.dir, label: 'candidate' },
+    { dir: xClone.dir, label: 'x' },
+  ]);
 
   // Back-to-back, x first, matching the recorded pairs' protocol.
   const xRunDir = path.join(runsDir, `${runId}-x`);
@@ -922,9 +1031,11 @@ async function main() {
       nodeVersion: process.version,
       platform: process.platform,
     },
+    harness,
     gate,
     iterations: xArtifact.iterations,
-    metricsVersion: 3,
+    fixture: xArtifact.fixture,
+    metricsVersion: METRICS_VERSION,
     phases,
     warnings,
     worktreeDirty,
@@ -949,12 +1060,6 @@ async function main() {
   pruneCloneCache([candidateClone.dir, xClone.dir]);
 
   log(`total wall time: ${Math.round((Date.now() - startedAt) / 1000)}s`);
-  log(
-    'To make this pair the recorded baseline: copy the two raw artifacts ' +
-      'into apps/web/e2e/render-baselines/ (sha-keyed names, full shas in ' +
-      'the table) and update that README - recording is a manual, reviewed ' +
-      'step and is never done automatically.',
-  );
 
   if (gate.enabled === true && gate.pass === false) {
     // Distinct exit path from a measurement failure (which throws and exits

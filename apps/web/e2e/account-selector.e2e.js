@@ -5,6 +5,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const {
+  collectEventTimingSummary,
+  evaluateEventCountBudgets,
+  evaluateFanoutBudgets,
+} = require('./account-selector-perf-metrics');
+const {
   AccountManagerTestIDs,
   AccountSelectorTestIDs,
   AddressInputTestIDs,
@@ -618,6 +623,55 @@ const performanceBudgetDefinitions = [
     statistic: 'max',
   },
   {
+    defaultLimit: 500,
+    envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_BUILD_P95_MS',
+    event: 'activeBuildResult',
+    field: 'bgTotalMs',
+    statistic: 'p95',
+  },
+  {
+    defaultLimit: 1200,
+    envName: 'ACCOUNT_SELECTOR_E2E_SELECTION_STATE_TO_PAINT_P95_MS',
+    event: 'providerSubtreePaint',
+    field: 'selectionStateToPaintMs',
+    statistic: 'p95',
+  },
+  {
+    defaultLimit: 700,
+    envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_STATE_TO_PAINT_P95_MS',
+    event: 'providerSubtreePaint',
+    field: 'activeStateToPaintMs',
+    statistic: 'p95',
+  },
+  {
+    defaultLimit: 250,
+    envName: 'ACCOUNT_SELECTOR_E2E_PROVIDER_COMMIT_TO_PAINT_P95_MS',
+    event: 'providerSubtreePaint',
+    field: 'commitToPaintMs',
+    statistic: 'p95',
+  },
+  {
+    defaultLimit: 1500,
+    envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_BUILD_MAX_MS',
+    event: 'activeBuildResult',
+    field: 'bgTotalMs',
+    statistic: 'max',
+  },
+  {
+    defaultLimit: 250,
+    envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_BUILD_RPC_OVERHEAD_P95_MS',
+    event: 'activeBuildResult',
+    field: 'approximateRpcOverheadMs',
+    statistic: 'p95',
+  },
+  {
+    defaultLimit: 1000,
+    envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_BUILD_RPC_OVERHEAD_MAX_MS',
+    event: 'activeBuildResult',
+    field: 'approximateRpcOverheadMs',
+    statistic: 'max',
+  },
+  {
     // Observed p95: 58-140ms.
     defaultLimit: 500,
     envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_RELOAD_TOTAL_P95_MS',
@@ -631,6 +685,62 @@ const performanceBudgetDefinitions = [
     envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_RELOAD_TOTAL_MAX_MS',
     event: 'activeReloadResult',
     field: 'totalMs',
+    statistic: 'max',
+  },
+  {
+    defaultLimit: 1000,
+    envName: 'ACCOUNT_SELECTOR_E2E_SELECTION_STATE_TO_COMMIT_P95_MS',
+    event: 'providerSubtreeCommit',
+    field: 'selectionStateToProviderCommitMs',
+    statistic: 'p95',
+  },
+  {
+    defaultLimit: 500,
+    envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_STATE_TO_COMMIT_P95_MS',
+    event: 'providerSubtreeCommit',
+    field: 'activeStateToProviderCommitMs',
+    statistic: 'p95',
+  },
+  {
+    defaultLimit: 500,
+    envName: 'ACCOUNT_SELECTOR_E2E_AVAILABLE_NETWORKS_P95_MS',
+    event: 'availableNetworksResult',
+    field: 'totalMs',
+    statistic: 'p95',
+  },
+  {
+    defaultLimit: 1500,
+    envName: 'ACCOUNT_SELECTOR_E2E_AVAILABLE_NETWORKS_MAX_MS',
+    event: 'availableNetworksResult',
+    field: 'totalMs',
+    statistic: 'max',
+  },
+  {
+    defaultLimit: 500,
+    envName: 'ACCOUNT_SELECTOR_E2E_AUTO_DERIVE_P95_MS',
+    event: 'autoDeriveResult',
+    field: 'totalMs',
+    statistic: 'p95',
+  },
+  {
+    defaultLimit: 1500,
+    envName: 'ACCOUNT_SELECTOR_E2E_AUTO_DERIVE_MAX_MS',
+    event: 'autoDeriveResult',
+    field: 'totalMs',
+    statistic: 'max',
+  },
+  {
+    defaultLimit: 500,
+    envName: 'ACCOUNT_SELECTOR_E2E_AUTO_DERIVE_SYNC_GLOBAL_P95_MS',
+    event: 'autoDeriveResult',
+    field: 'stageMs.syncGlobal',
+    statistic: 'p95',
+  },
+  {
+    defaultLimit: 1500,
+    envName: 'ACCOUNT_SELECTOR_E2E_AUTO_DERIVE_SYNC_GLOBAL_MAX_MS',
+    event: 'autoDeriveResult',
+    field: 'stageMs.syncGlobal',
     statistic: 'max',
   },
   {
@@ -664,6 +774,50 @@ const performanceBudgetDefinitions = [
     event: 'storageInitResult',
     field: 'totalMs',
     statistic: 'max',
+  },
+].map((budget) => ({
+  ...budget,
+  limit: readPositiveNumberEnv(budget.envName, budget.defaultLimit),
+}));
+
+const fanoutBudgetDefinitions = [
+  {
+    defaultLimit: 6,
+    envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_RELOAD_MAX_CONSUMERS',
+    fanout: 'activeReloads',
+    field: 'maxConsumersPerOperation',
+  },
+  {
+    defaultLimit: 6,
+    envName: 'ACCOUNT_SELECTOR_E2E_SELECTION_MAX_CONSUMERS',
+    fanout: 'selectionTransitions',
+    field: 'maxConsumersPerOperation',
+  },
+].map((budget) => ({
+  ...budget,
+  limit: readPositiveNumberEnv(budget.envName, budget.defaultLimit),
+}));
+
+const eventCountBudgetDefinitions = [
+  {
+    defaultLimit: 180,
+    envName: 'ACCOUNT_SELECTOR_E2E_AVAILABLE_NETWORKS_REQUEST_MAX_COUNT',
+    event: 'availableNetworksRequested',
+  },
+  {
+    defaultLimit: 140,
+    envName: 'ACCOUNT_SELECTOR_E2E_AUTO_DERIVE_REQUEST_MAX_COUNT',
+    event: 'autoDeriveRequested',
+  },
+  {
+    defaultLimit: 260,
+    envName: 'ACCOUNT_SELECTOR_E2E_ACTIVE_RELOAD_MAX_COUNT',
+    event: 'activeReloadStart',
+  },
+  {
+    defaultLimit: 570,
+    envName: 'ACCOUNT_SELECTOR_E2E_SELECTION_UPDATE_MAX_COUNT',
+    event: 'selectionUpdateRequested',
   },
 ].map((budget) => ({
   ...budget,
@@ -951,27 +1105,6 @@ function collectCdpStackFrames(stackTrace, frames = []) {
   return frames;
 }
 
-function percentile(values, ratio) {
-  if (!values.length) return undefined;
-  const sorted = [...values].toSorted((a, b) => a - b);
-  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))];
-}
-
-function summarizeTimingValues(timingValues) {
-  const summary = {};
-  for (const [field, values] of Object.entries(timingValues)) {
-    if (values.length) {
-      summary[field] = {
-        count: values.length,
-        max: Math.max(...values),
-        p50: percentile(values, 0.5),
-        p95: percentile(values, 0.95),
-      };
-    }
-  }
-  return summary;
-}
-
 function recordFanout(fanoutMap, { consumer, id, reason }) {
   if (typeof id !== 'number') return;
   const operation = fanoutMap.get(id) || {
@@ -1024,16 +1157,6 @@ function summarizeFanout(fanoutMap) {
 function buildTraceSummary(events) {
   const eventCounts = {};
   const outcomeCounts = {};
-  const timingFields = [
-    'actualDuration',
-    'bgTotalMs',
-    'buildMs',
-    'mutexWaitMs',
-    'totalMs',
-    'workMs',
-  ];
-  const timings = Object.fromEntries(timingFields.map((field) => [field, []]));
-  const timingsByEvent = {};
   const activeReloadFanout = new Map();
   const selectionTransitionFanout = new Map();
   const providerRenders = {
@@ -1051,14 +1174,6 @@ function buildTraceSummary(events) {
     if (typeof event.outcome === 'string') {
       const key = `${event.event}:${event.outcome}`;
       outcomeCounts[key] = (outcomeCounts[key] || 0) + 1;
-    }
-    for (const field of timingFields) {
-      if (typeof event[field] === 'number' && Number.isFinite(event[field])) {
-        timings[field].push(event[field]);
-        timingsByEvent[event.event] ||= {};
-        timingsByEvent[event.event][field] ||= [];
-        timingsByEvent[event.event][field].push(event[field]);
-      }
     }
     if (
       event.event === 'providerSubtreeCommit' ||
@@ -1126,13 +1241,8 @@ function buildTraceSummary(events) {
     }
   }
 
-  const timingSummary = summarizeTimingValues(timings);
-  const timingSummaryByEvent = Object.fromEntries(
-    Object.entries(timingsByEvent).map(([event, timingValues]) => [
-      event,
-      summarizeTimingValues(timingValues),
-    ]),
-  );
+  const { timingSummary, timingSummaryByEvent } =
+    collectEventTimingSummary(events);
 
   return {
     eventCounts,
@@ -1178,6 +1288,29 @@ function assertPerformanceBudgets(results) {
     })),
     [],
     'AccountSelector performance budget exceeded',
+  );
+}
+
+function assertFanoutBudgets(results) {
+  const failures = results.filter((result) => !result.passed);
+  assert.deepEqual(
+    failures.map(({ fanout, field, limit, observed }) => ({
+      fanout,
+      field,
+      limit,
+      observed,
+    })),
+    [],
+    'AccountSelector update fan-out budget exceeded',
+  );
+}
+
+function assertEventCountBudgets(results) {
+  const failures = results.filter((result) => !result.passed);
+  assert.deepEqual(
+    failures.map(({ event, limit, observed }) => ({ event, limit, observed })),
+    [],
+    'AccountSelector hook/action execution budget exceeded',
   );
 }
 
@@ -6711,6 +6844,14 @@ async function runCycle({ browser, cycle, rendererUrl }) {
     );
     const summary = buildTraceSummary(allEvents);
     const performanceBudgets = evaluatePerformanceBudgets(summary);
+    const eventCountBudgets = evaluateEventCountBudgets(
+      summary,
+      eventCountBudgetDefinitions,
+    );
+    const fanoutBudgets = evaluateFanoutBudgets(
+      summary,
+      fanoutBudgetDefinitions,
+    );
     assert.deepEqual(
       summary.fanout.selectionTransitions.duplicateConsumers,
       [],
@@ -6745,6 +6886,8 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       cycle,
       cdpExceptionCount: cdpExceptions.length,
       cdpExceptions,
+      eventCountBudgets,
+      fanoutBudgets,
       iterations,
       pageErrorCount: pageErrors.length,
       pageErrors,
@@ -6783,6 +6926,8 @@ async function runCycle({ browser, cycle, rendererUrl }) {
       )}\n`,
     );
     assertPerformanceBudgets(performanceBudgets);
+    assertEventCountBudgets(eventCountBudgets);
+    assertFanoutBudgets(fanoutBudgets);
     assertPhaseRenderBudgets(phaseRenderBudgetResults);
     assert.deepEqual(pageErrors, [], 'Web page emitted uncaught errors');
     assert.deepEqual(

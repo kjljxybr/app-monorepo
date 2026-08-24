@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /*
- * Cross-branch React render baseline for account-selector UI flows (v3).
+ * Cross-branch Account Selector performance baseline (v5).
  *
  * Purpose
  * -------
@@ -23,15 +23,14 @@
  *   - network-switch:      toggle evm--1 <-> btc--0 through the network trigger
  *   - selector-open-close: open the account selector and dismiss it
  *   - tab-switch:          Wallet <-> Trade sidebar tab round trip
- *   - background-churn:    with the Home page settled and NOTHING changed in
- *     the data, emit AccountUpdate on the app event bus repeatedly (spaced
- *     beyond the reload throttle) and measure what each no-op reload cycle
- *     costs between quiescent points. This is the decisive phase for reload
- *     dedup work: a branch that gates deep-equal rebuilds writes nothing.
+ *   - background-churn:    first pin a canonical account/network state, then
+ *     emit AccountUpdate on the app event bus repeatedly with NOTHING changed
+ *     in the data. Each measured emit must start and complete at least one
+ *     active-account rebuild; the artifact records those probe deltas.
  * Interactive phases first run 1 unmeasured warm-up iteration (v3: the first
  * pass through a phase pays one-time lazy-mount spikes that distorted v2
  * medians), then RENDER_BASELINE_ITERATIONS measured iterations (default 5);
- * background-churn performs RENDER_BASELINE_CHURN_EMITS emits (default 10),
+ * background-churn performs RENDER_BASELINE_CHURN_EMITS emits (default 11),
  * one measured iteration per emit and no warm-up (its first emit shows no
  * systematic spike).
  *
@@ -58,7 +57,7 @@
  *      "test:e2e:web:render-baseline": "node apps/web/e2e/render-commit-baseline.e2e.js"
  * 2. Run `yarn test:e2e:web:render-baseline` there exactly as here.
  * 3. Diff the two JSON artifacts written to .tmp/render-baseline/
- *    (<git-short-sha>-<branch>-v3.json) phase by phase.
+ *    (<git-short-sha>-<branch>-v5.json) phase by phase.
  *
  * Comparability caveats
  * ---------------------
@@ -87,11 +86,18 @@ const artifactDir =
   process.env.RENDER_BASELINE_ARTIFACT_DIR ||
   path.join(repoRoot, '.tmp', 'render-baseline');
 
-const METRICS_VERSION = 3;
+// Bumped whenever the measurement protocol changes in a way that shifts the
+// numbers: v3 added warm-up iterations, v4 pinned a canonical background-churn
+// state and made every churn sample prove it drove a real rebuild. Artifacts
+// from different metricsVersions describe different protocols and must never
+// be compared value-to-value - re-measure both sides instead (which is what
+// the A/B driver does on every run).
+const METRICS_VERSION = 5;
 
 const RENDERER_TIMEOUT_MS =
   Number(process.env.WEB_E2E_RENDERER_TIMEOUT_MS) || 180_000;
 const PAGE_TIMEOUT_MS = Number(process.env.WEB_E2E_PAGE_TIMEOUT_MS) || 120_000;
+const FIXTURE_DB_TIMEOUT_MS = 30_000;
 const ITERATIONS = Number(process.env.RENDER_BASELINE_ITERATIONS) || 5;
 // v3: unmeasured warm-up iterations before each interactive phase's measured
 // iterations. The first pass through a phase systematically pays one-time
@@ -111,8 +117,10 @@ const PHASE_SETTLE_MS = Number(process.env.RENDER_BASELINE_SETTLE_MS) || 1000;
 // quiescence wait takes over. Combined with the settle + quiescence between
 // iterations, consecutive emits are spaced well beyond the reload throttle,
 // so every emit triggers its own full reload cycle.
-const CHURN_EMITS = Number(process.env.RENDER_BASELINE_CHURN_EMITS) || 10;
+const CHURN_EMITS = Number(process.env.RENDER_BASELINE_CHURN_EMITS) || 11;
 const CHURN_POST_EMIT_WAIT_MS = 500;
+const RETENTION_ITERATIONS =
+  Number(process.env.RENDER_BASELINE_RETENTION_ITERATIONS) || 7;
 
 // Public BIP39 test vectors (Trezor/BIP39 reference data) - NOT secrets and
 // never holding funds. Fixed mnemonics keep account names, addresses and list
@@ -122,6 +130,41 @@ const PUBLIC_TEST_MNEMONICS = [
   'legal winner thank year wave sausage worth useful legal winner thank yellow',
   'letter advice cage absurd amount doctor acoustic avoid letter advice cage above',
 ];
+
+function resolveFixtureScale({ accountsPerWallet, walletCount } = {}) {
+  const resolvedAccountsPerWallet = Number(accountsPerWallet || 2);
+  const resolvedWalletCount = Number(
+    walletCount || PUBLIC_TEST_MNEMONICS.length,
+  );
+  if (
+    !Number.isInteger(resolvedAccountsPerWallet) ||
+    resolvedAccountsPerWallet < 2 ||
+    resolvedAccountsPerWallet > 100
+  ) {
+    throw new Error(
+      `accountsPerWallet must be an integer from 2 to 100, received ${accountsPerWallet}`,
+    );
+  }
+  if (
+    !Number.isInteger(resolvedWalletCount) ||
+    resolvedWalletCount < 1 ||
+    resolvedWalletCount > PUBLIC_TEST_MNEMONICS.length
+  ) {
+    throw new Error(
+      `walletCount must be an integer from 1 to ${PUBLIC_TEST_MNEMONICS.length}, ` +
+        `received ${walletCount}`,
+    );
+  }
+  return {
+    accountsPerWallet: resolvedAccountsPerWallet,
+    walletCount: resolvedWalletCount,
+  };
+}
+
+const FIXTURE_SCALE = resolveFixtureScale({
+  accountsPerWallet: process.env.RENDER_BASELINE_ACCOUNTS_PER_WALLET,
+  walletCount: process.env.RENDER_BASELINE_WALLET_COUNT,
+});
 
 // Every value below is verified to exist on origin/x AND current branches.
 const WALLET_MODE_STORAGE_KEY = '$onekey_web_dapp_mode';
@@ -142,6 +185,10 @@ const ONBOARDING_CLOSE_SELECTOR =
 // string is stable in en_US on both branches while the tab's testID is not.
 const SINGLE_NETWORK_TAB_LABEL = 'Single network';
 const NETWORK_IDS = ['evm--1', 'btc--0'];
+const CHURN_STATE = {
+  accountIndex: 0,
+  networkId: NETWORK_IDS[0],
+};
 
 function log(message) {
   console.log(`[render-baseline] ${message}`);
@@ -407,6 +454,8 @@ function installRenderBaselineHook() {
     commitRenderedCounts: [],
     commits: 0,
     commitsMissingDuration: 0,
+    interactionDurationsMs: [],
+    longAnimationFrameDurationsMs: [],
     longTasks: 0,
     renderedComponents: 0,
     walkErrors: 0,
@@ -549,6 +598,31 @@ function installRenderBaselineHook() {
   } catch {
     // long-task observer unsupported: counts stay 0
   }
+  try {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        if (
+          state.interactionDurationsMs.length < MAX_COMMIT_LOG &&
+          entry.interactionId > 0
+        ) {
+          state.interactionDurationsMs.push(entry.duration);
+        }
+      }
+    }).observe({ durationThreshold: 16, type: 'event' });
+  } catch {
+    // Event Timing is optional; the artifact exposes an empty distribution.
+  }
+  try {
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        if (state.longAnimationFrameDurationsMs.length < MAX_COMMIT_LOG) {
+          state.longAnimationFrameDurationsMs.push(entry.duration);
+        }
+      }
+    }).observe({ type: 'long-animation-frame' });
+  } catch {
+    // Long Animation Frames are optional on older Chrome versions.
+  }
   globalThis.__renderBaseline = {
     get actualDurationMs() {
       return state.actualDurationMs;
@@ -567,6 +641,12 @@ function installRenderBaselineHook() {
     },
     get longTasks() {
       return state.longTasks;
+    },
+    get interactionDurationsMs() {
+      return state.interactionDurationsMs;
+    },
+    get longAnimationFrameDurationsMs() {
+      return state.longAnimationFrameDurationsMs;
     },
     mark(name) {
       globalThis.__renderBaseline.marks.push({
@@ -596,6 +676,10 @@ async function readCounters(page) {
     commitLogLength: globalThis.__renderBaseline.commitRenderedCounts.length,
     commits: globalThis.__renderBaseline.commits,
     commitsMissingDuration: globalThis.__renderBaseline.commitsMissingDuration,
+    interactionLogLength:
+      globalThis.__renderBaseline.interactionDurationsMs.length,
+    longAnimationFrameLogLength:
+      globalThis.__renderBaseline.longAnimationFrameDurationsMs.length,
     longTasks: globalThis.__renderBaseline.longTasks,
     renderedComponents: globalThis.__renderBaseline.renderedComponents,
     walkErrors: globalThis.__renderBaseline.walkErrors,
@@ -609,6 +693,52 @@ async function readCommitRenderedSlice(page, fromIndex, toIndex) {
       globalThis.__renderBaseline.commitRenderedCounts.slice(from, to),
     { from: fromIndex, to: toIndex },
   );
+}
+
+async function readPerformanceSlice(page, key, fromIndex, toIndex) {
+  return page.evaluate(
+    ({ from, metricKey, to }) =>
+      globalThis.__renderBaseline[metricKey].slice(from, to),
+    { from: fromIndex, metricKey: key, to: toIndex },
+  );
+}
+
+function diffResourceSnapshots(before, after) {
+  return {
+    retainedDocuments: Math.max(0, after.documents - before.documents),
+    retainedDomNodes: Math.max(0, after.domNodes - before.domNodes),
+    retainedEventListeners: Math.max(
+      0,
+      after.eventListeners - before.eventListeners,
+    ),
+    retainedJsHeapBytes: Math.max(
+      0,
+      after.jsHeapUsedBytes - before.jsHeapUsedBytes,
+    ),
+  };
+}
+
+async function createResourceSnapshotProbe(context, page) {
+  const session = await context.newCDPSession(page);
+  await session.send('HeapProfiler.enable');
+  return {
+    async dispose() {
+      await session.detach();
+    },
+    async read() {
+      await session.send('HeapProfiler.collectGarbage');
+      const [dom, heap] = await Promise.all([
+        session.send('Memory.getDOMCounters'),
+        session.send('Runtime.getHeapUsage'),
+      ]);
+      return {
+        documents: dom.documents,
+        domNodes: dom.nodes,
+        eventListeners: dom.jsEventListeners,
+        jsHeapUsedBytes: heap.usedSize,
+      };
+    },
+  };
 }
 
 async function waitForCommitQuiescence(
@@ -725,8 +855,8 @@ async function waitForPersistedSelection(page, expected) {
 }
 
 // ---------------------------------------------------------------------------
-// Fixture: 3 HD wallets x 2 indexed accounts, chain accounts on evm--1 and
-// btc--0 with the default (first) derive type = 12 chain accounts total.
+// Fixture defaults to 3 HD wallets x 2 indexed accounts, with scale knobs for
+// validating how update and render cost grows with larger account lists.
 // Everything runs through background APIs that exist on origin/x. The app
 // auto-selects the newest wallet's first account, so the LAST created wallet
 // is the primary wallet the measured flows operate on; the other two keep the
@@ -735,7 +865,13 @@ async function waitForPersistedSelection(page, expected) {
 
 async function createFixture(page, devOnlyPassword) {
   return page.evaluate(
-    async ({ mnemonics, networkIds, password }) => {
+    async ({
+      accountsPerWallet,
+      fixtureDbTimeoutMs,
+      mnemonics,
+      networkIds,
+      password,
+    }) => {
       const api = globalThis.$$appGlobals.$backgroundApiProxy;
       const e2eParams = { $$devOnlyPassword: password };
       await api.serviceE2E.clearWalletsAndAccounts(e2eParams);
@@ -748,14 +884,15 @@ async function createFixture(page, devOnlyPassword) {
       await api.servicePassword.setPassword(encodedPassword, 'password');
 
       const waitForIndexedAccount = async (indexedAccountId) => {
-        for (let attempt = 0; attempt < 40; attempt += 1) {
+        const deadline = Date.now() + fixtureDbTimeoutMs;
+        while (Date.now() < deadline) {
           const indexedAccount = await api.serviceAccount.getIndexedAccountSafe(
             { id: indexedAccountId },
           );
           if (indexedAccount) {
             return indexedAccount;
           }
-          await new Promise((resolve) => setTimeout(resolve, 50));
+          await new Promise((resolve) => setTimeout(resolve, 100));
         }
         throw new Error(`Indexed account ${indexedAccountId} not readable`);
       };
@@ -773,13 +910,17 @@ async function createFixture(page, devOnlyPassword) {
         const walletId = created.wallet.id;
 
         await waitForIndexedAccount(created.indexedAccount.id);
-        const second = await api.serviceAccount.addHDNextIndexedAccount({
-          walletId,
-        });
-        const indexedAccountIds = [
-          created.indexedAccount.id,
-          second.indexedAccountId,
-        ];
+        const indexedAccountIds = [created.indexedAccount.id];
+        for (
+          let accountIndex = 1;
+          accountIndex < accountsPerWallet;
+          accountIndex += 1
+        ) {
+          const next = await api.serviceAccount.addHDNextIndexedAccount({
+            walletId,
+          });
+          indexedAccountIds.push(next.indexedAccountId);
+        }
         const accountNames = [];
         for (const indexedAccountId of indexedAccountIds) {
           const indexedAccount = await waitForIndexedAccount(indexedAccountId);
@@ -792,8 +933,8 @@ async function createFixture(page, devOnlyPassword) {
             if (!deriveItems.length) {
               throw new Error(`Network ${networkId} has no derive items`);
             }
-            // Default derive type only: 3 wallets x 2 accounts x 2 networks
-            // = 12 chain accounts.
+            // The default derive type keeps fixture growth proportional to the
+            // wallet/account/network axes instead of derive-type breadth.
             await api.serviceAccount.addHDOrHWAccounts({
               deriveType: deriveItems[0].value,
               indexedAccountId,
@@ -821,7 +962,9 @@ async function createFixture(page, devOnlyPassword) {
       };
     },
     {
-      mnemonics: PUBLIC_TEST_MNEMONICS,
+      accountsPerWallet: FIXTURE_SCALE.accountsPerWallet,
+      fixtureDbTimeoutMs: FIXTURE_DB_TIMEOUT_MS,
+      mnemonics: PUBLIC_TEST_MNEMONICS.slice(0, FIXTURE_SCALE.walletCount),
       networkIds: NETWORK_IDS,
       password: devOnlyPassword,
     },
@@ -934,8 +1077,7 @@ async function closeAccountSelector(page) {
   await waitForHiddenTestID(page, TEST_IDS.walletList);
 }
 
-async function flowAccountSwitch(page, primaryWallet, iteration) {
-  const targetIndex = iteration % 2 === 0 ? 1 : 0;
+async function selectAccountByIndex(page, primaryWallet, targetIndex) {
   const targetName = primaryWallet.accountNames[targetIndex];
   await openAccountSelector(page);
   await clickTestID(page, TEST_IDS.walletItem(primaryWallet.walletId));
@@ -963,8 +1105,12 @@ async function flowAccountSwitch(page, primaryWallet, iteration) {
   );
 }
 
-async function flowNetworkSwitch(page, fixture, iteration) {
-  const targetNetworkId = iteration % 2 === 0 ? NETWORK_IDS[1] : NETWORK_IDS[0];
+async function flowAccountSwitch(page, primaryWallet, iteration) {
+  const targetIndex = iteration % 2 === 0 ? 1 : 0;
+  await selectAccountByIndex(page, primaryWallet, targetIndex);
+}
+
+async function selectNetworkById(page, fixture, targetNetworkId) {
   await clickTestID(page, TEST_IDS.networkTrigger);
   const networkRow = page.locator(
     `${visibleTestID(targetNetworkId)}, ${visibleTestID(
@@ -1010,6 +1156,11 @@ async function flowNetworkSwitch(page, fixture, iteration) {
   );
 }
 
+async function flowNetworkSwitch(page, fixture, iteration) {
+  const targetNetworkId = iteration % 2 === 0 ? NETWORK_IDS[1] : NETWORK_IDS[0];
+  await selectNetworkById(page, fixture, targetNetworkId);
+}
+
 async function flowSelectorOpenClose(page) {
   await openAccountSelector(page);
   await closeAccountSelector(page);
@@ -1027,18 +1178,67 @@ async function flowTabSwitch(page) {
     .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
 }
 
-// The decisive phase for reload dedup: emit AccountUpdate on the app event bus
-// from page context with NOTHING actually changed in the data. On both
-// branches AccountSelectorEffects listens for AccountUpdate and schedules
-// reloadActiveAccountInfo behind a 150ms trailing throttle (origin/x
-// AccountSelectorEffects.tsx:224 / branch:1032), so a single emit per
-// quiescent window triggers exactly one full reload cycle. What each cycle
-// then costs is the measurement - the branch is expected to gate deep-equal
-// rebuilds into a no-op write, but nothing here forces that outcome. The
-// $appEventBus global is assigned unconditionally in
-// packages/shared/src/eventBus/appEventBus.ts on both branches, and
-// $$appGlobals is exposed in dev builds (which this harness always runs).
+async function installReloadProbe(page) {
+  await page.evaluate(() => {
+    const proxy = globalThis.$$appGlobals.$backgroundApiProxy;
+    const methodName =
+      'serviceAccountSelector.buildActiveAccountInfoFromSelectedAccount';
+    const original = proxy.callBackground;
+    if (typeof original !== 'function') {
+      throw new Error('callBackground is unavailable for the reload probe');
+    }
+    const probe = {
+      completed: 0,
+      durationsMs: [],
+      failed: 0,
+      pending: 0,
+      started: 0,
+    };
+    proxy.callBackground = async function renderBaselineReloadProbe(
+      method,
+      ...args
+    ) {
+      if (method !== methodName) {
+        return original.call(this, method, ...args);
+      }
+      probe.pending += 1;
+      probe.started += 1;
+      const startedAt = globalThis.performance.now();
+      try {
+        const result = await original.call(this, method, ...args);
+        probe.completed += 1;
+        return result;
+      } catch (error) {
+        probe.failed += 1;
+        throw error;
+      } finally {
+        probe.durationsMs.push(
+          Math.round((globalThis.performance.now() - startedAt) * 100) / 100,
+        );
+        probe.pending -= 1;
+      }
+    };
+    globalThis.__renderBaselineReloadProbe = probe;
+  });
+}
+
+async function readReloadProbe(page) {
+  return page.evaluate(() => {
+    const probe = globalThis.__renderBaselineReloadProbe;
+    if (!probe) {
+      throw new Error('Reload probe is not installed');
+    }
+    return { ...probe };
+  });
+}
+
+// The decisive phase for reload dedup: emit AccountUpdate with NOTHING changed
+// and require the background active-account build to finish before accepting
+// the sample. This makes a missing/dropped reload a test failure instead of an
+// artificially cheap measurement.
 async function flowBackgroundChurn(page) {
+  const before = await readReloadProbe(page);
+  assert.equal(before.pending, 0, 'Reload probe was busy before churn emit');
   await page.evaluate(() => {
     globalThis.$$appGlobals.$appEventBus.emit('AccountUpdate', undefined);
   });
@@ -1047,22 +1247,82 @@ async function flowBackgroundChurn(page) {
   // quiescence between iterations, consecutive emits are spaced far beyond
   // the 150ms reload throttle.
   await page.waitForTimeout(CHURN_POST_EMIT_WAIT_MS);
+  await page.waitForFunction(
+    ({ previousStarted }) => {
+      const probe = globalThis.__renderBaselineReloadProbe;
+      return Boolean(
+        probe && probe.started > previousStarted && probe.pending === 0,
+      );
+    },
+    { previousStarted: before.started },
+    { timeout: QUIESCENCE_TIMEOUT_MS },
+  );
+  const after = await readReloadProbe(page);
+  const diagnostics = {
+    reloadDurationMaxMs: Math.max(
+      0,
+      ...after.durationsMs.slice(before.durationsMs.length),
+    ),
+    reloadDurationTotalMs: after.durationsMs
+      .slice(before.durationsMs.length)
+      .reduce((total, duration) => total + duration, 0),
+    reloadsCompleted: after.completed - before.completed,
+    reloadsFailed: after.failed - before.failed,
+    reloadsStarted: after.started - before.started,
+  };
+  assert.ok(
+    diagnostics.reloadsStarted > 0,
+    'AccountUpdate did not start an active-account rebuild',
+  );
+  assert.equal(
+    diagnostics.reloadsCompleted,
+    diagnostics.reloadsStarted,
+    'Not every active-account rebuild completed',
+  );
+  assert.equal(diagnostics.reloadsFailed, 0, 'Active-account rebuild failed');
+  return diagnostics;
 }
 
 // ---------------------------------------------------------------------------
 // Measurement driver
 // ---------------------------------------------------------------------------
 
+// Conventional median: an even sample count averages the two middle samples
+// rather than picking the upper one, so the reported value cannot jump a whole
+// sample apart between runs that differ only in ordering. CHURN_EMITS is odd
+// for the same reason - the decisive phase's median is then an observed
+// sample, not an average of two.
 function summarize(values) {
   const sorted = values.toSorted((a, b) => a - b);
-  const median = sorted.length
-    ? sorted[Math.floor((sorted.length - 1) / 2)]
-    : 0;
+  const middle = Math.floor(sorted.length / 2);
+  let median = 0;
+  if (sorted.length % 2 === 1) {
+    median = sorted[middle];
+  } else if (sorted.length) {
+    median = (sorted[middle - 1] + sorted[middle]) / 2;
+  }
   return {
     max: sorted.length ? sorted[sorted.length - 1] : 0,
     median,
     min: sorted.length ? sorted[0] : 0,
   };
+}
+
+function summarizeIterationDiagnostics(iterationDiagnostics) {
+  const valuesByMetric = {};
+  for (const diagnostics of iterationDiagnostics) {
+    for (const [metric, value] of Object.entries(diagnostics)) {
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        valuesByMetric[metric] ||= [];
+        valuesByMetric[metric].push(value);
+      }
+    }
+  }
+  return Object.fromEntries(
+    Object.entries(valuesByMetric)
+      .toSorted(([left], [right]) => left.localeCompare(right))
+      .map(([metric, values]) => [metric, summarize(values)]),
+  );
 }
 
 function roundMs(value) {
@@ -1073,7 +1333,11 @@ async function measurePhase(
   page,
   phaseName,
   runIteration,
-  { iterations = ITERATIONS, warmupIterations = WARMUP_ITERATIONS } = {},
+  {
+    diagnosticsProbe,
+    iterations = ITERATIONS,
+    warmupIterations = WARMUP_ITERATIONS,
+  } = {},
 ) {
   log(
     `phase ${phaseName}: ${warmupIterations} warm-up + ${iterations} measured iterations`,
@@ -1083,7 +1347,12 @@ async function measurePhase(
   const maxRenderedInCommitPerIteration = [];
   const actualDurationMsDeltas = [];
   const longTaskDeltas = [];
+  const interactionCountDeltas = [];
+  const maxInteractionLatencyMsPerIteration = [];
+  const longAnimationFrameCountDeltas = [];
+  const maxLongAnimationFrameMsPerIteration = [];
   const wallMs = [];
+  const iterationDiagnostics = [];
   let missingDurationCommits = 0;
   // The flow-iteration index keeps counting across warm-up and measured
   // iterations, so the alternating flows (account-switch, network-switch)
@@ -1106,9 +1375,12 @@ async function measurePhase(
   ) {
     await page.waitForTimeout(PHASE_SETTLE_MS);
     await waitForCommitQuiescence(page);
+    const resourceBefore = diagnosticsProbe
+      ? await diagnosticsProbe()
+      : undefined;
     const before = await readCounters(page);
     const startedAt = Date.now();
-    await runIteration(iteration);
+    const flowDiagnostics = await runIteration(iteration);
     await waitForCommitQuiescence(page);
     const after = await readCounters(page);
     commitDeltas.push(after.commits - before.commits);
@@ -1129,7 +1401,37 @@ async function measurePhase(
     missingDurationCommits +=
       after.commitsMissingDuration - before.commitsMissingDuration;
     longTaskDeltas.push(after.longTasks - before.longTasks);
+    const interactionSlice = await readPerformanceSlice(
+      page,
+      'interactionDurationsMs',
+      before.interactionLogLength,
+      after.interactionLogLength,
+    );
+    interactionCountDeltas.push(interactionSlice.length);
+    maxInteractionLatencyMsPerIteration.push(
+      interactionSlice.length ? Math.max(...interactionSlice) : 0,
+    );
+    const longAnimationFrameSlice = await readPerformanceSlice(
+      page,
+      'longAnimationFrameDurationsMs',
+      before.longAnimationFrameLogLength,
+      after.longAnimationFrameLogLength,
+    );
+    longAnimationFrameCountDeltas.push(longAnimationFrameSlice.length);
+    maxLongAnimationFrameMsPerIteration.push(
+      longAnimationFrameSlice.length ? Math.max(...longAnimationFrameSlice) : 0,
+    );
     wallMs.push(Date.now() - startedAt);
+    const diagnostics = { ...flowDiagnostics };
+    if (diagnosticsProbe && resourceBefore) {
+      Object.assign(
+        diagnostics,
+        diffResourceSnapshots(resourceBefore, await diagnosticsProbe()),
+      );
+    }
+    if (Object.keys(diagnostics).length) {
+      iterationDiagnostics.push(diagnostics);
+    }
   }
   // actualDuration is best-effort: if any commit in this phase lacked it,
   // report the phase's duration metric as unavailable instead of a partial sum.
@@ -1144,9 +1446,19 @@ async function measurePhase(
       : 'unavailable',
     commitDeltas,
     commits: summarize(commitDeltas),
+    diagnostics: summarizeIterationDiagnostics(iterationDiagnostics),
     iterations,
+    iterationDiagnostics,
+    interactionCountDeltas,
+    interactions: summarize(interactionCountDeltas),
     longTaskDeltas,
     longTasks: summarize(longTaskDeltas),
+    longAnimationFrameCountDeltas,
+    longAnimationFrames: summarize(longAnimationFrameCountDeltas),
+    maxInteractionLatencyMs: summarize(maxInteractionLatencyMsPerIteration),
+    maxInteractionLatencyMsPerIteration,
+    maxLongAnimationFrameMs: summarize(maxLongAnimationFrameMsPerIteration),
+    maxLongAnimationFrameMsPerIteration,
     maxRenderedInCommit: summarize(maxRenderedInCommitPerIteration),
     maxRenderedInCommitPerIteration,
     phase: phaseName,
@@ -1197,11 +1509,14 @@ async function main() {
 
     log('create HD wallet fixture (public BIP39 test mnemonics)');
     const fixture = await createFixture(page, devOnlyPassword);
-    assert.equal(fixture.wallets.length, PUBLIC_TEST_MNEMONICS.length);
+    assert.equal(fixture.wallets.length, FIXTURE_SCALE.walletCount);
     // createHDWallet auto-selects each new wallet's first account, so the last
     // created wallet is the active one; the measured flows stay on it.
     const primaryWallet = fixture.wallets[fixture.wallets.length - 1];
-    assert.equal(primaryWallet.accountNames.length, 2);
+    assert.equal(
+      primaryWallet.accountNames.length,
+      FIXTURE_SCALE.accountsPerWallet,
+    );
 
     // Reload so the measured document starts from a clean boot; all measured
     // phases run inside this single document.
@@ -1251,6 +1566,22 @@ async function main() {
         flowSelectorOpenClose(page),
       ),
     );
+    const retentionProbe = await createResourceSnapshotProbe(context, page);
+    try {
+      phases.push(
+        await measurePhase(
+          page,
+          'selector-retention',
+          () => flowSelectorOpenClose(page),
+          {
+            diagnosticsProbe: () => retentionProbe.read(),
+            iterations: RETENTION_ITERATIONS,
+          },
+        ),
+      );
+    } finally {
+      await retentionProbe.dispose();
+    }
     if (await getSidebarTab(page, 'Trade').count()) {
       phases.push(
         await measurePhase(page, 'tab-switch', () => flowTabSwitch(page)),
@@ -1259,8 +1590,14 @@ async function main() {
       notes.push('tab-switch skipped: Trade sidebar tab not present');
       log('phase tab-switch: skipped (Trade sidebar tab not present)');
     }
-    // Home settles on whatever account the last account-switch iteration
-    // left selected - deterministic and identical across branches.
+    log(
+      `pin background-churn state to account ${CHURN_STATE.accountIndex}, ` +
+        `network ${CHURN_STATE.networkId}`,
+    );
+    await selectAccountByIndex(page, primaryWallet, CHURN_STATE.accountIndex);
+    await selectNetworkById(page, fixture, CHURN_STATE.networkId);
+    await waitForCommitQuiescence(page);
+    await installReloadProbe(page);
     phases.push(
       await measurePhase(
         page,
@@ -1280,11 +1617,20 @@ async function main() {
         renderedComponents: bootCounters.renderedComponents,
       },
       churnEmits: CHURN_EMITS,
+      churnState: CHURN_STATE,
       environment: {
         arch: os.arch(),
         headless: shouldRunHeadless(),
         nodeVersion: process.version,
         platform: process.platform,
+      },
+      fixture: {
+        ...FIXTURE_SCALE,
+        chainAccountCount:
+          FIXTURE_SCALE.walletCount *
+          FIXTURE_SCALE.accountsPerWallet *
+          NETWORK_IDS.length,
+        networkCount: NETWORK_IDS.length,
       },
       git,
       iterations: ITERATIONS,
@@ -1292,6 +1638,7 @@ async function main() {
       notes,
       phases,
       quietMs: QUIET_MS,
+      retentionIterations: RETENTION_ITERATIONS,
       timestamp: new Date().toISOString(),
       totalActualDurationMs: roundMs(finalCounters.actualDurationMs),
       totalCommits: finalCounters.commits,
@@ -1376,3 +1723,10 @@ if (require.main === module) {
     process.exitCode = 1;
   });
 }
+
+module.exports = {
+  diffResourceSnapshots,
+  resolveFixtureScale,
+  summarize,
+  summarizeIterationDiagnostics,
+};

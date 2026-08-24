@@ -9,12 +9,22 @@ import { useAccountSelectorAvailableNetworks } from './useAccountSelectorAvailab
 const mockGetAllNetworkIds: jest.MockedFunction<
   () => Promise<{ networkIds: string[] }>
 > = jest.fn();
+const mockRun = jest.fn();
+const mockNetworkIds: string[] = [];
 let capturedLoader: (() => Promise<string[]>) | undefined;
+
+function isEventListener(value: unknown): value is () => void {
+  return typeof value === 'function';
+}
 
 jest.mock('@onekeyhq/shared/src/eventBus/appEventBus', () => ({
   EAppEventBusNames: { AddedCustomNetwork: 'AddedCustomNetwork' },
   appEventBus: { off: jest.fn(), on: jest.fn() },
 }));
+
+const { appEventBus: mockAppEventBus } = jest.requireMock<{
+  appEventBus: { off: jest.Mock; on: jest.Mock };
+}>('@onekeyhq/shared/src/eventBus/appEventBus');
 
 jest.mock('@onekeyhq/shared/src/logger/logger', () => {
   const noopLogger: unknown = new Proxy(jest.fn(), {
@@ -36,7 +46,7 @@ jest.mock('../../../background/instance/backgroundApiProxy', () => ({
 jest.mock('../../../hooks/usePromiseResult', () => ({
   usePromiseResult: (fn: () => Promise<string[]>) => {
     capturedLoader = fn;
-    return { result: [], run: jest.fn() };
+    return { result: mockNetworkIds, run: mockRun };
   },
 }));
 
@@ -52,6 +62,10 @@ jest.mock('../../../states/jotai/contexts/accountSelector/perfDebug', () => ({
 }));
 
 describe('useAccountSelectorAvailableNetworks all network ids cache', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
   // The module level cache is shared across renders, so a single mount walks
   // through both the fresh window and the expiry in one sequence.
   it('serves a fresh cache and reloads once it outlives its max age', async () => {
@@ -77,5 +91,32 @@ describe('useAccountSelectorAvailableNetworks all network ids cache', () => {
     expect(mockGetAllNetworkIds).toHaveBeenCalledTimes(2);
 
     jest.restoreAllMocks();
+  });
+
+  it('keeps one listener and a stable result across parent rerenders', () => {
+    const rendered = renderHook(() =>
+      useAccountSelectorAvailableNetworks({ num: 0 }),
+    );
+    const initialResult = rendered.result.current;
+    const listener: unknown = mockAppEventBus.on.mock.calls[0]?.[1];
+    if (!isEventListener(listener)) {
+      throw new OneKeyLocalError('network listener was not captured');
+    }
+
+    rendered.rerender();
+
+    expect(rendered.result.current).toBe(initialResult);
+    expect(mockAppEventBus.on).toHaveBeenCalledTimes(1);
+
+    listener();
+    expect(mockRun).toHaveBeenCalledTimes(1);
+    expect(mockRun).toHaveBeenCalledWith({ alwaysSetState: true });
+
+    rendered.unmount();
+    expect(mockAppEventBus.off).toHaveBeenCalledTimes(1);
+    expect(mockAppEventBus.off).toHaveBeenCalledWith(
+      'AddedCustomNetwork',
+      listener,
+    );
   });
 });
