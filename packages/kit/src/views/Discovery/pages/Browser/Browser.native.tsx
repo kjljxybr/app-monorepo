@@ -274,6 +274,10 @@ function MobileBrowser() {
   }, [isTabletMainView, isTabletDetailView, displayHomePage, isLandscape]);
   const isBrowserWebPageVisible =
     selectedHeaderTab === ETranslations.global_browser && !showDiscoveryPage;
+  const isBrowserHeaderTabSelected =
+    selectedHeaderTab === ETranslations.global_browser;
+  const shouldKeepBrowserTabLayerAttached =
+    platformEnv.isNativeIOSPad && !isTabletMainView;
 
   useEffect(() => {
     if (!tabs?.length) {
@@ -654,7 +658,7 @@ function MobileBrowser() {
           </>
         ) : (
           <>
-            {/* Tablet / DualScreen: keep legacy display:none/flex switching */}
+            {/* Keep iPad browser layers attached; Android retains legacy display switching. */}
             {isShowContent ? (
               <View
                 style={{
@@ -672,12 +676,33 @@ function MobileBrowser() {
             ) : null}
             <Stack
               flex={1}
-              zIndex={3}
+              zIndex={shouldKeepBrowserTabLayerAttached ? undefined : 3}
+              collapsable={false}
+              pointerEvents={
+                shouldKeepBrowserTabLayerAttached && !isBrowserHeaderTabSelected
+                  ? 'none'
+                  : 'auto'
+              }
+              accessibilityElementsHidden={
+                shouldKeepBrowserTabLayerAttached && !isBrowserHeaderTabSelected
+              }
+              importantForAccessibility={
+                shouldKeepBrowserTabLayerAttached && !isBrowserHeaderTabSelected
+                  ? 'no-hide-descendants'
+                  : 'auto'
+              }
               display={
-                selectedHeaderTab === ETranslations.global_browser
+                shouldKeepBrowserTabLayerAttached || isBrowserHeaderTabSelected
                   ? undefined
                   : 'none'
               }
+              style={[
+                shouldKeepBrowserTabLayerAttached && styles.webPageRootLayer,
+                shouldKeepBrowserTabLayerAttached &&
+                  (isBrowserHeaderTabSelected
+                    ? styles.iosWebPageRootLayerVisible
+                    : styles.iosWebPageRootLayerHidden),
+              ]}
             >
               <Stack flex={1}>
                 <View
@@ -698,7 +723,13 @@ function MobileBrowser() {
                     }
                     style={[
                       styles.webPageLayer,
-                      { display: showDiscoveryPage ? 'none' : 'flex' },
+                      platformEnv.isNativeIOSPad &&
+                        (showDiscoveryPage
+                          ? styles.iosWebPageRootLayerHidden
+                          : styles.iosWebPageRootLayerVisible),
+                      !platformEnv.isNativeIOSPad && {
+                        display: showDiscoveryPage ? 'none' : 'flex',
+                      },
                     ]}
                   >
                     {content}
