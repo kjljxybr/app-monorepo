@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /*
- * Cross-branch Account Selector performance baseline (v5).
+ * Cross-branch Account Selector performance baseline (v6).
  *
  * Purpose
  * -------
@@ -22,6 +22,8 @@
  *   - account-switch:      open the account selector and pick the other account
  *   - network-switch:      toggle evm--1 <-> btc--0 through the network trigger
  *   - selector-open-close: open the account selector and dismiss it
+ *   - swap-num-0/1:       mount and dismiss each Swap selector slot
+ *   - discover matrix:    mount 1/2/8 enabled nums and 2 origins x 2 nums
  *   - tab-switch:          Wallet <-> Trade sidebar tab round trip
  *   - background-churn:    first pin a canonical account/network state, then
  *     emit AccountUpdate on the app event bus repeatedly with NOTHING changed
@@ -49,22 +51,22 @@
  * origin/x as well as on feature branches, and this file deliberately requires
  * nothing from the repo besides the root-level playwright-core dependency.
  *
- * Getting the x baseline
- * ----------------------
- * 1. Copy THIS ONE FILE to apps/web/e2e/render-commit-baseline.e2e.js on a
- *    checkout of origin/x (it has no other dependency on this branch), and add
- *    the same one-line script to the root package.json:
- *      "test:e2e:web:render-baseline": "node apps/web/e2e/render-commit-baseline.e2e.js"
- * 2. Run `yarn test:e2e:web:render-baseline` there exactly as here.
- * 3. Diff the two JSON artifacts written to .tmp/render-baseline/
- *    (<git-short-sha>-<branch>-v5.json) phase by phase.
+ * Cross-commit comparison
+ * -----------------------
+ * Use `yarn test:e2e:web:render-baseline:compare`. The driver propagates this
+ * exact harness into both commit clones, validates strict comparability, and
+ * aggregates balanced paired samples. Running this file directly is intended
+ * only for harness development.
  *
  * Comparability caveats
  * ---------------------
  * Numbers are comparable only between runs on the SAME machine, with the SAME
- * headless setting (WEB_E2E_HEADLESS) and under similar machine load. Commit
- * and rendered-component counts are stable per branch; actualDuration and wall
- * ms are noisier and should be read as a secondary signal. The fiber walk in
+ * headless setting (WEB_E2E_HEADLESS) and under similar machine load. Each
+ * measured slice starts after hard commit quiescence, records an intermediate
+ * next-paint checkpoint, and ends at hard quiescence after the asserted flow
+ * result. This preserves user-visible early cost without dropping delayed
+ * commits caused by the operation. actualDuration and wall ms remain secondary
+ * signals. The fiber walk in
  * onCommitFiberRoot costs the same on both branches (symmetric overhead), but
  * it runs on the main thread inside commit processing, so it inflates the
  * long-task counter; long tasks are still recorded but should not be compared
@@ -88,11 +90,13 @@ const artifactDir =
 
 // Bumped whenever the measurement protocol changes in a way that shifts the
 // numbers: v3 added warm-up iterations, v4 pinned a canonical background-churn
-// state and made every churn sample prove it drove a real rebuild. Artifacts
+// state, v5 added retention/responsiveness probes, and v6 added hard
+// quiescence, operation-to-quiescence windows with next-paint checkpoints, and
+// the scene/num/origin matrix. Artifacts
 // from different metricsVersions describe different protocols and must never
 // be compared value-to-value - re-measure both sides instead (which is what
 // the A/B driver does on every run).
-const METRICS_VERSION = 5;
+const METRICS_VERSION = 6;
 
 const RENDERER_TIMEOUT_MS =
   Number(process.env.WEB_E2E_RENDERER_TIMEOUT_MS) || 180_000;
@@ -121,6 +125,65 @@ const CHURN_EMITS = Number(process.env.RENDER_BASELINE_CHURN_EMITS) || 11;
 const CHURN_POST_EMIT_WAIT_MS = 500;
 const RETENTION_ITERATIONS =
   Number(process.env.RENDER_BASELINE_RETENTION_ITERATIONS) || 7;
+const OPERATION_WINDOW = 'operation-to-hard-quiescence';
+
+function resolveScenarioProfile(value) {
+  const profile = value || 'matrix';
+  if (!['core', 'matrix'].includes(profile)) {
+    throw new Error(
+      `RENDER_BASELINE_SCENARIO_PROFILE=${profile} must be "core" or "matrix"`,
+    );
+  }
+  return profile;
+}
+
+function buildScenarioMatrix(profile) {
+  const core = [
+    { enabledNums: [0], sceneName: 'home', scenario: 'account-switch' },
+    { enabledNums: [0], sceneName: 'home', scenario: 'network-switch' },
+    { enabledNums: [0], sceneName: 'home', scenario: 'selector-open-close' },
+    { enabledNums: [0], sceneName: 'home', scenario: 'selector-retention' },
+    { enabledNums: [0], sceneName: 'home', scenario: 'tab-switch' },
+    { enabledNums: [0], sceneName: 'home', scenario: 'background-churn' },
+  ];
+  if (profile === 'core') {
+    return core;
+  }
+  return [
+    ...core,
+    { enabledNums: [0], sceneName: 'swap', scenario: 'selector-open-close' },
+    { enabledNums: [1], sceneName: 'swap', scenario: 'selector-open-close' },
+    {
+      enabledNums: [0],
+      originCount: 1,
+      sceneName: 'discover',
+      scenario: 'connection-list-open-close',
+    },
+    {
+      enabledNums: [0, 1],
+      originCount: 1,
+      sceneName: 'discover',
+      scenario: 'connection-list-open-close',
+    },
+    {
+      enabledNums: Array.from({ length: 8 }, (_, index) => index),
+      originCount: 1,
+      sceneName: 'discover',
+      scenario: 'connection-list-open-close',
+    },
+    {
+      enabledNums: [0, 1],
+      originCount: 2,
+      sceneName: 'discover',
+      scenario: 'connection-list-open-close',
+    },
+  ];
+}
+
+const SCENARIO_PROFILE = resolveScenarioProfile(
+  process.env.RENDER_BASELINE_SCENARIO_PROFILE,
+);
+const SCENARIO_MATRIX = buildScenarioMatrix(SCENARIO_PROFILE);
 
 // Public BIP39 test vectors (Trezor/BIP39 reference data) - NOT secrets and
 // never holding funds. Fixed mnemonics keep account names, addresses and list
@@ -171,6 +234,9 @@ const WALLET_MODE_STORAGE_KEY = '$onekey_web_dapp_mode';
 const TEST_IDS = {
   accountItem: (index) => `account-item-index-${index}`,
   accountTrigger: 'AccountSelectorTriggerBase',
+  dappAccountListItem: 'dapp-connection-account-list-item',
+  dappConnectionList: 'dapp-connection-list',
+  dappConnectionListItem: 'dapp-connection-list-item',
   networkTrigger: 'account-network-trigger-button',
   networkTriggerText: 'account-network-trigger-button-text',
   walletItem: (walletId) => `wallet-${walletId}`,
@@ -185,6 +251,10 @@ const ONBOARDING_CLOSE_SELECTOR =
 // string is stable in en_US on both branches while the tab's testID is not.
 const SINGLE_NETWORK_TAB_LABEL = 'Single network';
 const NETWORK_IDS = ['evm--1', 'btc--0'];
+const MATRIX_DAPP_ORIGINS = [
+  'https://render-baseline-primary.test',
+  'https://render-baseline-secondary.test',
+];
 const CHURN_STATE = {
   accountIndex: 0,
   networkId: NETWORK_IDS[0],
@@ -758,7 +828,30 @@ async function waitForCommitQuiescence(
       return;
     }
   }
-  log(`warning: commit quiescence not reached within ${timeoutMs}ms`);
+  throw new Error(
+    `Commit quiescence was not reached within ${timeoutMs}ms; ` +
+      'the measurement window is contaminated by unrelated work',
+  );
+}
+
+async function waitForNextPaint(page) {
+  await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        globalThis.requestAnimationFrame(() => {
+          globalThis.requestAnimationFrame(resolve);
+        });
+      }),
+  );
+}
+
+async function markOperation(page, operationId, edge) {
+  await page.evaluate(
+    ({ id, operationEdge }) => {
+      globalThis.__renderBaseline.mark(`${id}:${operationEdge}`);
+    },
+    { id: operationId, operationEdge: edge },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -837,19 +930,42 @@ async function waitForHomeShell(page) {
   assert.fail('Home shell (account selector trigger) never became stable');
 }
 
-async function waitForPersistedSelection(page, expected) {
+async function waitForPersistedSelection(
+  page,
+  expected,
+  { num = 0, sceneName = 'home', sceneUrl } = {},
+) {
   await page.waitForFunction(
-    async ({ expectedSelection }) => {
+    async ({
+      expectedSelection,
+      selectionNum,
+      selectionSceneName,
+      selectionSceneUrl,
+    }) => {
+      const simpleDb = globalThis.$$appGlobals.$backgroundApiProxy.simpleDb;
       const selected =
-        await globalThis.$$appGlobals.$backgroundApiProxy.simpleDb.accountSelector.getSelectedAccount(
-          { num: 0, sceneName: 'home' },
-        );
+        selectionSceneName === 'discover' && selectionSceneUrl
+          ? (
+              await simpleDb.dappConnection.getAccountSelectorMap({
+                sceneUrl: selectionSceneUrl,
+              })
+            )?.[selectionNum]
+          : await simpleDb.accountSelector.getSelectedAccount({
+              num: selectionNum,
+              sceneName: selectionSceneName,
+              sceneUrl: selectionSceneUrl,
+            });
       if (!selected) return false;
       return Object.entries(expectedSelection).every(
         ([key, value]) => selected[key] === value,
       );
     },
-    { expectedSelection: expected },
+    {
+      expectedSelection: expected,
+      selectionNum: num,
+      selectionSceneName: sceneName,
+      selectionSceneUrl: sceneUrl,
+    },
     { timeout: PAGE_TIMEOUT_MS },
   );
 }
@@ -1166,6 +1282,187 @@ async function flowSelectorOpenClose(page) {
   await closeAccountSelector(page);
 }
 
+async function openSceneAccountSelector(page, { num, sceneName, sceneUrl }) {
+  await page.evaluate(
+    ({ selectionNum, selectionSceneName, selectionSceneUrl }) => {
+      globalThis.$$appGlobals.$rootAppNavigation.pushModal(
+        'AccountManagerStacks',
+        {
+          params: {
+            num: selectionNum,
+            sceneName: selectionSceneName,
+            sceneUrl: selectionSceneUrl,
+          },
+          screen: 'AccountSelectorStack',
+        },
+      );
+    },
+    {
+      selectionNum: num,
+      selectionSceneName: sceneName,
+      selectionSceneUrl: sceneUrl,
+    },
+  );
+  await page
+    .locator(visibleTestID(TEST_IDS.walletList))
+    .first()
+    .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
+}
+
+async function closeSceneAccountSelector(page) {
+  await page.evaluate(() => {
+    globalThis.$$appGlobals.$rootAppNavigation.pop();
+  });
+  await waitForHiddenTestID(page, TEST_IDS.walletList);
+  await page
+    .locator(visibleTestID(TEST_IDS.accountTrigger))
+    .first()
+    .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
+}
+
+async function flowSceneSelectorOpenClose(page, config) {
+  await openSceneAccountSelector(page, config);
+  await closeSceneAccountSelector(page);
+}
+
+async function buildMatrixDAppAccountInfo(page, fixture) {
+  const wallet = fixture.wallets[0];
+  return page.evaluate(
+    async ({ indexedAccountId, walletId }) => {
+      const api = globalThis.$$appGlobals.$backgroundApiProxy;
+      const networkId = 'evm--1';
+      const deriveType =
+        (await api.serviceNetwork.getGlobalDeriveTypeOfNetwork({
+          networkId,
+        })) ?? 'default';
+      const { accounts } =
+        await api.serviceAccount.getAccountsByIndexedAccounts({
+          deriveType,
+          indexedAccountIds: [indexedAccountId],
+          networkId,
+        });
+      const account = accounts[0];
+      if (!account?.id || !account.address) {
+        throw new Error('Unable to build benchmark DApp account information');
+      }
+      return {
+        accountId: account.id,
+        address: account.address,
+        deriveType,
+        focusedWallet: walletId,
+        indexedAccountId,
+        networkId,
+        networkImpl: 'evm',
+        walletId,
+      };
+    },
+    {
+      indexedAccountId: wallet.indexedAccountIds[0],
+      walletId: wallet.walletId,
+    },
+  );
+}
+
+async function clearMatrixDAppConnections(page) {
+  await page.evaluate(
+    async ({ origins }) => {
+      const entity =
+        globalThis.$$appGlobals.$backgroundApiProxy.simpleDb.dappConnection;
+      await Promise.all(
+        origins.map((origin) =>
+          entity.deleteConnection(origin, 'injectedProvider'),
+        ),
+      );
+    },
+    { origins: MATRIX_DAPP_ORIGINS },
+  );
+}
+
+async function configureMatrixDAppConnections(
+  page,
+  accountInfo,
+  enabledNumCounts,
+) {
+  await clearMatrixDAppConnections(page);
+  await page.evaluate(
+    async ({ baseAccountInfo, counts, origins }) => {
+      const entity =
+        globalThis.$$appGlobals.$backgroundApiProxy.simpleDb.dappConnection;
+      for (const [originIndex, enabledNumCount] of counts.entries()) {
+        await entity.upsertConnection({
+          accountsInfo: Array.from({ length: enabledNumCount }, () => ({
+            ...baseAccountInfo,
+          })),
+          imageURL: '',
+          origin: origins[originIndex],
+          replaceExistAccount: true,
+          storageType: 'injectedProvider',
+        });
+        const map = await entity.getAccountSelectorMap({
+          sceneUrl: origins[originIndex],
+        });
+        if (Object.keys(map || {}).length !== enabledNumCount) {
+          throw new Error(
+            `Expected ${enabledNumCount} enabled nums for ${origins[originIndex]}`,
+          );
+        }
+      }
+    },
+    {
+      baseAccountInfo: accountInfo,
+      counts: enabledNumCounts,
+      origins: MATRIX_DAPP_ORIGINS,
+    },
+  );
+  await waitForCommitQuiescence(page);
+}
+
+async function openMatrixDAppConnectionList(
+  page,
+  { accountCount, originCount },
+) {
+  await page.evaluate(() => {
+    globalThis.$$appGlobals.$rootAppNavigation.pushModal(
+      'DAppConnectionModal',
+      { screen: 'ConnectionList' },
+    );
+  });
+  await page
+    .locator(visibleTestID(TEST_IDS.dappConnectionList))
+    .first()
+    .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
+  await page.waitForFunction(
+    ({ expectedAccounts, expectedOrigins, accountSelector, originSelector }) =>
+      globalThis.document.querySelectorAll(accountSelector).length ===
+        expectedAccounts &&
+      globalThis.document.querySelectorAll(originSelector).length ===
+        expectedOrigins,
+    {
+      accountSelector: `[data-testid=${JSON.stringify(TEST_IDS.dappAccountListItem)}]`,
+      expectedAccounts: accountCount,
+      expectedOrigins: originCount,
+      originSelector: `[data-testid=${JSON.stringify(TEST_IDS.dappConnectionListItem)}]`,
+    },
+    { timeout: PAGE_TIMEOUT_MS },
+  );
+}
+
+async function closeMatrixDAppConnectionList(page) {
+  await page.evaluate(() => {
+    globalThis.$$appGlobals.$rootAppNavigation.pop();
+  });
+  await waitForHiddenTestID(page, TEST_IDS.dappConnectionList);
+  await page
+    .locator(visibleTestID(TEST_IDS.accountTrigger))
+    .first()
+    .waitFor({ state: 'visible', timeout: PAGE_TIMEOUT_MS });
+}
+
+async function flowMatrixDAppConnectionListOpenClose(page, expected) {
+  await openMatrixDAppConnectionList(page, expected);
+  await closeMatrixDAppConnectionList(page);
+}
+
 async function flowTabSwitch(page) {
   const tradeTab = getSidebarTab(page, 'Trade');
   const walletTab = getSidebarTab(page, 'Wallet');
@@ -1336,6 +1633,7 @@ async function measurePhase(
   {
     diagnosticsProbe,
     iterations = ITERATIONS,
+    scenario,
     warmupIterations = WARMUP_ITERATIONS,
   } = {},
 ) {
@@ -1352,7 +1650,11 @@ async function measurePhase(
   const longAnimationFrameCountDeltas = [];
   const maxLongAnimationFrameMsPerIteration = [];
   const wallMs = [];
+  const nextPaintCommitDeltas = [];
+  const nextPaintRenderedComponentDeltas = [];
+  const nextPaintWallMs = [];
   const iterationDiagnostics = [];
+  const operationIds = [];
   let missingDurationCommits = 0;
   // The flow-iteration index keeps counting across warm-up and measured
   // iterations, so the alternating flows (account-switch, network-switch)
@@ -1366,6 +1668,7 @@ async function measurePhase(
     await page.waitForTimeout(PHASE_SETTLE_MS);
     await waitForCommitQuiescence(page);
     await runIteration(warmup);
+    await waitForNextPaint(page);
     await waitForCommitQuiescence(page);
   }
   for (
@@ -1379,9 +1682,20 @@ async function measurePhase(
       ? await diagnosticsProbe()
       : undefined;
     const before = await readCounters(page);
+    const operationId = `${phaseName}:${iteration}`;
+    operationIds.push(operationId);
+    await markOperation(page, operationId, 'start');
     const startedAt = Date.now();
     const flowDiagnostics = await runIteration(iteration);
+    await waitForNextPaint(page);
+    const nextPaint = await readCounters(page);
+    nextPaintCommitDeltas.push(nextPaint.commits - before.commits);
+    nextPaintRenderedComponentDeltas.push(
+      nextPaint.renderedComponents - before.renderedComponents,
+    );
+    nextPaintWallMs.push(Date.now() - startedAt);
     await waitForCommitQuiescence(page);
+    await markOperation(page, operationId, 'end');
     const after = await readCounters(page);
     commitDeltas.push(after.commits - before.commits);
     renderedComponentDeltas.push(
@@ -1461,9 +1775,16 @@ async function measurePhase(
     maxLongAnimationFrameMsPerIteration,
     maxRenderedInCommit: summarize(maxRenderedInCommitPerIteration),
     maxRenderedInCommitPerIteration,
+    nextPaintCommitDeltas,
+    nextPaintCommits: summarize(nextPaintCommitDeltas),
+    nextPaintRenderedComponentDeltas,
+    nextPaintRenderedComponents: summarize(nextPaintRenderedComponentDeltas),
+    nextPaintWallMs: summarize(nextPaintWallMs),
+    operationIds,
     phase: phaseName,
     renderedComponentDeltas,
     renderedComponents: summarize(renderedComponentDeltas),
+    scenario,
     wallMs: summarize(wallMs),
     warmupIterations,
   };
@@ -1485,11 +1806,13 @@ async function main() {
 
   const { child: rendererProcess, rendererUrl } = await startWebRenderer();
   let browser;
+  let browserVersion;
   let page;
   const phases = [];
   const notes = [];
   try {
     browser = await launchBrowser();
+    browserVersion = browser.version();
     const context = await browser.newContext();
     await context.addInitScript(
       ({ key }) => {
@@ -1552,18 +1875,27 @@ async function main() {
     );
 
     phases.push(
-      await measurePhase(page, 'account-switch', (iteration) =>
-        flowAccountSwitch(page, primaryWallet, iteration),
+      await measurePhase(
+        page,
+        'account-switch',
+        (iteration) => flowAccountSwitch(page, primaryWallet, iteration),
+        { scenario: SCENARIO_MATRIX[0] },
       ),
     );
     phases.push(
-      await measurePhase(page, 'network-switch', (iteration) =>
-        flowNetworkSwitch(page, fixture, iteration),
+      await measurePhase(
+        page,
+        'network-switch',
+        (iteration) => flowNetworkSwitch(page, fixture, iteration),
+        { scenario: SCENARIO_MATRIX[1] },
       ),
     );
     phases.push(
-      await measurePhase(page, 'selector-open-close', () =>
-        flowSelectorOpenClose(page),
+      await measurePhase(
+        page,
+        'selector-open-close',
+        () => flowSelectorOpenClose(page),
+        { scenario: SCENARIO_MATRIX[2] },
       ),
     );
     const retentionProbe = await createResourceSnapshotProbe(context, page);
@@ -1576,15 +1908,86 @@ async function main() {
           {
             diagnosticsProbe: () => retentionProbe.read(),
             iterations: RETENTION_ITERATIONS,
+            scenario: SCENARIO_MATRIX[3],
           },
         ),
       );
     } finally {
       await retentionProbe.dispose();
     }
+    if (SCENARIO_PROFILE === 'matrix') {
+      for (const num of [0, 1]) {
+        const scenario = SCENARIO_MATRIX.find(
+          (item) => item.sceneName === 'swap' && item.enabledNums[0] === num,
+        );
+        phases.push(
+          await measurePhase(
+            page,
+            `swap-num-${num}-open-close`,
+            () =>
+              flowSceneSelectorOpenClose(page, {
+                num,
+                sceneName: 'swap',
+              }),
+            { scenario },
+          ),
+        );
+      }
+
+      const dappAccountInfo = await buildMatrixDAppAccountInfo(page, fixture);
+      try {
+        for (const enabledNumCount of [1, 2, 8]) {
+          await configureMatrixDAppConnections(page, dappAccountInfo, [
+            enabledNumCount,
+          ]);
+          const scenario = SCENARIO_MATRIX.find(
+            (item) =>
+              item.sceneName === 'discover' &&
+              item.originCount === 1 &&
+              item.enabledNums.length === enabledNumCount,
+          );
+          phases.push(
+            await measurePhase(
+              page,
+              `discover-${enabledNumCount}-num-open-close`,
+              () =>
+                flowMatrixDAppConnectionListOpenClose(page, {
+                  accountCount: enabledNumCount,
+                  originCount: 1,
+                }),
+              { scenario },
+            ),
+          );
+        }
+
+        await configureMatrixDAppConnections(page, dappAccountInfo, [2, 2]);
+        const multiOriginScenario = SCENARIO_MATRIX.find(
+          (item) => item.sceneName === 'discover' && item.originCount === 2,
+        );
+        phases.push(
+          await measurePhase(
+            page,
+            'discover-2-origin-2-num-open-close',
+            () =>
+              flowMatrixDAppConnectionListOpenClose(page, {
+                accountCount: 4,
+                originCount: 2,
+              }),
+            { scenario: multiOriginScenario },
+          ),
+        );
+      } finally {
+        await clearMatrixDAppConnections(page);
+        await waitForCommitQuiescence(page);
+      }
+    }
     if (await getSidebarTab(page, 'Trade').count()) {
       phases.push(
-        await measurePhase(page, 'tab-switch', () => flowTabSwitch(page)),
+        await measurePhase(page, 'tab-switch', () => flowTabSwitch(page), {
+          scenario: SCENARIO_MATRIX.find(
+            ({ scenario }) => scenario === 'tab-switch',
+          ),
+        }),
       );
     } else {
       notes.push('tab-switch skipped: Trade sidebar tab not present');
@@ -1603,7 +2006,13 @@ async function main() {
         page,
         'background-churn',
         () => flowBackgroundChurn(page),
-        { iterations: CHURN_EMITS, warmupIterations: 0 },
+        {
+          iterations: CHURN_EMITS,
+          scenario: SCENARIO_MATRIX.find(
+            ({ scenario }) => scenario === 'background-churn',
+          ),
+          warmupIterations: 0,
+        },
       ),
     );
 
@@ -1620,6 +2029,7 @@ async function main() {
       churnState: CHURN_STATE,
       environment: {
         arch: os.arch(),
+        browserVersion,
         headless: shouldRunHeadless(),
         nodeVersion: process.version,
         platform: process.platform,
@@ -1636,9 +2046,12 @@ async function main() {
       iterations: ITERATIONS,
       metricsVersion: METRICS_VERSION,
       notes,
+      operationWindow: OPERATION_WINDOW,
       phases,
       quietMs: QUIET_MS,
       retentionIterations: RETENTION_ITERATIONS,
+      scenarioMatrix: SCENARIO_MATRIX,
+      scenarioProfile: SCENARIO_PROFILE,
       timestamp: new Date().toISOString(),
       totalActualDurationMs: roundMs(finalCounters.actualDurationMs),
       totalCommits: finalCounters.commits,
@@ -1725,8 +2138,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  buildScenarioMatrix,
   diffResourceSnapshots,
   resolveFixtureScale,
+  resolveScenarioProfile,
   summarize,
   summarizeIterationDiagnostics,
 };

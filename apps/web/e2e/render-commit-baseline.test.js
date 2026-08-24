@@ -2,11 +2,45 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
+  buildScenarioMatrix,
   diffResourceSnapshots,
   resolveFixtureScale,
+  resolveScenarioProfile,
   summarize,
   summarizeIterationDiagnostics,
 } = require('./render-commit-baseline.e2e');
+
+test('scenario matrix covers swap nums and Discover fan-out/origins', () => {
+  const matrix = buildScenarioMatrix(resolveScenarioProfile('matrix'));
+
+  assert.ok(
+    matrix.some(
+      ({ enabledNums, sceneName }) =>
+        sceneName === 'swap' && enabledNums.join(',') === '0',
+    ),
+  );
+  assert.ok(
+    matrix.some(
+      ({ enabledNums, sceneName }) =>
+        sceneName === 'swap' && enabledNums.join(',') === '1',
+    ),
+  );
+  assert.deepEqual(
+    matrix
+      .filter(({ sceneName }) => sceneName === 'discover')
+      .map(({ enabledNums, originCount }) => ({
+        enabledNumCount: enabledNums.length,
+        originCount,
+      })),
+    [
+      { enabledNumCount: 1, originCount: 1 },
+      { enabledNumCount: 2, originCount: 1 },
+      { enabledNumCount: 8, originCount: 1 },
+      { enabledNumCount: 2, originCount: 2 },
+    ],
+  );
+  assert.throws(() => resolveScenarioProfile('unknown'), /core.*matrix/);
+});
 
 test('resolveFixtureScale supports larger account fixtures with bounded wallets', () => {
   assert.deepEqual(

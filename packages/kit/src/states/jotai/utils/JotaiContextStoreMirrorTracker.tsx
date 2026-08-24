@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef } from 'react';
+import { memo, useEffect, useMemo } from 'react';
 
 import type {
   IJotaiContextStoreData,
@@ -12,9 +12,7 @@ import {
   useJotaiContextTrackerMap,
 } from '@onekeyhq/kit-bg/src/states/jotai/atoms';
 import { CONTEXT_ATOM_COLD_START_CACHE_KEYS } from '@onekeyhq/shared/src/consts/jotaiConsts';
-import { defaultLogger } from '@onekeyhq/shared/src/logger/logger';
 import platformEnv from '@onekeyhq/shared/src/platformEnv';
-import { useDebugComponentRemountLog } from '@onekeyhq/shared/src/utils/debug/debugUtils';
 import { isSwapColdStartAllNetworkContextNetworkId } from '@onekeyhq/shared/src/utils/swapColdStartCacheSnapshotUtils';
 
 import { JotaiContextRootProviderRenderer } from './JotaiContextRootProviderRenderer';
@@ -41,14 +39,16 @@ const ACCOUNT_SELECTOR_HOME_SCOPE_KEY = 'store:accountSelector@home';
 const SWAP_COLD_START_SCOPE_KEY = `store:${EJotaiContextStoreNames.swap}`;
 const accountSelectorEnabledNumCounts = new Map<string, Map<number, number>>();
 
-export type IJotaiContextStoreMirrorPerfContext = {
-  perfDebugName: string;
-  providerInstanceId: number;
-  sceneName: string;
+export type IJotaiContextStoreMirrorRegistrationChange = {
+  action: 'add' | 'remove';
+  registrationCount: number;
+  storeId: string;
 };
 
 type IJotaiContextStoreMirrorTrackerProps = IJotaiContextStoreData & {
-  accountSelectorPerfContext?: IJotaiContextStoreMirrorPerfContext;
+  onRegistrationChange?: (
+    change: IJotaiContextStoreMirrorRegistrationChange,
+  ) => void;
 };
 
 function getColdStartSnapshot() {
@@ -144,44 +144,12 @@ function hasSwapColdStartSnapshot() {
 
 // AccountSelectorMapTracker
 export function JotaiContextStoreMirrorTracker({
-  accountSelectorPerfContext,
+  onRegistrationChange,
   ...data
 }: IJotaiContextStoreMirrorTrackerProps) {
   const { storeName, accountSelectorInfo } = data;
-  const renderVersionRef = useRef(0);
-  const commitCountRef = useRef(0);
-  const lastCommittedRenderVersionRef = useRef(0);
-  // Diagnostics-only prop read through a ref: its identity flips when the
-  // perf toggle changes, and having it in the registration effect deps would
-  // remove+re-add the mirror count, letting a pending store reset destroy a
-  // still-mounted scene store.
-  const accountSelectorPerfContextRef = useRef(accountSelectorPerfContext);
-  accountSelectorPerfContextRef.current = accountSelectorPerfContext;
-  renderVersionRef.current += 1;
-  useDebugComponentRemountLog({
-    name: `JotaiContextStoreMirrorTracker`,
-    payload: data,
-  });
   const { setMap } = useJotaiContextTrackerMap();
   const storeId = buildJotaiContextStoreId(data);
-  // oxlint-disable-next-line use-effect-no-deps/use-effect-no-deps
-  useEffect(() => {
-    if (
-      !accountSelectorPerfContext ||
-      lastCommittedRenderVersionRef.current === renderVersionRef.current
-    ) {
-      return;
-    }
-    lastCommittedRenderVersionRef.current = renderVersionRef.current;
-    commitCountRef.current += 1;
-    defaultLogger.accountSelector.perf.trace('mirrorTrackerCommit', {
-      commitCount: commitCountRef.current,
-      perfDebugName: accountSelectorPerfContext.perfDebugName,
-      providerInstanceId: accountSelectorPerfContext.providerInstanceId,
-      sceneName: accountSelectorPerfContext.sceneName,
-      storeId,
-    });
-  });
   useEffect(() => {
     const processMapCount = (action: 'add' | 'remove') => {
       const toMergeMap: IJotaiContextStoreMap = {};
@@ -264,17 +232,11 @@ export function JotaiContextStoreMirrorTracker({
       if (action === 'remove' && value.count <= 0) {
         jotaiContextStore.completeStoreResetIfRequestedById(storeId);
       }
-      const perfContext = accountSelectorPerfContextRef.current;
-      if (perfContext) {
-        defaultLogger.accountSelector.perf.trace('mirrorTrackerRegistration', {
-          action,
-          perfDebugName: perfContext.perfDebugName,
-          providerInstanceId: perfContext.providerInstanceId,
-          registrationCount: Math.max(0, value.count),
-          sceneName: perfContext.sceneName,
-          storeId,
-        });
-      }
+      onRegistrationChange?.({
+        action,
+        registrationCount: Math.max(0, value.count),
+        storeId,
+      });
     };
 
     processMapCount('add');
@@ -282,7 +244,7 @@ export function JotaiContextStoreMirrorTracker({
     return () => {
       processMapCount('remove');
     };
-  }, [accountSelectorInfo, setMap, storeId, storeName]);
+  }, [accountSelectorInfo, onRegistrationChange, setMap, storeId, storeName]);
 
   return null;
 }

@@ -2,10 +2,11 @@
 
 import { memo } from 'react';
 
-import { act, render } from '@testing-library/react';
+import { act, render, waitFor } from '@testing-library/react';
 import { cloneDeep } from 'lodash';
 
 import { getJotaiContextTrackerMap } from '@onekeyhq/kit-bg/src/states/jotai/atoms';
+import { EJotaiContextStoreNames } from '@onekeyhq/kit-bg/src/states/jotai/atoms/jotaiContextStoreMap';
 import { OneKeyLocalError } from '@onekeyhq/shared/src/errors';
 import { EAccountSelectorSceneName } from '@onekeyhq/shared/types';
 
@@ -28,6 +29,7 @@ import type {
 import type { IJotaiContextStore } from '../../states/jotai/utils/createJotaiContext';
 
 const mockPerfTrace = jest.fn();
+let mockPerfDebugEnabled = true;
 const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
 
 jest.mock('@onekeyhq/shared/src/logger/logger', () => {
@@ -49,7 +51,7 @@ jest.mock('../../states/jotai/contexts/accountSelector/perfDebug', () => ({
     stateUpdatedAt: performance.now() - 5,
     transitionId: 1,
   }),
-  isAccountSelectorPerfDebugEnabled: () => true,
+  isAccountSelectorPerfDebugEnabled: () => mockPerfDebugEnabled,
 }));
 
 // AccountSelectorProvider imports JotaiContextStoreMirrorTracker, whose module
@@ -118,6 +120,7 @@ function clearJotaiContextTrackerMap() {
 
 describe('AccountSelectorProviderMirror availableNetworksMap init guard', () => {
   beforeEach(() => {
+    mockPerfDebugEnabled = true;
     jotaiContextStore.storeCache.clear();
     jotaiContextStore.storeResetRequests.clear();
     clearJotaiContextTrackerMap();
@@ -198,6 +201,7 @@ describe('AccountSelectorProviderMirror availableNetworksMap init guard', () => 
 
 describe('AccountSelectorProviderMirror paint attribution', () => {
   beforeEach(() => {
+    mockPerfDebugEnabled = true;
     jotaiContextStore.storeCache.clear();
     jotaiContextStore.storeResetRequests.clear();
     clearJotaiContextTrackerMap();
@@ -212,7 +216,7 @@ describe('AccountSelectorProviderMirror paint attribution', () => {
     clearJotaiContextTrackerMap();
   });
 
-  it('reports selection state-to-paint latency after a tracked provider commit', () => {
+  it('reports selection state-to-paint latency after a tracked provider commit', async () => {
     let contextStore: IJotaiContextStore | undefined;
     globalThis.requestAnimationFrame = (callback: FrameRequestCallback) => {
       callback(performance.now() + 16);
@@ -236,6 +240,17 @@ describe('AccountSelectorProviderMirror paint attribution', () => {
       </AccountSelectorProviderMirror>,
     );
 
+    await waitFor(() => expect(contextStore).toBeDefined());
+    await waitFor(() =>
+      expect(mockPerfTrace).toHaveBeenCalledWith(
+        'providerSubtreeCommit',
+        expect.objectContaining({
+          initialObservation: true,
+          perfDebugName: 'provider-paint-test',
+        }),
+      ),
+    );
+
     if (!contextStore) {
       throw new OneKeyLocalError('context store not captured');
     }
@@ -248,20 +263,66 @@ describe('AccountSelectorProviderMirror paint attribution', () => {
       });
     });
 
-    expect(mockPerfTrace).toHaveBeenCalledWith(
-      'providerSubtreePaint',
-      expect.objectContaining({
-        commitToPaintMs: expect.any(Number),
-        perfDebugName: 'provider-paint-test',
-        stateChanges: expect.arrayContaining([
-          expect.objectContaining({
-            num: 0,
-            selectedChanged: true,
-            selectionStateToPaintMs: expect.any(Number),
-            selectionTransitionId: 1,
-          }),
-        ]),
-      }),
+    await waitFor(() =>
+      expect(mockPerfTrace).toHaveBeenCalledWith(
+        'providerSubtreePaint',
+        expect.objectContaining({
+          commitToPaintMs: expect.any(Number),
+          perfDebugName: 'provider-paint-test',
+          stateChanges: expect.arrayContaining([
+            expect.objectContaining({
+              num: 0,
+              selectedChanged: true,
+              selectionStateToPaintMs: expect.any(Number),
+              selectionTransitionId: 1,
+            }),
+          ]),
+        }),
+      ),
     );
+  });
+
+  it('keeps the mirror registration mounted when perf attribution changes', async () => {
+    let contextStore: IJotaiContextStore | undefined;
+    const data = {
+      accountSelectorInfo: {
+        enabledNum: [0],
+        sceneName: EAccountSelectorSceneName.home,
+        sceneUrl: undefined,
+      },
+      storeName: EJotaiContextStoreNames.accountSelector,
+    };
+
+    function Consumer() {
+      contextStore = useAccountSelectorContextData().store;
+      return null;
+    }
+
+    function renderMirror() {
+      return (
+        <AccountSelectorProviderMirror
+          config={{ sceneName: EAccountSelectorSceneName.home }}
+          enabledNum={[0]}
+          perfDebugName="provider-toggle-test"
+          waitForStorageReady={false}
+        >
+          <Consumer />
+        </AccountSelectorProviderMirror>
+      );
+    }
+
+    const rendered = render(renderMirror());
+    await waitFor(() => expect(contextStore).toBeDefined());
+    if (!contextStore) {
+      throw new OneKeyLocalError('context store not captured');
+    }
+    const store = contextStore;
+    jotaiContextStore.requestStoreReset(data, store);
+
+    mockPerfDebugEnabled = false;
+    rendered.rerender(renderMirror());
+
+    await waitFor(() => expect(jotaiContextStore.getStore(data)).toBe(store));
+    expect(jotaiContextStore.storeResetRequests.size).toBe(1);
   });
 });

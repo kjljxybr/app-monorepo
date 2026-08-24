@@ -1,63 +1,28 @@
 #!/usr/bin/env node
 
 /*
- * One-command cross-branch A/B driver for the render commit baseline
- * (render-commit-baseline.e2e.js). The whole protocol lives here, in the code
- * that actually runs it, so it cannot drift from a prose description:
+ * Cross-commit Account Selector A/B driver.
  *
- *   1. Baseline target: a PINNED x commit (constant below, overridable via
- *      RENDER_BASELINE_X_COMMIT). Pinning keeps successive candidate runs
- *      comparable with each other even after origin/x moves on.
- *   2. Candidate target: the current repo's committed HEAD, or the exact
- *      RENDER_BASELINE_CANDIDATE_COMMIT override. Product code always comes
- *      from that commit; the benchmark harness comes from this worktree and
- *      its SHA-256 is recorded in the summary.
- *   3. Both targets are measured in disposable local clones under
- *      .tmp/render-baseline-clones/ in this repo (gitignored). Each clone is a
- *      `git clone --no-checkout <localRepoPath>` (plain path, NOT file://, so
- *      git's local transport hardlinks the object database - near-instant and
- *      near-zero additional disk for .git) followed by a detached
- *      `git checkout <sha>`. Because the object store is shared, ANY commit
- *      present in the local repository is directly checkoutable - no fetch,
- *      no deepening. Never `git clone -b x` (the local x branch is often
- *      stale - the number one pitfall); the pinned sha is checked out
- *      directly. Clones for the same sha are reused across invocations when
- *      node_modules is present (saves ~4 minutes per rerun);
- *      RENDER_BASELINE_FRESH=1 forces fresh clones. Each clone still costs
- *      roughly 8GB of disk (working tree + node_modules); purge with
- *      `rm -rf .tmp/render-baseline-clones` (or RENDER_BASELINE_CLEANUP=1).
- *   4. Hardlink caveat: the clones share the main repo's object files via
- *      hardlinks. An aggressive `git gc --prune` in the main repo could only
- *      race the brief clone step itself; once a clone exists its hardlinks
- *      keep the objects alive independently. Negligible for a ~10-minute run.
- *   5. The harness is copied from THIS DRIVER'S WORKTREE into both clones
- *      byte-identical, and the one-line test:e2e:web:render-baseline script is
- *      injected into each clone's package.json. This permits fair historical
- *      commit comparisons after a harness fix without changing product code.
- *   6. Both measurements run back-to-back (x first, then candidate) with
- *      WEB_E2E_HEADLESS=true, on an otherwise idle machine; RENDER_BASELINE_*
- *      and WEB_E2E_* env knobs pass through to the harness.
- *   7. The two v4 artifacts are compared per phase (rendered components,
- *      commits, max rendered per commit, actualDuration; medians + % change,
- *      background-churn highlighted) and a machine-readable summary (which
- *      embeds the gate verdict from step 8) plus copies of both raw artifacts
- *      are written to .tmp/render-baseline/ in THIS repo. Nothing is recorded
- *      into the repository: both sides are re-measured live in every run, so
- *      there is no stored baseline that could go stale against the code.
- *   8. Regression gate (default ON; RENDER_BASELINE_GATE=0 disables): for
- *      every phase measured on both sides, the candidate's renderedComponents
- *      and commits medians must not exceed the x medians of the SAME run by
- *      more than RENDER_BASELINE_GATE_FACTOR (default 1.3). This is symmetric
- *      regression detection - deliberately never "candidate must beat x",
- *      which would go permanently stale the moment x is re-pinned onto a
- *      commit that already contains the optimization under test.
- *      actualDuration and wall-ms medians only warn (too noisy to gate). A
- *      failed gate exits with code 2; measurement failures exit with code 1.
+ * PR mode is the default: the baseline is merge-base(candidate, origin/x).
+ * Trend mode uses DEFAULT_PINNED_X_COMMIT and is explicitly selected with
+ * RENDER_BASELINE_BASE_MODE=trend. RENDER_BASELINE_X_COMMIT overrides either.
  *
- * This driver requires nothing beyond Node builtins.
+ * Each target is checked out in a reusable local clone and receives the same
+ * byte-identical harness from this worktree. The default protocol runs three
+ * balanced groups: ABBA, BAAB, ABBA. This yields six adjacent baseline /
+ * candidate pairs while balancing warm-cache, thermal and order effects.
+ * RENDER_BASELINE_GROUPS changes the group count.
+ *
+ * Phase metrics are aggregated from paired candidate/baseline ratios. The
+ * summary stores every raw sample plus median, MAD and IQR. Missing phases,
+ * required metrics or comparable environment/config fields fail measurement;
+ * they cannot produce a PASS. The hard gate covers rendered components,
+ * commits, max rendered in one commit, and background reload fan-out.
+ * Duration and responsiveness metrics remain warning-only. Gate regressions
+ * exit 2; measurement/comparability failures exit 1.
  */
 
-// cspell:ignore pgrep hardlink hardlinks checkoutable
+// cspell:ignore BAAB pgrep hardlink hardlinks checkoutable
 
 const { execFileSync, spawn } = require('node:child_process');
 const crypto = require('node:crypto');
@@ -65,22 +30,27 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const {
+  DECISIVE_PHASE,
+  aggregatePairedMeasurements,
+  buildBalancedSchedule,
+  buildPairedMeasurements,
+  evaluatePairedRegressionGate,
+  formatPercent,
+  summarizeDistribution,
+  validateComparableMeasurements,
+} = require('./render-baseline-protocol');
+
 const repoRoot = path.resolve(__dirname, '../../..');
 
-// origin/x commit the candidate is compared against by default. Pinning keeps
-// successive candidate runs comparable with each other as origin/x moves on.
-// It is NOT a stored measurement: the x side is re-measured live in every run,
-// so re-pinning is a one-line change with no recorded artifact to keep in
-// sync. Re-pin once x has drifted far enough that the comparison stops
-// describing the regression this baseline guards.
+// Long-term trend anchor. PR mode does not use it.
 const DEFAULT_PINNED_X_COMMIT = 'a830dee4bbcee70217c127ec369432cd15c4b14e';
 
 const HARNESS_RELATIVE_PATH = 'apps/web/e2e/render-commit-baseline.e2e.js';
-const METRICS_VERSION = 5;
+const METRICS_VERSION = 6;
 const RUN_SCRIPT_NAME = 'test:e2e:web:render-baseline';
 const RUN_SCRIPT_COMMAND = 'node apps/web/e2e/render-commit-baseline.e2e.js';
-const DECISIVE_PHASE = 'background-churn';
-const RETENTION_PHASE = 'selector-retention';
+const DEFAULT_GROUPS = 3;
 
 const clonesRoot =
   process.env.RENDER_BASELINE_CLONES_DIR ||
@@ -224,25 +194,75 @@ function assertNoConcurrentMeasurement() {
   );
 }
 
-function resolvePinnedXCommit() {
-  const override = process.env.RENDER_BASELINE_X_COMMIT;
-  if (!override) {
-    return { sha: DEFAULT_PINNED_X_COMMIT, source: 'pinned default' };
+function resolveGroups() {
+  const raw = process.env.RENDER_BASELINE_GROUPS;
+  if (raw === undefined || raw.trim() === '') {
+    return DEFAULT_GROUPS;
   }
-  if (/^[0-9a-f]{40}$/.test(override)) {
-    return { sha: override, source: 'RENDER_BASELINE_X_COMMIT' };
-  }
-  // Allow short shas / ref names; resolve them in the local repo. CAUTION: a
-  // bare `x` resolves the often-stale local branch - prefer full shas or
-  // `origin/x` after a fetch.
-  const resolved = tryGit(['rev-parse', `${override}^{commit}`], repoRoot);
-  if (!resolved) {
+  const groups = Number(raw);
+  if (!Number.isInteger(groups) || groups <= 0) {
     throw new Error(
-      `RENDER_BASELINE_X_COMMIT=${override} does not resolve to a commit in ` +
-        `${repoRoot}. Run \`git fetch origin x\` first, or pass a full sha.`,
+      `RENDER_BASELINE_GROUPS=${raw} must be a positive integer ` +
+        `(default ${DEFAULT_GROUPS})`,
     );
   }
-  return { sha: resolved, source: `RENDER_BASELINE_X_COMMIT (${override})` };
+  return groups;
+}
+
+function resolveBaselineCommit(candidateSha) {
+  const override = process.env.RENDER_BASELINE_X_COMMIT;
+  if (override) {
+    const resolved = /^[0-9a-f]{40}$/.test(override)
+      ? override
+      : tryGit(['rev-parse', `${override}^{commit}`], repoRoot);
+    if (!resolved) {
+      throw new Error(
+        `RENDER_BASELINE_X_COMMIT=${override} does not resolve to a commit in ` +
+          `${repoRoot}. Run \`git fetch origin x\` first, or pass a full sha.`,
+      );
+    }
+    return {
+      mode: 'explicit',
+      sha: resolved,
+      source: `RENDER_BASELINE_X_COMMIT (${override})`,
+    };
+  }
+
+  const mode = process.env.RENDER_BASELINE_BASE_MODE || 'pr';
+  if (mode === 'trend') {
+    return {
+      mode,
+      sha: DEFAULT_PINNED_X_COMMIT,
+      source: 'pinned long-term trend baseline',
+    };
+  }
+  if (mode !== 'pr') {
+    throw new Error(
+      `RENDER_BASELINE_BASE_MODE=${mode} must be either "pr" or "trend"`,
+    );
+  }
+  const originX = tryGit(
+    ['rev-parse', 'refs/remotes/origin/x^{commit}'],
+    repoRoot,
+  );
+  if (!originX) {
+    throw new Error(
+      'refs/remotes/origin/x is unavailable. Run `git fetch origin x` and retry.',
+    );
+  }
+  const mergeBase = tryGit(['merge-base', candidateSha, originX], repoRoot);
+  if (!mergeBase) {
+    throw new Error(
+      `Unable to resolve merge-base between candidate ${candidateSha} and ` +
+        `origin/x ${originX}`,
+    );
+  }
+  return {
+    mode,
+    originX,
+    sha: mergeBase,
+    source: `merge-base(candidate, origin/x ${originX.slice(0, 7)})`,
+  };
 }
 
 function resolveCandidateCommit() {
@@ -263,12 +283,12 @@ function resolveCandidateCommit() {
   };
 }
 
-function assertPinnedShaReachable(xSha) {
+function assertBaselineShaReachable(xSha) {
   // Hard requirement: the clones hardlink this repo's object store, so the
   // pinned commit must exist HERE for the detached checkout to work.
   if (!hasCommit(repoRoot, xSha)) {
     throw new Error(
-      `Pinned x commit ${xSha} is not present in the local repository. Run ` +
+      `Baseline commit ${xSha} is not present in the local repository. Run ` +
         `\`git fetch origin x\` in ${repoRoot} and retry.`,
     );
   }
@@ -280,7 +300,7 @@ function assertPinnedShaReachable(xSha) {
   if (!originX) {
     log(
       'WARNING: refs/remotes/origin/x does not exist locally; cannot sanity ' +
-        'check that the pinned commit is on x',
+        'check that the baseline commit is on x',
     );
     return null;
   }
@@ -288,7 +308,7 @@ function assertPinnedShaReachable(xSha) {
     tryGit(['merge-base', '--is-ancestor', xSha, originX], repoRoot) !== null;
   if (!isAncestor && xSha !== originX) {
     log(
-      `WARNING: pinned x commit ${xSha} is not an ancestor of local ` +
+      `WARNING: baseline commit ${xSha} is not an ancestor of local ` +
         `origin/x (${originX}) - measuring it anyway, but verify it really ` +
         'is an x commit (or run `git fetch origin x` to refresh the ref)',
     );
@@ -440,213 +460,6 @@ async function runMeasurement({ cloneDir, label, logFile, runArtifactDir }) {
 }
 
 // ---------------------------------------------------------------------------
-// Comparison
-// ---------------------------------------------------------------------------
-
-function pctChange(xValue, candidateValue) {
-  if (
-    typeof xValue !== 'number' ||
-    typeof candidateValue !== 'number' ||
-    xValue === 0
-  ) {
-    return null;
-  }
-  return Math.round(((candidateValue - xValue) / xValue) * 1000) / 10;
-}
-
-function formatPct(value) {
-  if (value === null) {
-    return 'n/a';
-  }
-  return `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`;
-}
-
-function phaseMedian(phase, metric) {
-  if (!phase) {
-    return null;
-  }
-  if (metric === 'actualDurationMs') {
-    return phase.actualDurationAvailable === true
-      ? phase.actualDurationMs.median
-      : null;
-  }
-  if (metric.startsWith('diagnostics.')) {
-    const diagnostic = metric.slice('diagnostics.'.length);
-    const stats = phase.diagnostics?.[diagnostic];
-    return stats && typeof stats.median === 'number' ? stats.median : null;
-  }
-  const stats = phase[metric];
-  return stats && typeof stats.median === 'number' ? stats.median : null;
-}
-
-function comparePhases(xArtifact, candidateArtifact) {
-  const candidateByName = new Map(
-    candidateArtifact.phases.map((phase) => [phase.phase, phase]),
-  );
-  const phaseNames = xArtifact.phases.map((phase) => phase.phase);
-  for (const phase of candidateArtifact.phases) {
-    if (!phaseNames.includes(phase.phase)) {
-      phaseNames.push(phase.phase);
-    }
-  }
-  const xByName = new Map(
-    xArtifact.phases.map((phase) => [phase.phase, phase]),
-  );
-  const metrics = [
-    ['renderedComponents', 'rendered components / iteration (median)'],
-    ['commits', 'React commits / iteration (median)'],
-    ['maxRenderedInCommit', 'max rendered in one commit (median)'],
-    ['actualDurationMs', 'actualDuration ms / iteration (median)'],
-    [
-      'maxInteractionLatencyMs',
-      'max Event Timing latency ms / iteration (median)',
-    ],
-    [
-      'maxLongAnimationFrameMs',
-      'max Long Animation Frame ms / iteration (median)',
-    ],
-    ['diagnostics.reloadsStarted', 'reload calls / churn emit (median)'],
-    [
-      'diagnostics.reloadDurationTotalMs',
-      'reload duration ms / churn emit (median)',
-    ],
-    ['diagnostics.retainedDomNodes', 'retained DOM nodes / cycle (median)'],
-    [
-      'diagnostics.retainedEventListeners',
-      'retained event listeners / cycle (median)',
-    ],
-    [
-      'diagnostics.retainedJsHeapBytes',
-      'retained JS heap bytes / cycle (median)',
-    ],
-  ];
-  const rows = phaseNames.map((phaseName) => {
-    const entry = { phase: phaseName };
-    for (const [metric] of metrics) {
-      const xValue = phaseMedian(xByName.get(phaseName), metric);
-      const candidateValue = phaseMedian(
-        candidateByName.get(phaseName),
-        metric,
-      );
-      entry[metric] = {
-        candidate: candidateValue,
-        pctChange: pctChange(xValue, candidateValue),
-        x: xValue,
-      };
-    }
-    return entry;
-  });
-
-  for (const [metric, title] of metrics) {
-    console.log(`\n${title}:`);
-    console.table(
-      rows.map((row) => ({
-        phase: row.phase === DECISIVE_PHASE ? `${row.phase} **` : row.phase,
-        x: row[metric].x ?? 'n/a',
-        candidate: row[metric].candidate ?? 'n/a',
-        change: formatPct(row[metric].pctChange),
-      })),
-    );
-  }
-  const churn = rows.find((row) => row.phase === DECISIVE_PHASE);
-  if (churn) {
-    console.log(
-      `** ${DECISIVE_PHASE} is the decisive phase for reload dedup work ` +
-        '(no-op AccountUpdate reload cycles):',
-    );
-    console.log(
-      `   rendered ${churn.renderedComponents.x} -> ` +
-        `${churn.renderedComponents.candidate} ` +
-        `(${formatPct(churn.renderedComponents.pctChange)}), ` +
-        `commits ${churn.commits.x} -> ${churn.commits.candidate} ` +
-        `(${formatPct(churn.commits.pctChange)}), ` +
-        `duration ${churn.actualDurationMs.x ?? 'n/a'}ms -> ` +
-        `${churn.actualDurationMs.candidate ?? 'n/a'}ms ` +
-        `(${formatPct(churn.actualDurationMs.pctChange)})`,
-    );
-  }
-  return rows;
-}
-
-function compareBoot(xArtifact, candidateArtifact) {
-  const boot = {};
-  for (const metric of ['commits', 'renderedComponents', 'actualDurationMs']) {
-    const xValue = xArtifact.boot[metric];
-    const candidateValue = candidateArtifact.boot[metric];
-    boot[metric] = {
-      candidate: candidateValue,
-      pctChange: pctChange(xValue, candidateValue),
-      x: xValue,
-    };
-  }
-  console.log(
-    `\nboot: commits ${boot.commits.x} -> ${boot.commits.candidate} ` +
-      `(${formatPct(boot.commits.pctChange)}), rendered ` +
-      `${boot.renderedComponents.x} -> ${boot.renderedComponents.candidate} ` +
-      `(${formatPct(boot.renderedComponents.pctChange)}), duration ` +
-      `${boot.actualDurationMs.x}ms -> ${boot.actualDurationMs.candidate}ms ` +
-      `(${formatPct(boot.actualDurationMs.pctChange)})`,
-  );
-  return boot;
-}
-
-function comparabilityWarnings(xArtifact, candidateArtifact) {
-  const warnings = [];
-  if (
-    xArtifact.metricsVersion !== METRICS_VERSION ||
-    candidateArtifact.metricsVersion !== METRICS_VERSION
-  ) {
-    warnings.push(
-      `metricsVersion mismatch: x=${xArtifact.metricsVersion} ` +
-        `candidate=${candidateArtifact.metricsVersion}`,
-    );
-  }
-  for (const key of [
-    'iterations',
-    'churnEmits',
-    'quietMs',
-    'retentionIterations',
-    'warmupIterations',
-  ]) {
-    if (xArtifact[key] !== candidateArtifact[key]) {
-      warnings.push(
-        `${key} mismatch: x=${xArtifact[key]} candidate=${candidateArtifact[key]}`,
-      );
-    }
-  }
-  if (
-    JSON.stringify(xArtifact.fixture) !==
-    JSON.stringify(candidateArtifact.fixture)
-  ) {
-    warnings.push(
-      `fixture mismatch: x=${JSON.stringify(xArtifact.fixture)} ` +
-        `candidate=${JSON.stringify(candidateArtifact.fixture)}`,
-    );
-  }
-  if (
-    JSON.stringify(xArtifact.churnState) !==
-    JSON.stringify(candidateArtifact.churnState)
-  ) {
-    warnings.push(
-      `churnState mismatch: x=${JSON.stringify(xArtifact.churnState)} ` +
-        `candidate=${JSON.stringify(candidateArtifact.churnState)}`,
-    );
-  }
-  if (
-    xArtifact.environment.headless !== candidateArtifact.environment.headless
-  ) {
-    warnings.push(
-      `headless mismatch: x=${xArtifact.environment.headless} ` +
-        `candidate=${candidateArtifact.environment.headless}`,
-    );
-  }
-  for (const warning of warnings) {
-    log(`WARNING: ${warning} - the comparison may not be valid`);
-  }
-  return warnings;
-}
-
-// ---------------------------------------------------------------------------
 // Regression gate
 // ---------------------------------------------------------------------------
 
@@ -656,23 +469,6 @@ function comparabilityWarnings(xArtifact, candidateArtifact) {
 // idle machine; 1.3 sits well above that noise while still failing on the
 // multi-x regressions this baseline exists to guard.
 const DEFAULT_GATE_FACTOR = 1.3;
-// Gated: the stable count metrics. Warn-only: duration and wall time are too
-// noisy to fail a run on.
-const GATE_METRICS = ['renderedComponents', 'commits'];
-const GATE_WARN_ONLY_METRICS = [
-  'actualDurationMs',
-  'maxInteractionLatencyMs',
-  'maxLongAnimationFrameMs',
-  'wallMs',
-];
-const CHURN_GATE_METRICS = ['diagnostics.reloadsStarted'];
-const CHURN_WARN_ONLY_METRICS = ['diagnostics.reloadDurationTotalMs'];
-const RETENTION_WARN_ONLY_METRICS = [
-  'diagnostics.retainedDocuments',
-  'diagnostics.retainedDomNodes',
-  'diagnostics.retainedEventListeners',
-  'diagnostics.retainedJsHeapBytes',
-];
 
 // Default ON; RENDER_BASELINE_GATE=0 disables the gate entirely.
 function isGateEnabled() {
@@ -698,136 +494,110 @@ function resolveGateFactor() {
   return value;
 }
 
-function round2(value) {
-  return Math.round(value * 100) / 100;
-}
-
-// Pure verdict function (exported below for self-tests). The gate is
-// deliberately SYMMETRIC regression detection: the candidate must not be
-// significantly worse than the x side measured in the SAME run. It is never
-// "candidate must beat x" - that one-directional claim would go permanently
-// stale the moment x is re-pinned onto a commit that already contains the
-// optimization under test. Phases or metrics missing on either side are
-// surfaced as warnings, never silently skipped. A zero x median leaves the
-// candidate no headroom at all (0 * factor = 0): factor scaling cannot
-// express slack above zero, and that strictness is intentional.
-function evaluateRegressionGate(xPhases, candidatePhases, factor) {
-  const xByName = new Map(xPhases.map((phase) => [phase.phase, phase]));
-  const candidateByName = new Map(
-    candidatePhases.map((phase) => [phase.phase, phase]),
+function assertComparableMeasurements(measurements) {
+  const issues = validateComparableMeasurements(measurements, METRICS_VERSION);
+  if (issues.length === 0) {
+    return;
+  }
+  for (const issue of issues) {
+    log(`COMPARABILITY FAILURE: ${issue}`);
+  }
+  throw new Error(
+    `Measurements are not comparable (${issues.length} hard failure(s))`,
   );
-  const failures = [];
-  const warnings = [];
-  const phases = [];
-  for (const xPhase of xPhases) {
-    const phaseName = xPhase.phase;
-    const candidatePhase = candidateByName.get(phaseName);
-    if (!candidatePhase) {
-      warnings.push(
-        `phase ${phaseName}: present on x but missing on candidate - not gated`,
-      );
-    } else {
-      const checks = [];
-      const gatedMetrics =
-        phaseName === DECISIVE_PHASE
-          ? [...GATE_METRICS, ...CHURN_GATE_METRICS]
-          : GATE_METRICS;
-      for (const metric of gatedMetrics) {
-        const xValue = phaseMedian(xPhase, metric);
-        const candidateValue = phaseMedian(candidatePhase, metric);
-        if (typeof xValue !== 'number' || typeof candidateValue !== 'number') {
-          warnings.push(
-            `phase ${phaseName} ${metric}: median unavailable on one side - not gated`,
-          );
-        } else {
-          const limit = xValue * factor;
-          const pass = candidateValue <= limit;
-          checks.push({
-            candidate: candidateValue,
-            limit: round2(limit),
-            metric,
-            pass,
-            x: xValue,
-          });
-          if (!pass) {
-            failures.push(
-              `phase ${phaseName} ${metric}: x median ${xValue} vs candidate ` +
-                `median ${candidateValue} ` +
-                `(${formatPct(pctChange(xValue, candidateValue))}) exceeds ` +
-                `gate factor ${factor} (limit ${round2(limit)})`,
-            );
-          }
-        }
-      }
-      let warnOnlyMetrics = GATE_WARN_ONLY_METRICS;
-      if (phaseName === DECISIVE_PHASE) {
-        warnOnlyMetrics = [...warnOnlyMetrics, ...CHURN_WARN_ONLY_METRICS];
-      }
-      if (phaseName === RETENTION_PHASE) {
-        warnOnlyMetrics = [...warnOnlyMetrics, ...RETENTION_WARN_ONLY_METRICS];
-      }
-      for (const metric of warnOnlyMetrics) {
-        const xValue = phaseMedian(xPhase, metric);
-        const candidateValue = phaseMedian(candidatePhase, metric);
-        // actualDuration is best-effort and may legitimately be unavailable;
-        // warn-only metrics stay silent about that.
-        if (
-          typeof xValue === 'number' &&
-          typeof candidateValue === 'number' &&
-          candidateValue > xValue * factor
-        ) {
-          warnings.push(
-            `phase ${phaseName} ${metric}: x median ${xValue} vs candidate ` +
-              `median ${candidateValue} ` +
-              `(${formatPct(pctChange(xValue, candidateValue))}) exceeds ` +
-              `factor ${factor} - WARNING ONLY, this metric is not stable ` +
-              'enough to gate',
-          );
-        }
-      }
-      phases.push({
-        checks,
-        pass: checks.every((check) => check.pass),
-        phase: phaseName,
-      });
-    }
-  }
-  for (const candidatePhase of candidatePhases) {
-    if (!xByName.has(candidatePhase.phase)) {
-      warnings.push(
-        `phase ${candidatePhase.phase}: present on candidate but missing on ` +
-          'x - not gated',
-      );
-    }
-  }
-  return {
-    factor,
-    failures,
-    pass: failures.length === 0,
-    phases,
-    warnings,
-  };
 }
 
-// Evaluates the gate against the two artifacts, logs the verdict, and returns
-// the object stored under `gate` in the summary JSON. Exit-code handling
-// stays in main so the summary is always written first.
-function applyRegressionGate(xArtifact, candidateArtifact, gateConfig) {
+function printPairedComparison(aggregate) {
+  const metrics = [
+    ['renderedComponents', 'rendered components'],
+    ['commits', 'React commits'],
+    ['maxRenderedInCommit', 'max rendered in one commit'],
+    ['nextPaintRenderedComponents', 'rendered components by next paint'],
+    ['nextPaintCommits', 'React commits by next paint'],
+    ['nextPaintWallMs', 'next-paint wall ms'],
+    ['actualDurationMs', 'actualDuration ms'],
+    ['maxInteractionLatencyMs', 'max interaction latency ms'],
+    ['maxLongAnimationFrameMs', 'max Long Animation Frame ms'],
+    ['diagnostics.reloadsStarted', 'reload calls'],
+    ['diagnostics.reloadDurationTotalMs', 'reload duration ms'],
+  ];
+  for (const [metric, title] of metrics) {
+    const rows = aggregate.phases
+      .filter((phase) => phase.metrics[metric])
+      .map((phase) => {
+        const result = phase.metrics[metric];
+        const ratio = result.pairedRatio;
+        return {
+          'baseline median': result.baseline.median,
+          'candidate median': result.candidate.median,
+          change: formatPercent(ratio?.median),
+          'paired IQR': ratio?.iqr ?? 'n/a',
+          'paired MAD': ratio?.mad ?? 'n/a',
+          evidence: result.classification.direction,
+          phase:
+            phase.phase === DECISIVE_PHASE ? `${phase.phase} **` : phase.phase,
+        };
+      });
+    if (rows.length) {
+      console.log(`\n${title} (${aggregate.pairCount} paired samples):`);
+      console.table(rows);
+    }
+  }
+}
+
+function aggregateBoot(measurements) {
+  const pairs = buildPairedMeasurements(measurements);
+  return Object.fromEntries(
+    ['commits', 'renderedComponents', 'actualDurationMs'].map((metric) => {
+      const samples = pairs.map((pair) => {
+        const baseline = pair.baseline.artifact.boot[metric];
+        const candidate = pair.candidate.artifact.boot[metric];
+        let ratio = null;
+        if (baseline !== 0) {
+          ratio = candidate / baseline;
+        } else if (candidate === 0) {
+          ratio = 1;
+        }
+        return {
+          baseline,
+          candidate,
+          group: pair.group,
+          pair: pair.pair,
+          ratio,
+        };
+      });
+      const ratios = samples
+        .map(({ ratio }) => ratio)
+        .filter((ratio) => typeof ratio === 'number' && Number.isFinite(ratio));
+      return [
+        metric,
+        {
+          baseline: summarizeDistribution(
+            samples.map(({ baseline }) => baseline),
+          ),
+          candidate: summarizeDistribution(
+            samples.map(({ candidate }) => candidate),
+          ),
+          pairedRatio: ratios.length ? summarizeDistribution(ratios) : null,
+          samples,
+        },
+      ];
+    }),
+  );
+}
+
+function applyPairedRegressionGate(aggregate, gateConfig) {
   if (!gateConfig.enabled) {
     return { enabled: false };
   }
-  const verdict = evaluateRegressionGate(
-    xArtifact.phases,
-    candidateArtifact.phases,
-    gateConfig.factor,
-  );
+  const verdict = evaluatePairedRegressionGate(aggregate, gateConfig.factor);
   for (const warning of verdict.warnings) {
     log(`gate WARNING: ${warning}`);
   }
   if (verdict.pass) {
     log(
-      'regression gate: PASS - no phase renderedComponents/commits median ' +
-        `exceeds x * ${verdict.factor}`,
+      `regression threshold: PASS across ${aggregate.pairCount} paired ` +
+        `samples; evidence=${verdict.evidenceStatus}`,
     );
   } else {
     for (const failure of verdict.failures) {
@@ -888,11 +658,13 @@ async function main() {
     log('regression gate: DISABLED via RENDER_BASELINE_GATE');
   }
 
-  const pinned = resolvePinnedXCommit();
-  const xSha = pinned.sha;
-  const localOriginX = assertPinnedShaReachable(xSha);
   const candidate = resolveCandidateCommit();
   const candidateSha = candidate.sha;
+  const baseline = resolveBaselineCommit(candidateSha);
+  const xSha = baseline.sha;
+  const localOriginX = assertBaselineShaReachable(xSha);
+  const groups = resolveGroups();
+  const schedule = buildBalancedSchedule(groups);
   const currentHeadSha = git(['rev-parse', 'HEAD'], repoRoot);
   const candidateBranch =
     candidateSha === currentHeadSha
@@ -900,7 +672,7 @@ async function main() {
       : '(historical detached target)';
   const worktreeDirty = git(['status', '--porcelain'], repoRoot) !== '';
 
-  log(`baseline (x): ${xSha} [${pinned.source}]`);
+  log(`baseline (x): ${xSha} [${baseline.source}]`);
   log(`  ${commitSubject(repoRoot, xSha)}`);
   if (localOriginX !== xSha) {
     log(`  note: local origin/x has moved on to ${localOriginX}`);
@@ -913,6 +685,10 @@ async function main() {
   if (xSha === candidateSha) {
     log('WARNING: baseline and candidate are the same commit');
   }
+  log(
+    `measurement protocol: ${groups} balanced group(s), ` +
+      `${schedule.length} runs, ${groups * 2} paired samples`,
+  );
   if (worktreeDirty) {
     banner([
       'WORKTREE IS DIRTY: product code still comes from exact commits.',
@@ -960,24 +736,27 @@ async function main() {
     { dir: xClone.dir, label: 'x' },
   ]);
 
-  // Back-to-back, x first, matching the recorded pairs' protocol.
-  const xRunDir = path.join(runsDir, `${runId}-x`);
-  const candidateRunDir = path.join(runsDir, `${runId}-candidate`);
-  let xArtifactPath;
-  let candidateArtifactPath;
+  const cloneByTarget = {
+    baseline: xClone,
+    candidate: candidateClone,
+  };
+  const measurements = [];
   try {
-    xArtifactPath = await runMeasurement({
-      cloneDir: xClone.dir,
-      label: '[x]',
-      logFile: measureLog('x'),
-      runArtifactDir: xRunDir,
-    });
-    candidateArtifactPath = await runMeasurement({
-      cloneDir: candidateClone.dir,
-      label: '[candidate]',
-      logFile: measureLog('candidate'),
-      runArtifactDir: candidateRunDir,
-    });
+    for (const run of schedule) {
+      const runLabel = `g${run.group}-r${run.position}-${run.target}`;
+      const artifactPath = await runMeasurement({
+        cloneDir: cloneByTarget[run.target].dir,
+        label: `[${runLabel}]`,
+        logFile: measureLog(runLabel),
+        runArtifactDir: path.join(runsDir, `${runId}-${runLabel}`),
+      });
+      measurements.push({
+        ...run,
+        artifact: JSON.parse(fs.readFileSync(artifactPath, 'utf8')),
+        artifactPath,
+        label: runLabel,
+      });
+    }
   } catch (error) {
     banner([
       'A measurement run FAILED. Clones and logs are kept for diagnosis:',
@@ -988,74 +767,88 @@ async function main() {
     throw error;
   }
 
-  const xArtifact = JSON.parse(fs.readFileSync(xArtifactPath, 'utf8'));
-  const candidateArtifact = JSON.parse(
-    fs.readFileSync(candidateArtifactPath, 'utf8'),
-  );
-  const warnings = comparabilityWarnings(xArtifact, candidateArtifact);
+  assertComparableMeasurements(measurements);
+  const aggregate = aggregatePairedMeasurements(measurements);
 
   console.log(
     `\n=== Render baseline comparison: x ${xSha.slice(0, 7)} vs candidate ` +
       `${candidateSha.slice(0, 7)} ===`,
   );
-  const phases = comparePhases(xArtifact, candidateArtifact);
-  const boot = compareBoot(xArtifact, candidateArtifact);
-  const gate = applyRegressionGate(xArtifact, candidateArtifact, gateConfig);
+  printPairedComparison(aggregate);
+  const boot = aggregateBoot(measurements);
+  const gate = applyPairedRegressionGate(aggregate, gateConfig);
 
   const pairName = `compare-${xSha.slice(0, 7)}-vs-${candidateSha.slice(0, 7)}-${runId}`;
-  const xCopyPath = path.join(outputDir, `${pairName}-x-raw.json`);
-  const candidateCopyPath = path.join(
-    outputDir,
-    `${pairName}-candidate-raw.json`,
+  const rawArtifacts = measurements.map((measurement) => {
+    const rawArtifact = path.join(
+      outputDir,
+      `${pairName}-g${measurement.group}-r${measurement.position}-${measurement.target}-raw.json`,
+    );
+    fs.copyFileSync(measurement.artifactPath, rawArtifact);
+    return { ...measurement, rawArtifact };
+  });
+  const baselineMeasurements = rawArtifacts.filter(
+    ({ target }) => target === 'baseline',
   );
-  fs.copyFileSync(xArtifactPath, xCopyPath);
-  fs.copyFileSync(candidateArtifactPath, candidateCopyPath);
+  const candidateMeasurements = rawArtifacts.filter(
+    ({ target }) => target === 'candidate',
+  );
+  const firstBaseline = baselineMeasurements[0].artifact;
+  const firstCandidate = candidateMeasurements[0].artifact;
 
   const summary = {
     boot,
     candidate: {
       branch: candidateBranch || '(detached)',
       clone: candidateClone.dir,
-      environment: candidateArtifact.environment,
-      git: candidateArtifact.git,
-      rawArtifact: candidateCopyPath,
+      environment: firstCandidate.environment,
+      git: firstCandidate.git,
+      rawArtifacts: candidateMeasurements.map(({ rawArtifact }) => rawArtifact),
       reusedClone: candidateClone.reusedClone,
       reusedInstall: candidateInstall.reusedInstall,
       sha: candidateSha,
-      timestamp: candidateArtifact.timestamp,
     },
-    churnEmits: xArtifact.churnEmits,
+    churnEmits: firstBaseline.churnEmits,
     comparedAt: new Date().toISOString(),
     driver: {
       arch: os.arch(),
       nodeVersion: process.version,
       platform: process.platform,
     },
+    fixture: firstBaseline.fixture,
     harness,
     gate,
-    iterations: xArtifact.iterations,
-    fixture: xArtifact.fixture,
+    iterations: firstBaseline.iterations,
+    measurements: rawArtifacts.map(
+      ({ artifact, artifactPath, ...measurement }) => measurement,
+    ),
     metricsVersion: METRICS_VERSION,
-    phases,
-    warnings,
+    phases: aggregate.phases,
+    protocol: {
+      classificationMethod: aggregate.classificationMethod,
+      groups,
+      pairedSamples: aggregate.pairCount,
+      schedule,
+    },
+    warnings: gate.warnings || [],
     worktreeDirty,
     x: {
       clone: xClone.dir,
-      environment: xArtifact.environment,
-      git: xArtifact.git,
-      pinnedSource: pinned.source,
-      rawArtifact: xCopyPath,
+      environment: firstBaseline.environment,
+      git: firstBaseline.git,
+      mode: baseline.mode,
+      originX: baseline.originX,
+      rawArtifacts: baselineMeasurements.map(({ rawArtifact }) => rawArtifact),
       reusedClone: xClone.reusedClone,
       reusedInstall: xInstall.reusedInstall,
       sha: xSha,
-      timestamp: xArtifact.timestamp,
+      source: baseline.source,
     },
   };
   const summaryPath = path.join(outputDir, `${pairName}.json`);
   fs.writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`);
   log(`summary: ${summaryPath}`);
-  log(`raw artifacts: ${xCopyPath}`);
-  log(`               ${candidateCopyPath}`);
+  log(`raw artifacts: ${rawArtifacts.length} files beside the summary`);
 
   pruneCloneCache([candidateClone.dir, xClone.dir]);
 
@@ -1079,7 +872,6 @@ async function main() {
 
 // Exported for self-tests; requiring this file never runs main().
 module.exports = {
-  evaluateRegressionGate,
   isGateEnabled,
   resolveGateFactor,
 };

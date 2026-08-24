@@ -110,6 +110,8 @@
     "test:e2e:web:lse": "node apps/web/e2e/local-secret-envelope.e2e.js",
     "test:e2e:web:render-baseline": "node apps/web/e2e/render-commit-baseline.e2e.js",
     "test:e2e:web:render-baseline:compare": "node apps/web/e2e/render-baseline-compare.e2e.js",
+    "test:e2e:web:render-baseline:compare:quick": "cross-env RENDER_BASELINE_GATE=0 RENDER_BASELINE_GROUPS=1 RENDER_BASELINE_SCENARIO_PROFILE=core node apps/web/e2e/render-baseline-compare.e2e.js",
+    "test:e2e:web:render-baseline:compare:trend": "cross-env RENDER_BASELINE_BASE_MODE=trend node apps/web/e2e/render-baseline-compare.e2e.js",
     "test:e2e:web:render-baseline:scale": "cross-env RENDER_BASELINE_ACCOUNTS_PER_WALLET=10 node apps/web/e2e/render-baseline-compare.e2e.js",
     "test:e2e:web:account-selector:perf-metrics": "node --test apps/web/e2e/account-selector-perf-metrics.test.js apps/web/e2e/render-commit-baseline.test.js apps/web/e2e/render-baseline-compare.test.js",
     "test:unit:account-selector:performance": "yarn jest packages/kit/src/components/AccountSelector/AccountSelectorProvider.test.tsx packages/kit/src/components/AccountSelector/hooks/useAccountSelectorAvailableNetworks.test.tsx packages/kit/src/states/jotai/contexts/accountSelector/atoms.test.tsx --runInBand --reporters=default",
