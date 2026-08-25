@@ -225,7 +225,17 @@ type ISelectionWriteRevisionPolicy = 'bumped' | 'untracked';
 // whether the revision moved or the selection itself changed.
 type ISelectionUpdateResult = {
   outcome: ESelectionUpdateOutcome;
+  selectionIntentEpoch?: number;
   transitionId?: number;
+};
+
+type IUnavailableSelectionPersistenceResult = {
+  homeMatched: boolean;
+  homeSelectionIntentMatched: boolean;
+  primaryMatched: boolean;
+  primaryPersisted: boolean;
+  storageInitGenerationMatched: boolean;
+  syncedHome: boolean;
 };
 
 type IActiveAccountReloadResult = {
@@ -1519,25 +1529,34 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
     sceneName,
     sceneUrl,
     shouldContinue,
+    storageInitGeneration,
   }: {
     selectedAccountsMapInDB: IAccountSelectorSelectedAccountsMap | undefined;
     sceneName: EAccountSelectorSceneName;
     sceneUrl?: string;
     shouldContinue?: () => boolean;
+    storageInitGeneration: number;
   }) => {
     if (!selectedAccountsMapInDB) {
-      return selectedAccountsMapInDB;
+      return {
+        aborted: false,
+        selectedAccountsMap: selectedAccountsMapInDB,
+      };
     }
 
     const selectedAccountsMap = cloneDeep(selectedAccountsMapInDB);
     const clearedEntries: {
       num: number;
       clearedSelectedAccount: IAccountSelectorSelectedAccount;
+      expectedSelectedAccount: IAccountSelectorSelectedAccount;
     }[] = [];
 
     await Promise.all(
       Object.entries(selectedAccountsMap).map(
         async ([numText, selectedAccount]) => {
+          if (!selectedAccount) {
+            return;
+          }
           const isPersistentlyUnavailableWallet =
             await this.isSelectedAccountWalletPersistentlyUnavailable({
               selectedAccount,
@@ -1555,45 +1574,82 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           clearedEntries.push({
             num,
             clearedSelectedAccount,
+            expectedSelectedAccount: selectedAccount,
           });
         },
       ),
     );
 
     if (!clearedEntries.length) {
-      return selectedAccountsMapInDB;
+      return {
+        aborted: false,
+        selectedAccountsMap: selectedAccountsMapInDB,
+      };
     }
 
     if (shouldContinue && !shouldContinue()) {
-      return selectedAccountsMap;
+      return {
+        aborted: true,
+        selectedAccountsMap: selectedAccountsMapInDB,
+      };
     }
 
-    await Promise.all(
-      clearedEntries.map(async ({ num, clearedSelectedAccount }) => {
-        await this.savePersistentlyUnavailableWalletSelectionToStorage({
-          sceneName,
-          sceneUrl,
-          num,
-          selectedAccount: clearedSelectedAccount,
-          trigger: 'init-clear-unavailable',
-        });
-      }),
+    const persistenceResults = await Promise.all(
+      clearedEntries.map(
+        async ({ num, clearedSelectedAccount, expectedSelectedAccount }) => {
+          if (shouldContinue && !shouldContinue()) {
+            return undefined;
+          }
+          return this.savePersistentlyUnavailableWalletSelectionToStorage({
+            expectedSelectedAccount,
+            sceneName,
+            sceneUrl,
+            num,
+            selectedAccount: clearedSelectedAccount,
+            shouldContinue,
+            storageInitGeneration,
+            trigger: 'init-clear-unavailable',
+          });
+        },
+      ),
     );
 
-    return selectedAccountsMap;
+    const requiresPersistenceCAS = accountSelectorUtils.isSceneCanPersist({
+      sceneName,
+    });
+    const persistenceRejected =
+      requiresPersistenceCAS &&
+      persistenceResults.some(
+        (result) =>
+          !result?.primaryMatched ||
+          !result.homeSelectionIntentMatched ||
+          !result.storageInitGenerationMatched,
+      );
+    return {
+      aborted: persistenceRejected,
+      selectedAccountsMap: persistenceRejected
+        ? selectedAccountsMapInDB
+        : selectedAccountsMap,
+    };
   };
 
   savePersistentlyUnavailableWalletSelectionToStorage = async ({
+    expectedSelectedAccount,
     sceneName,
     sceneUrl,
     num,
     selectedAccount,
+    shouldContinue,
+    storageInitGeneration,
     trigger = 'unspecified',
   }: {
+    expectedSelectedAccount: IAccountSelectorSelectedAccount;
     sceneName: EAccountSelectorSceneName;
     sceneUrl?: string;
     num: number;
     selectedAccount: IAccountSelectorSelectedAccount;
+    shouldContinue?: () => boolean;
+    storageInitGeneration?: number;
     trigger?: string;
   }) => {
     const perfEnabled = isAccountSelectorPerfDebugEnabled();
@@ -1605,6 +1661,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
     let primaryPersisted = false;
     let primaryWriteAttempted = false;
     let homeWriteAttempted = false;
+    let persistenceResult: IUnavailableSelectionPersistenceResult | undefined;
     let startedAt: number | undefined;
     let syncedHome = false;
     if (perfEnabled) {
@@ -1617,56 +1674,38 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       await this.mutexSaveToStorage.runExclusive(async () => {
         startedAt = getAccountSelectorPerfTimestamp();
         const { serviceAccountSelector, simpleDb } = backgroundApiProxy;
-        const currentSaved = await simpleDb.accountSelector.getSelectedAccount({
-          sceneName,
-          sceneUrl,
-          num,
-        });
-        if (!isSameSelectedAccount(currentSaved, selectedAccount)) {
-          phase = 'write-primary';
-          primaryWriteAttempted = true;
-          const primarySaveResult =
-            await simpleDb.accountSelector.saveSelectedAccount({
-              sceneName,
-              sceneUrl,
-              num,
-              selectedAccount,
-            });
-          primaryPersisted = Boolean(primarySaveResult?.persisted);
+        if (shouldContinue && !shouldContinue()) {
+          return;
         }
-
-        if (
+        phase = 'resolve-home-sync';
+        const shouldSyncWithHomeSource =
           sceneName !== EAccountSelectorSceneName.home &&
           (await serviceAccountSelector.shouldSyncWithHomeSource({
             sceneName,
             sceneUrl,
             num,
-          }))
-        ) {
-          phase = 'read-home';
-          const homeSelectedAccount =
-            await simpleDb.accountSelector.getSelectedAccount({
-              sceneName: EAccountSelectorSceneName.home,
-              num: 0,
-            });
-          const newHomeSelectedAccount =
-            accountSelectorUtils.buildMergedSelectedAccount({
-              data: homeSelectedAccount,
-              mergedByData: selectedAccount,
-            });
-          if (
-            !isSameSelectedAccount(homeSelectedAccount, newHomeSelectedAccount)
-          ) {
-            phase = 'write-home';
-            homeWriteAttempted = true;
-            const homeSaveResult =
-              await simpleDb.accountSelector.saveSelectedAccount({
-                sceneName: EAccountSelectorSceneName.home,
-                num: 0,
-                selectedAccount: newHomeSelectedAccount,
-              });
-            syncedHome = Boolean(homeSaveResult?.persisted);
-          }
+          }));
+        if (shouldContinue && !shouldContinue()) {
+          return;
+        }
+        phase = 'compare-and-set';
+        const saveResult =
+          await simpleDb.accountSelector.clearUnavailableSelectedAccount({
+            expectedSelectedAccount,
+            sceneName,
+            sceneUrl,
+            num,
+            selectedAccount,
+            shouldSyncWithHomeSource,
+            storageInitGeneration,
+          });
+        persistenceResult = saveResult;
+        primaryWriteAttempted = Boolean(saveResult?.primaryMatched);
+        primaryPersisted = Boolean(saveResult?.primaryPersisted);
+        homeWriteAttempted = Boolean(saveResult?.homeMatched);
+        syncedHome = Boolean(saveResult?.syncedHome);
+        if (shouldContinue && !shouldContinue()) {
+          phase = 'stale-after-compare-and-set';
         }
       });
       if (perfEnabled) {
@@ -1700,6 +1739,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           },
         );
       }
+      return persistenceResult;
     } catch (error) {
       if (perfEnabled) {
         defaultLogger.accountSelector.perf.trace(
@@ -1895,6 +1935,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         updateMeta?: IAccountSelectorUpdateMeta;
         num: number;
         parentOperationId?: number;
+        recordSelectionIntent?: boolean;
         reason?: string;
         shouldCommit?: () => boolean;
         /**
@@ -1937,6 +1978,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             num,
             builder,
             parentOperationId,
+            recordSelectionIntent,
             reason,
             shouldCommit,
             updateMeta,
@@ -1945,6 +1987,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             this.getSelectedAccount.call(set, { num }) ||
               defaultSelectedAccount(),
           );
+          let selectionIntentEpoch: number | undefined;
           const logSelectionUpdateResult = ({
             outcome,
             selectedAccount,
@@ -2077,11 +2120,39 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             }
             return {
               outcome,
+              selectionIntentEpoch,
               transitionId:
                 outcome === ESelectionUpdateOutcome.Commit
                   ? transitionMeta?.transitionId
                   : undefined,
             };
+          };
+          const recordSelectionIntentInBackground = async (
+            selectedAccount: IAccountSelectorSelectedAccount,
+          ) => {
+            if (
+              sceneInfo?.sceneName === EAccountSelectorSceneName.discover &&
+              sceneInfo.sceneUrl
+            ) {
+              return backgroundApiProxy.serviceDApp.recordConnectionSelectionIntent(
+                {
+                  accountSelectorNum: num,
+                  origin: sceneInfo.sceneUrl,
+                  selectedAccount,
+                },
+              );
+            }
+            if (sceneInfo?.sceneName) {
+              return backgroundApiProxy.simpleDb.accountSelector.recordSelectedAccountIntent(
+                {
+                  num,
+                  sceneName: sceneInfo.sceneName,
+                  sceneUrl: sceneInfo.sceneUrl,
+                  selectedAccount,
+                },
+              );
+            }
+            return undefined;
           };
           if (perfEnabled) {
             defaultLogger.accountSelector.perf.trace('selectionUpdateStart', {
@@ -2203,6 +2274,17 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           }
 
           if (isSameSelectedAccount(oldSelectedAccount, newSelectedAccount)) {
+            if (recordSelectionIntent) {
+              selectionIntentEpoch =
+                await recordSelectionIntentInBackground(newSelectedAccount);
+              if (shouldCommit && !shouldCommit()) {
+                return logSelectionUpdateResult({
+                  outcome: ESelectionUpdateOutcome.Stale,
+                  selectedAccount: oldSelectedAccount,
+                  staleGuard: ESelectionStaleGuard.CommitGuard,
+                });
+              }
+            }
             return logSelectionUpdateResult({
               outcome: ESelectionUpdateOutcome.Noop,
               selectedAccount: oldSelectedAccount,
@@ -2386,7 +2468,29 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
               staleGuard: ESelectionStaleGuard.CommitGuard,
             });
           }
-          if (isSameSelectedAccount(oldSelectedAccount, newSelectedAccount)) {
+          const finalSelectionIsSame = isSameSelectedAccount(
+            oldSelectedAccount,
+            newSelectedAccount,
+          );
+          if (
+            recordSelectionIntent ||
+            (!finalSelectionIsSame &&
+              sceneInfo?.sceneName === EAccountSelectorSceneName.discover &&
+              sceneInfo.sceneUrl)
+          ) {
+            // The background owns the connection approval epoch on split-runtime
+            // targets, so it must observe this write intent before the UI commits.
+            selectionIntentEpoch =
+              await recordSelectionIntentInBackground(newSelectedAccount);
+            if (shouldCommit && !shouldCommit()) {
+              return logSelectionUpdateResult({
+                outcome: ESelectionUpdateOutcome.Stale,
+                selectedAccount: oldSelectedAccount,
+                staleGuard: ESelectionStaleGuard.CommitGuard,
+              });
+            }
+          }
+          if (finalSelectionIsSame) {
             return logSelectionUpdateResult({
               outcome: ESelectionUpdateOutcome.Noop,
               selectedAccount: oldSelectedAccount,
@@ -2739,6 +2843,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         const selectionResult = await this.updateSelectedAccount.call(set, {
           num,
           parentOperationId: accountSelectOperationId,
+          recordSelectionIntent: true,
           reason,
           shouldCommit: () =>
             this.confirmAccountSelectLatestRequestIdMap.get(
@@ -2849,6 +2954,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             sceneName: sceneInfo.sceneName,
             sceneUrl: sceneInfo.sceneUrl,
             num,
+            selectionIntentEpoch: selectionResult.selectionIntentEpoch,
             trigger: 'confirm-explicit',
             selectedAccountUpdatedAt: get(accountSelectorUpdateMetaAtom())[num]
               ?.updatedAt,
@@ -4473,6 +4579,16 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       set(accountSelectorActiveAccountInitDoneAtom(), {});
       try {
         const { serviceAccountSelector } = backgroundApiProxy;
+        const storageInitGeneration =
+          await backgroundApiProxy.simpleDb.accountSelector.beginAccountSelectorStorageInit(
+            {
+              sceneName,
+              sceneUrl,
+            },
+          );
+        if (abortIfStale()) {
+          return;
+        }
         let selectedAccountsMapInDB:
           | IAccountSelectorSelectedAccountsMap
           | undefined =
@@ -4574,13 +4690,20 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           if (abortIfStale()) {
             return;
           }
-          selectedAccountsMapInDB =
+          const storageCleanupResult =
             await this.clearUnavailableWalletSelectionsInStorage({
               selectedAccountsMapInDB,
               sceneName,
               sceneUrl,
               shouldContinue: isLatestGeneration,
+              storageInitGeneration,
             });
+          if (storageCleanupResult.aborted) {
+            phase = EStorageInitPhase.BackgroundCasRejectedStorageCleanup;
+            logResult(`stale-${phase}`);
+            return;
+          }
+          selectedAccountsMapInDB = storageCleanupResult.selectedAccountsMap;
           if (abortIfStale()) {
             return;
           }
@@ -4613,13 +4736,21 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           if (abortIfStale()) {
             return;
           }
-          recentSelectionCacheSelectedAccountsMap =
+          const recentCleanupResult =
             await this.clearUnavailableWalletSelectionsInStorage({
               selectedAccountsMapInDB: repairedRecentSelectionCache,
               sceneName,
               sceneUrl,
               shouldContinue: isLatestGeneration,
+              storageInitGeneration,
             });
+          if (recentCleanupResult.aborted) {
+            phase = EStorageInitPhase.BackgroundCasRejectedRecentCleanup;
+            logResult(`stale-${phase}`);
+            return;
+          }
+          recentSelectionCacheSelectedAccountsMap =
+            recentCleanupResult.selectedAccountsMap;
           if (abortIfStale()) {
             return;
           }
@@ -4690,13 +4821,21 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         if (abortIfStale()) {
           return;
         }
-        const selectedAccountsMap =
-          (await this.clearUnavailableWalletSelectionsInStorage({
+        const currentCleanupResult =
+          await this.clearUnavailableWalletSelectionsInStorage({
             selectedAccountsMapInDB: repairedSelectedAccountsMap,
             sceneName,
             sceneUrl,
             shouldContinue: isLatestGeneration,
-          })) || {};
+            storageInitGeneration,
+          });
+        if (currentCleanupResult.aborted) {
+          phase = EStorageInitPhase.BackgroundCasRejectedCurrentCleanup;
+          logResult(`stale-${phase}`);
+          return;
+        }
+        const selectedAccountsMap =
+          currentCleanupResult.selectedAccountsMap || {};
         if (abortIfStale()) {
           return;
         }
@@ -4843,6 +4982,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
         sceneName: EAccountSelectorSceneName;
         sceneUrl?: string;
         num: number;
+        selectionIntentEpoch?: number;
         selectedAccountUpdatedAt: number | undefined;
         trigger?: string;
       },
@@ -4920,6 +5060,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           );
         }
         let primaryPersisted = false;
+        let selectionIntentRejected = false;
         let storagePhase = 'mutex-wait';
         await this.mutexSaveToStorage
           .runExclusive(async () => {
@@ -5138,6 +5279,13 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
                 await simpleDb.accountSelector.saveSelectedAccount(
                   fixedPayload,
                 );
+              if (primarySaveResult?.staleSelectionIntent) {
+                selectionIntentRejected = true;
+                logStorageResult({
+                  outcome: EStorageSaveOutcome.StaleSelectionIntent,
+                });
+                return;
+              }
               primaryPersisted = Boolean(primarySaveResult?.persisted);
             }
             if (!isPayloadStillCurrent()) {
@@ -5294,6 +5442,11 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
             }
             throw error;
           });
+        if (selectionIntentRejected) {
+          throw new OneKeyLocalError(
+            'Account selector selection intent is stale',
+          );
+        }
       })();
       let inflightByScope = this.saveToStorageInflightMap.get(
         payload.selectedAccount,
@@ -5414,6 +5567,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
           selectedAccount.othersWalletAccountId),
       );
       if (
+        !previousSelectedAccount ||
         !previousSelectedAccountHasWalletSelection ||
         selectedAccountHasIdentity
       ) {
@@ -5435,6 +5589,7 @@ class AccountSelectorActions extends ContextJotaiActionsBase {
       }
 
       await this.savePersistentlyUnavailableWalletSelectionToStorage({
+        expectedSelectedAccount: previousSelectedAccount,
         sceneName,
         sceneUrl,
         num,

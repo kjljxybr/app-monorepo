@@ -4,15 +4,20 @@
 // dialog), so the two are re-compared before anything is written.
 export function isApprovalAccountSuperseded({
   approvingAccountId,
+  approvingObservationRevision,
   latestAccountId,
+  latestObservationRevision,
 }: {
   approvingAccountId: string | undefined;
+  approvingObservationRevision: number;
   latestAccountId: string | undefined;
+  latestObservationRevision: number;
 }): boolean {
-  // No observation yet, or nothing being approved: there is nothing to
-  // contradict, and blocking here would strand a legitimate approval.
-  if (!latestAccountId || !approvingAccountId) {
+  if (!approvingAccountId) {
     return false;
   }
-  return latestAccountId !== approvingAccountId;
+  return (
+    latestObservationRevision !== approvingObservationRevision ||
+    latestAccountId !== approvingAccountId
+  );
 }

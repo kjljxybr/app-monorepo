@@ -5,7 +5,9 @@ describe('DApp connection approval guard', () => {
     expect(
       isApprovalAccountSuperseded({
         approvingAccountId: 'hd-1--0',
+        approvingObservationRevision: 1,
         latestAccountId: 'hd-1--1',
+        latestObservationRevision: 2,
       }),
     ).toBe(true);
   });
@@ -14,28 +16,43 @@ describe('DApp connection approval guard', () => {
     expect(
       isApprovalAccountSuperseded({
         approvingAccountId: 'hd-1--0',
+        approvingObservationRevision: 1,
         latestAccountId: 'hd-1--0',
+        latestObservationRevision: 1,
       }),
     ).toBe(false);
   });
 
-  it('allows approval before any account has been observed', () => {
+  it('blocks approval when the latest observation has no account', () => {
     expect(
       isApprovalAccountSuperseded({
         approvingAccountId: 'hd-1--0',
+        approvingObservationRevision: 1,
         latestAccountId: undefined,
+        latestObservationRevision: 2,
+      }),
+    ).toBe(true);
+  });
+
+  it('allows a guard call that has no account to approve', () => {
+    expect(
+      isApprovalAccountSuperseded({
+        approvingAccountId: undefined,
+        approvingObservationRevision: 1,
+        latestAccountId: 'hd-1--0',
+        latestObservationRevision: 2,
       }),
     ).toBe(false);
   });
 
-  it('allows approval when the observation has no account yet', () => {
-    // An account still creating its address reports no id; that is a reason to
-    // disable the button, not to reject an approval already in flight.
+  it('blocks a network-only observation change for the same account', () => {
     expect(
       isApprovalAccountSuperseded({
-        approvingAccountId: undefined,
+        approvingAccountId: 'hd-1--0',
+        approvingObservationRevision: 1,
         latestAccountId: 'hd-1--0',
+        latestObservationRevision: 2,
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 });

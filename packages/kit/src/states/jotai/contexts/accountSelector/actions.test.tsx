@@ -32,6 +32,7 @@ import {
 } from './actions';
 import {
   AccountSelectorJotaiProvider,
+  type IAccountSelectorContextData,
   accountSelectorActiveAccountInitDoneAtom,
   accountSelectorContextDataAtom,
   accountSelectorStorageInitDoneAtom,
@@ -43,8 +44,7 @@ import {
   selectedAccountsAtom,
   useSelectedAccount,
 } from './atoms';
-
-import type { IAccountSelectorContextData } from './atoms';
+import { isSameSelectedAccount } from './selectedAccountCompare';
 
 type IDeferred<T> = {
   promise: Promise<T>;
@@ -68,7 +68,31 @@ type ISaveSelectedAccountParams = {
   sceneName: EAccountSelectorSceneName;
   sceneUrl?: string;
   num: number;
+  selectionIntentEpoch?: number;
   selectedAccountUpdatedAt?: number;
+};
+type IClearUnavailableSelectedAccountParams = {
+  expectedSelectedAccount: ISelectedAccount;
+  selectedAccount: ISelectedAccount;
+  sceneName: EAccountSelectorSceneName;
+  sceneUrl?: string;
+  num: number;
+  shouldSyncWithHomeSource: boolean;
+  storageInitGeneration?: number;
+};
+type IClearUnavailableSelectedAccountResult = {
+  homeMatched: boolean;
+  homeSelectionIntentMatched: boolean;
+  primaryMatched: boolean;
+  primaryPersisted: boolean;
+  storageInitGenerationMatched: boolean;
+  syncedHome: boolean;
+};
+type IRecordSelectedAccountIntentParams = {
+  num: number;
+  sceneName: EAccountSelectorSceneName;
+  sceneUrl?: string;
+  selectedAccount: ISelectedAccount;
 };
 type IMergeHomeDataToSwapMapParams = {
   swapMap: ISelectedAccountsMap | undefined;
@@ -129,7 +153,30 @@ const mockGetAccountSelectorRawData: jest.MockedFunction<
   >
 > = jest.fn();
 const mockSaveSelectedAccount: jest.MockedFunction<
-  (params: ISaveSelectedAccountParams) => Promise<{ persisted: boolean }>
+  (
+    params: ISaveSelectedAccountParams,
+  ) => Promise<{ persisted: boolean; staleSelectionIntent?: boolean }>
+> = jest.fn();
+const mockClearUnavailableSelectedAccount: jest.MockedFunction<
+  (
+    params: IClearUnavailableSelectedAccountParams,
+  ) => Promise<IClearUnavailableSelectedAccountResult>
+> = jest.fn();
+const mockBeginAccountSelectorStorageInit: jest.MockedFunction<
+  (params: {
+    sceneName: EAccountSelectorSceneName;
+    sceneUrl?: string;
+  }) => Promise<number>
+> = jest.fn();
+const mockRecordConnectionSelectionIntent: jest.MockedFunction<
+  (params: {
+    accountSelectorNum: number;
+    origin: string;
+    selectedAccount: ISelectedAccount;
+  }) => Promise<number>
+> = jest.fn();
+const mockRecordSelectedAccountIntent: jest.MockedFunction<
+  (params: IRecordSelectedAccountIntentParams) => Promise<number>
 > = jest.fn();
 const mockSaveGlobalDeriveType: jest.MockedFunction<() => Promise<void>> =
   jest.fn();
@@ -388,16 +435,33 @@ jest.mock('@onekeyhq/kit/src/background/instance/backgroundApiProxy', () => ({
         ...args: Parameters<typeof mockAddDefaultNetworkAccountsService>
       ) => mockAddDefaultNetworkAccountsService(...args),
     },
+    serviceDApp: {
+      recordConnectionSelectionIntent: (params: {
+        accountSelectorNum: number;
+        origin: string;
+        selectedAccount: ISelectedAccount;
+      }) => mockRecordConnectionSelectionIntent(params),
+    },
     serviceNetwork: {
       isDeriveTypeAvailableForNetwork: () =>
         mockIsDeriveTypeAvailableForNetwork(),
     },
     simpleDb: {
       accountSelector: {
+        beginAccountSelectorStorageInit: (params: {
+          sceneName: EAccountSelectorSceneName;
+          sceneUrl?: string;
+        }) => mockBeginAccountSelectorStorageInit(params),
+        clearUnavailableSelectedAccount: (
+          params: IClearUnavailableSelectedAccountParams,
+        ) => mockClearUnavailableSelectedAccount(params),
         getRawData: () => mockGetAccountSelectorRawData(),
         getSelectedAccount: (params: IGetSelectedAccountParams) =>
           mockGetSelectedAccount(params),
         getSelectedAccountsMap: () => mockGetSelectedAccountsMap(),
+        recordSelectedAccountIntent: (
+          params: IRecordSelectedAccountIntentParams,
+        ) => mockRecordSelectedAccountIntent(params),
         saveSelectedAccount: (params: ISaveSelectedAccountParams) =>
           mockSaveSelectedAccount(params),
       },
@@ -499,6 +563,17 @@ describe('useAccountSelectorActions', () => {
     mockGetAccountSelectorRawData.mockResolvedValue(undefined);
     mockGetSelectedAccount.mockResolvedValue(undefined);
     mockSaveSelectedAccount.mockResolvedValue({ persisted: true });
+    mockClearUnavailableSelectedAccount.mockResolvedValue({
+      homeMatched: false,
+      homeSelectionIntentMatched: true,
+      primaryMatched: true,
+      primaryPersisted: true,
+      storageInitGenerationMatched: true,
+      syncedHome: false,
+    });
+    mockBeginAccountSelectorStorageInit.mockResolvedValue(1);
+    mockRecordConnectionSelectionIntent.mockResolvedValue(1);
+    mockRecordSelectedAccountIntent.mockResolvedValue(1);
     mockSaveGlobalDeriveType.mockResolvedValue(undefined);
     mockMergeHomeDataToSwapMap.mockImplementation(
       async (params) => params.swapMap,
@@ -684,6 +759,105 @@ describe('useAccountSelectorActions', () => {
     });
 
     expect(selectionOutcome).toBe('stale');
+    expect(store.get(selectedAccountsAtom())[0]).toBe(previous);
+  });
+
+  it('records a discover selection intent before committing locally', async () => {
+    const sceneUrl = 'https://selection-intent.test';
+    const { store, Wrapper } = createWrapper({
+      sceneName: EAccountSelectorSceneName.discover,
+      sceneUrl,
+    });
+    store.set(accountSelectorContextDataAtom(), {
+      sceneName: EAccountSelectorSceneName.discover,
+      sceneUrl,
+    });
+    const previous = store.get(selectedAccountsAtom())[0];
+    let selectionObservedByIntent: ISelectedAccount | undefined;
+    mockRecordConnectionSelectionIntent.mockImplementation(async () => {
+      selectionObservedByIntent = store.get(selectedAccountsAtom())[0];
+      return 1;
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const next = createHdSelectedAccount('hd-1--1');
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.updateSelectedAccount({
+          num: 0,
+          reason: 'discover-selection-intent-test',
+          builder: () => next,
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('commit');
+    expect(mockRecordConnectionSelectionIntent).toHaveBeenCalledWith({
+      accountSelectorNum: 0,
+      origin: sceneUrl,
+      selectedAccount: next,
+    });
+    expect(selectionObservedByIntent).toBe(previous);
+    expect(store.get(selectedAccountsAtom())[0]).toEqual(next);
+  });
+
+  it('does not record a dapp selection intent outside discover', async () => {
+    const { store, Wrapper } = createWrapper(EAccountSelectorSceneName.home);
+    store.set(accountSelectorContextDataAtom(), {
+      sceneName: EAccountSelectorSceneName.home,
+    });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    const next = createHdSelectedAccount('hd-1--1');
+
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = (
+        await result.current.updateSelectedAccount({
+          num: 0,
+          reason: 'home-selection-intent-test',
+          builder: () => next,
+        })
+      ).outcome;
+    });
+
+    expect(outcome).toBe('commit');
+    expect(mockRecordConnectionSelectionIntent).not.toHaveBeenCalled();
+    expect(store.get(selectedAccountsAtom())[0]).toEqual(next);
+  });
+
+  it('does not commit a discover selection when recording intent fails', async () => {
+    const sceneUrl = 'https://selection-intent-failure.test';
+    const { store, Wrapper } = createWrapper({
+      sceneName: EAccountSelectorSceneName.discover,
+      sceneUrl,
+    });
+    store.set(accountSelectorContextDataAtom(), {
+      sceneName: EAccountSelectorSceneName.discover,
+      sceneUrl,
+    });
+    const previous = store.get(selectedAccountsAtom())[0];
+    mockRecordConnectionSelectionIntent.mockRejectedValue(
+      new OneKeyLocalError('selection intent failed'),
+    );
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    await act(async () => {
+      await expect(
+        result.current.updateSelectedAccount({
+          num: 0,
+          reason: 'discover-selection-intent-failure-test',
+          builder: () => createHdSelectedAccount('hd-1--1'),
+        }),
+      ).rejects.toThrow('selection intent failed');
+    });
+
     expect(store.get(selectedAccountsAtom())[0]).toBe(previous);
   });
 
@@ -1828,6 +2002,347 @@ describe('useAccountSelectorActions', () => {
     expect(store.get(accountSelectorStorageInitDoneAtom())).toBe(true);
   });
 
+  it('does not let unavailable-wallet cleanup overwrite a newer persisted selection after waiting for the storage mutex', async () => {
+    const unavailableSelection = createHdSelectedAccount('hd-1--0');
+    const newerSelection = {
+      ...createHdSelectedAccount('hd-2--0'),
+      focusedWallet: 'hd-2',
+      walletId: 'hd-2',
+    };
+    const mockedWallet = {
+      id: 'hd-1',
+      isMocked: true,
+    } as IWallet;
+    const unavailableWalletLookup = createDeferred<IWallet | undefined>();
+    const newerWriteReached = createDeferred<void>();
+    const releaseNewerWrite = createDeferred<void>();
+    let persistedSelection: ISelectedAccount = unavailableSelection;
+
+    mockGetSelectedAccountsMap.mockResolvedValue({
+      0: unavailableSelection,
+    });
+    let unavailableLookupStarted = false;
+    mockGetWalletSafe.mockImplementation(async ({ walletId }) => {
+      if (walletId === 'hd-2') {
+        return { id: 'hd-2' } as IWallet;
+      }
+      if (!unavailableLookupStarted) {
+        unavailableLookupStarted = true;
+        return unavailableWalletLookup.promise;
+      }
+      return mockedWallet;
+    });
+    mockGetSelectedAccount.mockImplementation(async () => persistedSelection);
+    mockSaveSelectedAccount.mockImplementation(async ({ selectedAccount }) => {
+      if (
+        selectedAccount.indexedAccountId === newerSelection.indexedAccountId
+      ) {
+        newerWriteReached.resolve(undefined);
+        await releaseNewerWrite.promise;
+      }
+      persistedSelection = selectedAccount;
+      return { persisted: true };
+    });
+    mockClearUnavailableSelectedAccount.mockImplementation(
+      async ({ expectedSelectedAccount, selectedAccount }) => {
+        const primaryAlreadyCleared = isSameSelectedAccount(
+          persistedSelection,
+          selectedAccount,
+        );
+        const primaryMatched =
+          primaryAlreadyCleared ||
+          isSameSelectedAccount(persistedSelection, expectedSelectedAccount);
+        if (primaryMatched && !primaryAlreadyCleared) {
+          persistedSelection = selectedAccount;
+        }
+        return {
+          homeMatched: false,
+          homeSelectionIntentMatched: true,
+          primaryMatched,
+          primaryPersisted: primaryMatched && !primaryAlreadyCleared,
+          storageInitGenerationMatched: true,
+          syncedHome: false,
+        };
+      },
+    );
+
+    const { store, Wrapper } = createWrapper();
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    let initPromise: Promise<void> | undefined;
+    let newerSavePromise: Promise<void> | undefined;
+
+    await act(async () => {
+      initPromise = result.current.initFromStorage({
+        sceneName: EAccountSelectorSceneName.home,
+      });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockGetWalletSafe).toHaveBeenCalled());
+
+    await act(async () => {
+      await result.current.updateSelectedAccount({
+        num: 0,
+        reason: 'newer-selection-during-storage-init',
+        builder: () => newerSelection,
+      });
+    });
+    const newerSelectionUpdatedAt = store.get(
+      accountSelectorUpdateMetaAtom(),
+    )[0]?.updatedAt;
+    await act(async () => {
+      newerSavePromise = result.current.saveToStorage({
+        num: 0,
+        sceneName: EAccountSelectorSceneName.home,
+        selectedAccount: newerSelection,
+        selectedAccountUpdatedAt: newerSelectionUpdatedAt,
+        trigger: 'newer-selection-during-storage-init',
+      });
+      await newerWriteReached.promise;
+    });
+
+    await act(async () => {
+      unavailableWalletLookup.resolve(mockedWallet);
+      // Let the old cleanup pass its generation guard and queue behind the
+      // newer save that currently owns the UI-runtime storage mutex.
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      releaseNewerWrite.resolve(undefined);
+      await newerSavePromise;
+      await initPromise;
+    });
+
+    expect(persistedSelection).toEqual(newerSelection);
+    expect(store.get(selectedAccountsAtom())[0]).toEqual(newerSelection);
+    expect(mockClearUnavailableSelectedAccount).toHaveBeenCalledWith(
+      expect.objectContaining({
+        expectedSelectedAccount: unavailableSelection,
+        selectedAccount: expect.objectContaining({
+          indexedAccountId: undefined,
+          walletId: undefined,
+        }),
+      }),
+    );
+  });
+
+  it('does not let cleanup from an older background init clear the same selection after the wallet recovers', async () => {
+    const unavailableSelection = createHdSelectedAccount('hd-1--0');
+    const mockedWallet = {
+      id: 'hd-1',
+      isMocked: true,
+    } as IWallet;
+    const recoveredWallet = { id: 'hd-1' } as IWallet;
+    const cleanupReached = createDeferred<void>();
+    const releaseCleanup = createDeferred<void>();
+    let backgroundInitGeneration = 0;
+    let persistedSelection = unavailableSelection;
+
+    mockBeginAccountSelectorStorageInit.mockImplementation(async () => {
+      backgroundInitGeneration += 1;
+      return backgroundInitGeneration;
+    });
+    mockGetSelectedAccountsMap.mockResolvedValue({
+      0: unavailableSelection,
+    });
+    mockGetWalletSafe
+      .mockResolvedValueOnce(mockedWallet)
+      .mockResolvedValue(recoveredWallet);
+    mockGetSelectedAccount.mockImplementation(async () => persistedSelection);
+    mockClearUnavailableSelectedAccount.mockImplementation(
+      async ({ selectedAccount, storageInitGeneration }) => {
+        cleanupReached.resolve(undefined);
+        await releaseCleanup.promise;
+        const generationMatched =
+          storageInitGeneration === undefined ||
+          storageInitGeneration === backgroundInitGeneration;
+        if (generationMatched) {
+          persistedSelection = selectedAccount;
+        }
+        return {
+          homeMatched: false,
+          homeSelectionIntentMatched: true,
+          primaryMatched: generationMatched,
+          primaryPersisted: generationMatched,
+          storageInitGenerationMatched: generationMatched,
+          syncedHome: false,
+        };
+      },
+    );
+
+    const { Wrapper } = createWrapper();
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    let olderInit: Promise<void> | undefined;
+
+    await act(async () => {
+      olderInit = result.current.initFromStorage({
+        sceneName: EAccountSelectorSceneName.home,
+        trigger: 'older-unavailable-wallet-init',
+      });
+      await cleanupReached.promise;
+    });
+    await act(async () => {
+      await result.current.initFromStorage({
+        sceneName: EAccountSelectorSceneName.home,
+        trigger: 'newer-recovered-wallet-init',
+      });
+    });
+    await act(async () => {
+      releaseCleanup.resolve(undefined);
+      await olderInit;
+    });
+
+    expect(backgroundInitGeneration).toBe(2);
+    expect(persistedSelection).toEqual(unavailableSelection);
+    expect(mockClearUnavailableSelectedAccount).toHaveBeenCalledWith(
+      expect.objectContaining({
+        expectedSelectedAccount: unavailableSelection,
+        storageInitGeneration: 1,
+      }),
+    );
+  });
+
+  it('aborts storage init instead of applying a cleared map after the background CAS rejects', async () => {
+    const unavailableSelection = createHdSelectedAccount('hd-1--0');
+    const currentSelection = {
+      ...createHdSelectedAccount('hd-2--0'),
+      focusedWallet: 'hd-2',
+      walletId: 'hd-2',
+    };
+    mockGetSelectedAccountsMap.mockResolvedValue({
+      0: unavailableSelection,
+    });
+    mockGetWalletSafe.mockImplementation(async ({ walletId }) =>
+      walletId === 'hd-1'
+        ? ({ id: walletId, isMocked: true } as IWallet)
+        : ({ id: walletId } as IWallet),
+    );
+    mockClearUnavailableSelectedAccount.mockResolvedValue({
+      homeMatched: false,
+      homeSelectionIntentMatched: false,
+      primaryMatched: false,
+      primaryPersisted: false,
+      storageInitGenerationMatched: false,
+      syncedHome: false,
+    });
+
+    const { store, Wrapper } = createWrapper();
+    store.set(selectedAccountsAtom(), { 0: currentSelection });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+
+    await act(async () => {
+      await result.current.initFromStorage({
+        sceneName: EAccountSelectorSceneName.home,
+        trigger: 'background-cas-reject-test',
+      });
+    });
+
+    expect(mockClearUnavailableSelectedAccount).toHaveBeenCalled();
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]).toBeUndefined();
+    expect(store.get(selectedAccountsAtom())[0]).toEqual(currentSelection);
+  });
+
+  it('records a same-account user intent before noop persistence and aborts the older cleanup', async () => {
+    const selectedAccount = createHdSelectedAccount('hd-1--0');
+    const mockedWallet = {
+      id: 'hd-1',
+      isMocked: true,
+    } as IWallet;
+    const recoveredWallet = { id: 'hd-1' } as IWallet;
+    const cleanupReached = createDeferred<void>();
+    const releaseCleanup = createDeferred<void>();
+    let backgroundInitGeneration = 0;
+    let persistedSelection = selectedAccount;
+
+    mockBeginAccountSelectorStorageInit.mockImplementation(async () => {
+      backgroundInitGeneration += 1;
+      return backgroundInitGeneration;
+    });
+    mockRecordSelectedAccountIntent.mockImplementation(async () => {
+      backgroundInitGeneration += 1;
+      return 1;
+    });
+    mockGetSelectedAccountsMap.mockResolvedValue({ 0: selectedAccount });
+    mockGetSelectedAccount.mockImplementation(async () => persistedSelection);
+    mockGetWalletSafe
+      .mockResolvedValueOnce(mockedWallet)
+      .mockResolvedValue(recoveredWallet);
+    mockClearUnavailableSelectedAccount.mockImplementation(
+      async ({ selectedAccount: clearedSelection, storageInitGeneration }) => {
+        cleanupReached.resolve(undefined);
+        await releaseCleanup.promise;
+        const generationMatched =
+          storageInitGeneration === backgroundInitGeneration;
+        if (generationMatched) {
+          persistedSelection = clearedSelection;
+        }
+        return {
+          homeMatched: false,
+          homeSelectionIntentMatched: true,
+          primaryMatched: generationMatched,
+          primaryPersisted: generationMatched,
+          storageInitGenerationMatched: generationMatched,
+          syncedHome: false,
+        };
+      },
+    );
+
+    const { store, Wrapper } = createWrapper();
+    store.set(accountSelectorContextDataAtom(), {
+      sceneName: EAccountSelectorSceneName.home,
+    });
+    store.set(selectedAccountsAtom(), { 0: selectedAccount });
+    const { result } = renderHook(() => useAccountSelectorActions().current, {
+      wrapper: Wrapper,
+    });
+    let initPromise: Promise<void> | undefined;
+    let confirmPromise: Promise<boolean> | undefined;
+
+    await act(async () => {
+      initPromise = result.current.initFromStorage({
+        sceneName: EAccountSelectorSceneName.home,
+        trigger: 'same-account-intent-old-init',
+      });
+      await cleanupReached.promise;
+    });
+    await act(async () => {
+      confirmPromise = result.current.confirmAccountSelect({
+        indexedAccount: {
+          id: 'hd-1--0',
+          walletId: 'hd-1',
+        } as IIndexedAccount,
+        othersWalletAccount: undefined,
+        num: 0,
+      });
+      await waitFor(() => {
+        expect(mockRecordSelectedAccountIntent).toHaveBeenCalled();
+      });
+    });
+    await act(async () => {
+      releaseCleanup.resolve(undefined);
+      await expect(confirmPromise).resolves.toBe(true);
+      await initPromise;
+    });
+
+    expect(mockRecordSelectedAccountIntent).toHaveBeenCalledTimes(1);
+    expect(mockRecordSelectedAccountIntent).toHaveBeenCalledWith({
+      num: 0,
+      sceneName: EAccountSelectorSceneName.home,
+      sceneUrl: undefined,
+      selectedAccount,
+    });
+    expect(mockSaveSelectedAccount).not.toHaveBeenCalled();
+    expect(store.get(accountSelectorUpdateMetaAtom())[0]).toBeUndefined();
+    expect(persistedSelection).toEqual(selectedAccount);
+    expect(store.get(selectedAccountsAtom())[0]).toEqual(selectedAccount);
+  });
+
   it('marks storage and active account init done when storage loading fails', async () => {
     mockGetSelectedAccountsMap.mockRejectedValue(
       new Error('storage loading failed'),
@@ -2204,6 +2719,62 @@ describe('useAccountSelectorActions', () => {
           }),
         ).rejects.toThrow('storage unavailable');
       });
+    });
+
+    it('rejects an A confirm without side effects when a newer B intent arrives before its save', async () => {
+      const intentRecorded = createDeferred<void>();
+      const releaseRecentCacheFlush = createDeferred<void>();
+      let latestIntentEpoch = 0;
+      mockRecordSelectedAccountIntent.mockImplementation(async () => {
+        latestIntentEpoch = 1;
+        intentRecorded.resolve(undefined);
+        return latestIntentEpoch;
+      });
+      mockFlushColdStartCacheNow.mockImplementationOnce(async () => {
+        await releaseRecentCacheFlush.promise;
+      });
+      mockGetSelectedAccount.mockResolvedValue(undefined);
+      mockSaveSelectedAccount.mockImplementation(async (params) => ({
+        persisted: false,
+        staleSelectionIntent: params.selectionIntentEpoch !== latestIntentEpoch,
+      }));
+
+      const { store, Wrapper } = createWrapper();
+      store.set(accountSelectorContextDataAtom(), {
+        sceneName: EAccountSelectorSceneName.home,
+      });
+      const { result } = renderHook(() => useAccountSelectorActions().current, {
+        wrapper: Wrapper,
+      });
+      let confirmPromise: Promise<boolean> | undefined;
+
+      await act(async () => {
+        confirmPromise = result.current.confirmAccountSelect({
+          indexedAccount: {
+            id: 'hd-1--0',
+            walletId: 'hd-1',
+          } as IIndexedAccount,
+          othersWalletAccount: undefined,
+          num: 0,
+        });
+        await intentRecorded.promise;
+      });
+      latestIntentEpoch = 2;
+      await act(async () => {
+        releaseRecentCacheFlush.resolve(undefined);
+        await expect(confirmPromise).rejects.toThrow(/selection intent/i);
+      });
+
+      expect(mockSaveSelectedAccount).toHaveBeenCalledWith(
+        expect.objectContaining({
+          selectedAccount: expect.objectContaining({
+            indexedAccountId: 'hd-1--0',
+          }),
+          selectionIntentEpoch: 1,
+        }),
+      );
+      expect(mockSaveGlobalDeriveType).not.toHaveBeenCalled();
+      expect(mockShouldSyncWithHomeSource).not.toHaveBeenCalled();
     });
 
     it('drops a stale fallback result when a newer selection completes first', async () => {
@@ -4208,8 +4779,9 @@ describe('useAccountSelectorActions', () => {
       othersWalletAccountId: undefined,
       networkId: 'onekeyall',
     });
-    expect(mockSaveSelectedAccount).toHaveBeenCalledWith(
+    expect(mockClearUnavailableSelectedAccount).toHaveBeenCalledWith(
       expect.objectContaining({
+        expectedSelectedAccount: staleSelection,
         sceneName: EAccountSelectorSceneName.home,
         num: 0,
         selectedAccount: expect.objectContaining({
@@ -4312,9 +4884,10 @@ describe('useAccountSelectorActions', () => {
       });
     });
 
-    expect(mockSaveSelectedAccount).toHaveBeenCalledWith(
+    expect(mockClearUnavailableSelectedAccount).toHaveBeenCalledWith(
       expect.objectContaining({
-        sceneName: EAccountSelectorSceneName.home,
+        expectedSelectedAccount: staleHomeSelection,
+        sceneName: EAccountSelectorSceneName.swap,
         num: 0,
         selectedAccount: expect.objectContaining({
           walletId: undefined,
@@ -4323,11 +4896,7 @@ describe('useAccountSelectorActions', () => {
           othersWalletAccountId: undefined,
           networkId: 'evm--1',
         }),
-      }),
-    );
-    expect(mockSaveSelectedAccount).not.toHaveBeenCalledWith(
-      expect.objectContaining({
-        sceneName: EAccountSelectorSceneName.swap,
+        shouldSyncWithHomeSource: true,
       }),
     );
   });
@@ -4820,8 +5389,9 @@ describe('useAccountSelectorActions', () => {
       networkId: 'onekeyall',
     });
 
-    expect(mockSaveSelectedAccount).toHaveBeenCalledWith(
+    expect(mockClearUnavailableSelectedAccount).toHaveBeenCalledWith(
       expect.objectContaining({
+        expectedSelectedAccount: standardWalletSelection,
         sceneName: EAccountSelectorSceneName.home,
         num: 0,
         selectedAccount: expect.objectContaining({

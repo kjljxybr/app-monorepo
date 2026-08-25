@@ -103,6 +103,9 @@ export type IAutoDeriveSyncOutcome =
 /** initFromStorage() stages, also composed into its stale outcomes. */
 export enum EStorageInitPhase {
   ApplyStorage = 'apply-storage',
+  BackgroundCasRejectedCurrentCleanup = 'background-cas-rejected-current-cleanup',
+  BackgroundCasRejectedRecentCleanup = 'background-cas-rejected-recent-cleanup',
+  BackgroundCasRejectedStorageCleanup = 'background-cas-rejected-storage-cleanup',
   CurrentSelection = 'current-selection',
   DiscoverConnection = 'discover-connection',
   NormalizeStorage = 'normalize-storage',
@@ -144,6 +147,7 @@ export enum EStorageSaveOutcome {
   StaleBeforeFix = 'stale-before-fix',
   StaleBeforeRead = 'stale-before-read',
   StaleBeforeWrite = 'stale-before-write',
+  StaleSelectionIntent = 'stale-selection-intent',
   // Terminal results of a save that reached the write.
   Error = 'error',
   Partial = 'partial',

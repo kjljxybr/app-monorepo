@@ -9,6 +9,7 @@ import type { EOAuthSocialLoginProvider } from '@onekeyhq/shared/src/consts/auth
 import { OneKeyLocalError } from '@onekeyhq/shared/src/errors';
 import { ETranslations } from '@onekeyhq/shared/src/locale';
 import { defaultLogger } from '@onekeyhq/shared/src/logger/logger';
+import { generateUUID } from '@onekeyhq/shared/src/utils/miscUtils';
 import {
   EDAppModalPageStatus,
   type IConnectionAccountInfo,
@@ -82,11 +83,33 @@ function ConnectionModal() {
   // can verify the modal is not about to authorize a superseded account.
   const latestActiveAccountRef =
     useRef<IAccountSelectorActiveAccountInfo | null>(null);
+  const latestAccountObservationRevisionRef = useRef(0);
+  const latestAccountSelectorNumRef = useRef<number | undefined>(undefined);
+  const activeApprovalIdRef = useRef<string | undefined>(undefined);
   const missingScopeLoggedRef = useRef(false);
 
   const handleAccountChanged = useCallback<IHandleAccountChanged>(
     ({ activeAccount, selectedAccount: rawSelectedAccountData }, num) => {
+      latestAccountObservationRevisionRef.current += 1;
       latestActiveAccountRef.current = activeAccount;
+      latestAccountSelectorNumRef.current = num;
+      const activeApprovalId = activeApprovalIdRef.current;
+      if (activeApprovalId) {
+        void serviceDApp
+          .invalidateConnectionApproval({
+            approvalId: activeApprovalId,
+          })
+          .catch(() => {
+            // If cancellation cannot reach background, settle the original
+            // request as rejected so a pending approval fails closed.
+            dappApprove.reject({ isForce: true });
+            Toast.error({
+              title: intl.formatMessage({
+                id: ETranslations.global_unknown_error_retry_message,
+              }),
+            });
+          });
+      }
       const hasUsableAccount = Boolean(activeAccount.account);
       if (isAccountSelectorPerfDebugEnabled()) {
         const observedAt = getAccountSelectorPerfTimestamp();
@@ -128,7 +151,7 @@ function ConnectionModal() {
       setSelectedAccount(activeAccount);
       setRawSelectedAccount(rawSelectedAccountData);
     },
-    [],
+    [dappApprove, intl, serviceDApp],
   );
 
   const subtitle = useMemo(() => {
@@ -185,7 +208,7 @@ function ConnectionModal() {
         }
         return;
       }
-      if (!selectedAccount || !selectedAccount.account) {
+      if (!selectedAccount || !selectedAccount.account || !rawSelectedAccount) {
         Toast.error({ title: 'no account' });
         defaultLogger.discovery.dapp.dappUse({
           dappName: $sourceInfo?.hostname,
@@ -197,18 +220,12 @@ function ConnectionModal() {
         return;
       }
       const approvingAccountId = selectedAccount.account.id;
-      // Re-checked after every await below. The modal approves the account held
-      // in state, so a switch that lands mid-approval would authorize an account
-      // the user is no longer looking at.
-      const rejectIfAccountSuperseded = () => {
-        if (
-          !isApprovalAccountSuperseded({
-            approvingAccountId,
-            latestAccountId: latestActiveAccountRef.current?.account?.id,
-          })
-        ) {
-          return false;
-        }
+      const approvingObservationRevision =
+        latestAccountObservationRevisionRef.current;
+      // Local awaits re-check this observation. Once control moves to the
+      // background transaction, approvalId invalidation and the selector intent
+      // epoch guard the same account snapshot until the request is resolved.
+      const rejectChangedApproval = () => {
         Toast.error({
           title: intl.formatMessage({
             id: ETranslations.global_unknown_error_retry_message,
@@ -221,6 +238,20 @@ function ConnectionModal() {
           network: selectedAccount?.network?.name,
           failReason: 'account changed during approval',
         });
+      };
+      const rejectIfAccountSuperseded = () => {
+        if (
+          !isApprovalAccountSuperseded({
+            approvingAccountId,
+            approvingObservationRevision,
+            latestAccountId: latestActiveAccountRef.current?.account?.id,
+            latestObservationRevision:
+              latestAccountObservationRevisionRef.current,
+          })
+        ) {
+          return false;
+        }
+        rejectChangedApproval();
         return true;
       };
       if (rejectIfAccountSuperseded()) {
@@ -262,54 +293,65 @@ function ConnectionModal() {
         focusedWallet: rawSelectedAccount?.focusedWallet,
         othersWalletAccountId: rawSelectedAccount?.othersWalletAccountId,
       };
-      if (connectedAccountInfo?.existConnectedAccount) {
-        if (!isNumber(connectedAccountInfo?.num)) {
-          dappApprove.reject();
-          defaultLogger.discovery.dapp.dappUse({
-            dappName: $sourceInfo.hostname,
-            dappDomain: $sourceInfo?.origin,
-            action: 'ConnectWallet',
-            network: network?.name,
-            failReason: 'no accountSelectorNum',
-          });
-          throw new OneKeyLocalError('no accountSelectorNum');
-        }
-        await serviceDApp.updateConnectionSession({
-          origin: $sourceInfo?.origin,
-          updatedAccountInfo: accountInfo,
-          storageType: 'injectedProvider',
-          accountSelectorNum: connectedAccountInfo.num,
+      const accountSelectorNum = latestAccountSelectorNumRef.current;
+      if (!isNumber(accountSelectorNum)) {
+        dappApprove.reject();
+        defaultLogger.discovery.dapp.dappUse({
+          dappName: $sourceInfo.hostname,
+          dappDomain: $sourceInfo?.origin,
+          action: 'ConnectWallet',
+          network: network?.name,
+          failReason: 'no accountSelectorNum',
         });
-        // updateConnectionSession does not propagate the new account up to
-        // the home selector the way saveConnectionSession does. For the
-        // keyless-preselect entry (Continue with Google/Apple over an
-        // already-connected origin) we must mirror that propagation: under
-        // AlwaysUsePrimaryAccount mode, the next eth_accounts call runs
-        // alignPrimaryAccountToHomeAccount and would otherwise reverse our
-        // switch back to the previously-connected non-keyless account.
-        if (preselectKeylessProvider) {
-          await serviceDApp.syncDappAccountIfPrimaryMode({
-            origin: $sourceInfo.origin,
-          });
-        }
-      } else {
-        await serviceDApp.saveConnectionSession({
-          origin: $sourceInfo?.origin,
-          accountsInfo: [accountInfo],
-          storageType: 'injectedProvider',
+        throw new OneKeyLocalError('no accountSelectorNum');
+      }
+      let approvalFailureReason:
+        | 'request-settled'
+        | 'selection-changed'
+        | undefined;
+      const approvalId = `${String($sourceInfo.id)}:${String(
+        approvingObservationRevision,
+      )}:${generateUUID()}`;
+      activeApprovalIdRef.current = approvalId;
+      let approved = false;
+      try {
+        approved = await dappApprove.resolveByBackground({
+          close: () => {
+            close?.({ flag: EDAppModalPageStatus.Confirmed });
+          },
+          resolveInBackground: async (requestId) => {
+            const result = await serviceDApp.approveConnectionSession({
+              accountInfo,
+              accountSelectorNum,
+              approvalId,
+              expectedSelectedAccount: rawSelectedAccount,
+              mode: connectedAccountInfo?.existConnectedAccount
+                ? 'update'
+                : 'save',
+              origin: $sourceInfo.origin,
+              preselectKeylessProvider,
+              requestId,
+            });
+            approvalFailureReason = result.reason;
+            return result.approved;
+          },
         });
+      } finally {
+        if (activeApprovalIdRef.current === approvalId) {
+          activeApprovalIdRef.current = undefined;
+        }
+      }
+      if (!approved) {
+        if (approvalFailureReason === 'selection-changed') {
+          rejectChangedApproval();
+        }
+        return;
       }
       if (keylessAutoConnectNonce && $sourceInfo?.origin) {
         void serviceDApp.notifyDAppAccountAndChainChangedWithCache({
           targetOrigin: $sourceInfo.origin,
         });
       }
-      await dappApprove.resolve({
-        close: () => {
-          close?.({ flag: EDAppModalPageStatus.Confirmed });
-        },
-        result: accountInfo,
-      });
       setTimeout(() => {
         void notifyKeylessWebConnectSuccess({
           nonce: keylessAutoConnectNonce,

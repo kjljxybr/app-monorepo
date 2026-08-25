@@ -25,6 +25,27 @@ const mockUpdateConnectionSession = jest.fn(
 const mockSaveConnectionSession = jest.fn(
   async (_params: unknown) => undefined,
 );
+const mockApproveConnectionSession = jest.fn(
+  async (
+    _params: unknown,
+  ): Promise<{
+    approved: boolean;
+    reason?: 'request-settled' | 'selection-changed';
+  }> => ({
+    approved: true,
+  }),
+);
+const mockInvalidateConnectionApproval = jest.fn(
+  async (_params: unknown) => undefined,
+);
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 jest.mock('react-intl', () => ({
   useIntl: () => ({ formatMessage: () => '' }),
@@ -55,6 +76,10 @@ jest.mock('../../../background/instance/backgroundApiProxy', () => ({
   __esModule: true,
   default: {
     serviceDApp: {
+      approveConnectionSession: async (params: unknown) =>
+        mockApproveConnectionSession(params),
+      invalidateConnectionApproval: async (params: unknown) =>
+        mockInvalidateConnectionApproval(params),
       saveConnectionSession: async (params: unknown) => {
         await mockSaveConnectionSession(params);
       },
@@ -77,6 +102,17 @@ jest.mock('../../../hooks/useDappApproveAction', () => ({
     },
     reject: () => {
       mockReject();
+    },
+    resolveByBackground: async ({
+      resolveInBackground,
+    }: {
+      resolveInBackground: (id: string) => Promise<boolean>;
+    }) => {
+      const resolved = await resolveInBackground('request-1');
+      if (resolved) {
+        await mockResolve({});
+      }
+      return resolved;
     },
   }),
 }));
@@ -203,7 +239,14 @@ describe('ConnectionModal account consistency', () => {
     capturedHandleAccountChanged = undefined;
     capturedOnConfirm = undefined;
     capturedConfirmDisabled = undefined;
+    mockReject.mockImplementation(() => undefined);
     mockIsAccountIdDeactivatedBotWallet.mockImplementation(async () => false);
+    mockSaveConnectionSession.mockImplementation(async () => undefined);
+    mockUpdateConnectionSession.mockImplementation(async () => undefined);
+    mockInvalidateConnectionApproval.mockImplementation(async () => undefined);
+    mockApproveConnectionSession.mockImplementation(async () => ({
+      approved: true,
+    }));
   });
 
   it('shows an account without an address and disables approval instead of keeping the previous one', async () => {
@@ -271,7 +314,169 @@ describe('ConnectionModal account consistency', () => {
 
     expect(mockToastError).toHaveBeenCalledTimes(1);
     expect(mockResolve).not.toHaveBeenCalled();
-    expect(mockSaveConnectionSession).not.toHaveBeenCalled();
+    expect(mockApproveConnectionSession).not.toHaveBeenCalled();
+  });
+
+  it('rejects an in-flight approval when the latest observation has no account', async () => {
+    const botWalletLookup = createDeferred<boolean>();
+    mockIsAccountIdDeactivatedBotWallet.mockImplementation(
+      async () => botWalletLookup.promise,
+    );
+    render(<ConnectionModal />);
+
+    await act(async () => {
+      capturedHandleAccountChanged?.(
+        {
+          activeAccount: buildActiveAccount({ accountId: 'account-a' }),
+          selectedAccount: rawSelection,
+        } as any,
+        0,
+      );
+    });
+
+    let approvalPromise: Promise<void> | undefined;
+    act(() => {
+      approvalPromise = capturedOnConfirm?.();
+    });
+
+    await act(async () => {
+      capturedHandleAccountChanged?.(
+        {
+          activeAccount: buildActiveAccount({
+            accountId: 'account-b',
+            withAddress: false,
+          }),
+          selectedAccount: rawSelection,
+        } as any,
+        0,
+      );
+      botWalletLookup.resolve(false);
+      await approvalPromise;
+    });
+
+    expect(mockApproveConnectionSession).not.toHaveBeenCalled();
+    expect(mockResolve).not.toHaveBeenCalled();
+    expect(mockToastError).toHaveBeenCalledTimes(1);
+  });
+
+  it('invalidates the background approval when the observed account becomes addressless during the session RPC', async () => {
+    const saveStarted = createDeferred<void>();
+    const finishSave = createDeferred<void>();
+    let approvalInvalidated = false;
+    let persistedConnectionAccountId: string | undefined;
+    mockInvalidateConnectionApproval.mockImplementation(async () => {
+      approvalInvalidated = true;
+    });
+    mockApproveConnectionSession.mockImplementation(async (params: unknown) => {
+      saveStarted.resolve();
+      await finishSave.promise;
+      const accountId = (params as { accountInfo: { accountId: string } })
+        .accountInfo.accountId;
+      if (!approvalInvalidated) {
+        persistedConnectionAccountId = accountId;
+        return { approved: true };
+      }
+      return { approved: false, reason: 'selection-changed' as const };
+    });
+    render(<ConnectionModal />);
+
+    await act(async () => {
+      capturedHandleAccountChanged?.(
+        {
+          activeAccount: buildActiveAccount({ accountId: 'account-a' }),
+          selectedAccount: rawSelection,
+        } as any,
+        0,
+      );
+    });
+
+    let approvalPromise: Promise<void> | undefined;
+    act(() => {
+      approvalPromise = capturedOnConfirm?.();
+    });
+    await saveStarted.promise;
+
+    await act(async () => {
+      capturedHandleAccountChanged?.(
+        {
+          activeAccount: buildActiveAccount({
+            accountId: 'account-a',
+            withAddress: false,
+          }),
+          selectedAccount: rawSelection,
+        } as any,
+        0,
+      );
+    });
+
+    finishSave.resolve();
+    await act(async () => {
+      await approvalPromise;
+    });
+
+    expect(mockInvalidateConnectionApproval).toHaveBeenCalledTimes(1);
+    expect(persistedConnectionAccountId).toBeUndefined();
+    expect(mockResolve).not.toHaveBeenCalled();
+    expect(mockToastError).toHaveBeenCalledTimes(1);
+  });
+
+  it('force rejects the request when background invalidation fails', async () => {
+    const approvalStarted = createDeferred<void>();
+    const finishApproval = createDeferred<void>();
+    let requestRejected = false;
+    mockReject.mockImplementation(() => {
+      requestRejected = true;
+    });
+    mockInvalidateConnectionApproval.mockRejectedValueOnce(
+      new Error('invalidation unavailable'),
+    );
+    mockApproveConnectionSession.mockImplementation(async () => {
+      approvalStarted.resolve();
+      await finishApproval.promise;
+      return requestRejected
+        ? { approved: false, reason: 'request-settled' as const }
+        : { approved: true };
+    });
+    render(<ConnectionModal />);
+
+    await act(async () => {
+      capturedHandleAccountChanged?.(
+        {
+          activeAccount: buildActiveAccount({ accountId: 'account-a' }),
+          selectedAccount: rawSelection,
+        } as any,
+        0,
+      );
+    });
+
+    let approvalPromise: Promise<void> | undefined;
+    act(() => {
+      approvalPromise = capturedOnConfirm?.();
+    });
+    await approvalStarted.promise;
+
+    await act(async () => {
+      capturedHandleAccountChanged?.(
+        {
+          activeAccount: buildActiveAccount({
+            accountId: 'account-a',
+            withAddress: false,
+          }),
+          selectedAccount: rawSelection,
+        } as any,
+        0,
+      );
+      await Promise.resolve();
+    });
+
+    finishApproval.resolve();
+    await act(async () => {
+      await approvalPromise;
+    });
+
+    expect(mockReject).toHaveBeenCalledTimes(1);
+    expect(mockResolve).not.toHaveBeenCalled();
+    expect(mockToastError).toHaveBeenCalledTimes(1);
   });
 
   it('approves normally when the account stays the same', async () => {
