@@ -2066,7 +2066,7 @@ export function useTradingViewNativeKLine({
     ) {
       return;
     }
-    saveTradingViewNativeActiveInterval({
+    void saveTradingViewNativeActiveInterval({
       interval: activeInterval,
       namespace: intervalStorageNamespace,
     });

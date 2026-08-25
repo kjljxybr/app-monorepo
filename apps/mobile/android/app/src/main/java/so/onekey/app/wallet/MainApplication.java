@@ -5,7 +5,6 @@ import android.app.Application;
 import android.net.Uri;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
-import android.database.CursorWindow;
 import android.os.Bundle;
 
 import androidx.annotation.Keep;
@@ -35,8 +34,9 @@ import expo.modules.ReactNativeHostWrapper;
 
 import java.io.File;
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.util.List;
+
+import so.onekey.app.wallet.storage.OneKeyNativeStorageMigrationPackage;
 
 public class MainApplication extends Application implements ReactApplication {
 
@@ -223,7 +223,10 @@ public class MainApplication extends Application implements ReactApplication {
             (ReactApplicationContext) context;
           BackgroundThreadManager manager = BackgroundThreadManager.getInstance();
           long tBeforeBgStart = System.currentTimeMillis();
-          manager.setReactPackages(new PackageList(MainApplication.this).getPackages());
+          List<ReactPackage> backgroundPackages =
+            new PackageList(MainApplication.this).getPackages();
+          backgroundPackages.add(new OneKeyNativeStorageMigrationPackage());
+          manager.setReactPackages(backgroundPackages);
           manager.installSharedBridgeInMainRuntime(reactApplicationContext);
 
           String entryUrl = getBackgroundRunnerEntryUrl();
@@ -366,14 +369,6 @@ public class MainApplication extends Application implements ReactApplication {
       }
     } catch (Exception ignored) {}
     OneKeyLog.info("App", "nativeAppVersion: " + BuildConfig.VERSION_NAME + ", buildNumber: " + BuildConfig.VERSION_CODE + ", builtinBundleVersion: " + builtinBundleVersion);
-
-    try {
-      Field field = CursorWindow.class.getDeclaredField("sCursorWindowSize");
-      field.setAccessible(true);
-      field.set(null, 20 * 1024 * 1024);
-    } catch (Exception e) {
-      e.printStackTrace();
-    }
 
     // if (!BuildConfig.NO_FLIPPER) {
     //   ReactNativeFlipper.initializeFlipper(this, getReactNativeHost().getReactInstanceManager());

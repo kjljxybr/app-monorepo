@@ -4,13 +4,25 @@ import {
 } from '@onekeyfe/react-native-background-thread';
 
 import { OneKeyLocalError } from '@onekeyhq/shared/src/errors';
-import { appEventBus } from '@onekeyhq/shared/src/eventBus/appEventBus';
+import {
+  EAppEventBusNames,
+  appEventBus,
+} from '@onekeyhq/shared/src/eventBus/appEventBus';
 import { defaultLogger } from '@onekeyhq/shared/src/logger/logger';
 import {
   LogLevel,
   NativeLogger,
 } from '@onekeyhq/shared/src/modules3rdParty/react-native-file-logger';
+import {
+  type INativeStorageContractViolation,
+  type INativeStorageGlobal,
+  NATIVE_SYNC_STORAGE_MUTATION_EVENT,
+} from '@onekeyhq/shared/src/storage/nativeStorageTypes';
 
+import {
+  persistNativeStorageContractViolation,
+  readPersistedNativeStorageContractViolations,
+} from './nativeStorageContractViolationQueue';
 import {
   BACKGROUND_THREAD_MAIN_CAPABILITIES_KEY,
   BACKGROUND_THREAD_MAIN_CAPABILITIES_WAKE_KEY,
@@ -101,12 +113,14 @@ let handlerRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let handlerInstalled = false;
 let readySignalEmitted = false;
 let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+let backgroundInitializationFailure: Error | undefined;
 // Tracks the main runtime's current advertised support for the batched
 // jotai broadcast wire protocol. Mirrors whatever main last published so
 // an OTA rollback (new bg bundle + older main bundle that no longer
 // advertises batch support) flips us back to the legacy per-item path
 // instead of writing keys the main observer can't decode.
 let mainBatchProtocolReady = false;
+let mainRuntimeReady = false;
 // Ring buffer size for broadcast sequences (#48).
 // If the producer wraps before the consumer reads a slot, the old message is lost.
 // 4096 slots gives ~4K messages of headroom before overwrite.
@@ -256,6 +270,13 @@ function emitBackgroundRuntimeFailedSignal(error: unknown) {
   );
 }
 
+function emitBackgroundRuntimeStateSignal() {
+  if (backgroundInitializationFailure) {
+    return emitBackgroundRuntimeFailedSignal(backgroundInitializationFailure);
+  }
+  return emitBackgroundRuntimeReadySignal();
+}
+
 function startBackgroundRuntimeHeartbeat() {
   if (heartbeatTimer) {
     return;
@@ -338,6 +359,59 @@ function emitAppEventFromBgToUi(payload: {
     serializeBackgroundThreadAppEventBroadcastPayload(payload),
   );
   return true;
+}
+
+function broadcastNativeStorageContractViolation(
+  violation: INativeStorageContractViolation,
+) {
+  const sharedStore = getSharedStore();
+  const persisted = sharedStore
+    ? persistNativeStorageContractViolation(sharedStore, violation)
+    : false;
+  if (!persisted) {
+    logBgRpcTrace(
+      `failed to persist native storage contract violation id=${violation.id}`,
+      'error',
+    );
+  }
+  const delivered = mainRuntimeReady
+    ? emitAppEventFromBgToUi({
+        eventName: EAppEventBusNames.NativeStorageContractViolation,
+        payload: violation,
+      })
+    : false;
+  return persisted || delivered;
+}
+
+function rebroadcastPersistedNativeStorageContractViolations() {
+  const sharedStore = getSharedStore();
+  if (!mainRuntimeReady || !sharedStore) {
+    return;
+  }
+  const { entries, invalidKeys } =
+    readPersistedNativeStorageContractViolations(sharedStore);
+  invalidKeys.forEach((key) => sharedStore.delete(key));
+  entries.forEach(({ violation }) => {
+    emitAppEventFromBgToUi({
+      eventName: EAppEventBusNames.NativeStorageContractViolation,
+      payload: violation,
+    });
+  });
+}
+
+function flushPendingNativeStorageContractViolations() {
+  const runtimeGlobal = globalThis as INativeStorageGlobal;
+  const queue = runtimeGlobal.__onekeyNativeStorageContractViolationQueue;
+  if (!queue?.length) {
+    return;
+  }
+
+  const pending = queue.splice(0);
+  pending.forEach((violation) => {
+    if (!broadcastNativeStorageContractViolation(violation)) {
+      queue.push(violation);
+    }
+  });
 }
 
 function sendBridgeMessageFromBgToUi(
@@ -547,6 +621,11 @@ function applyMainCapabilities() {
     // latch — an OTA rollback can drop batch support and we must follow it
     // back down to the legacy path on the very next capability read.
     mainBatchProtocolReady = payload?.jotaiStateBatch === true;
+    mainRuntimeReady = payload !== undefined;
+    if (mainRuntimeReady) {
+      rebroadcastPersistedNativeStorageContractViolations();
+      flushPendingNativeStorageContractViolations();
+    }
   } catch (error) {
     logBgRpcTrace(
       `failed to read main capabilities: ${(error as Error)?.message || String(error)}`,
@@ -602,6 +681,8 @@ function installBackgroundRequestHandler() {
     applyMainCapabilities();
   }
 
+  flushPendingNativeStorageContractViolations();
+
   return true;
 }
 
@@ -623,7 +704,7 @@ function scheduleBackgroundHandlerInstall() {
       return;
     }
 
-    if (!emitBackgroundRuntimeReadySignal()) {
+    if (!emitBackgroundRuntimeStateSignal()) {
       scheduleBackgroundHandlerInstall();
     }
   }, HANDLER_RETRY_MS);
@@ -636,7 +717,7 @@ function ensureBackgroundRequestHandlerInstalled() {
       return;
     }
 
-    if (!emitBackgroundRuntimeReadySignal()) {
+    if (!emitBackgroundRuntimeStateSignal()) {
       scheduleBackgroundHandlerInstall();
     }
   } catch (error) {
@@ -649,7 +730,18 @@ function ensureBackgroundRequestHandlerInstalled() {
 export function setBackgroundThreadRequestExecutor(
   executor: IBackgroundThreadRequestExecutor,
 ) {
+  backgroundInitializationFailure = undefined;
   requestExecutor = executor;
+  ensureBackgroundRequestHandlerInstalled();
+}
+
+export function reportBackgroundThreadInitializationFailure(error: unknown) {
+  backgroundInitializationFailure =
+    error instanceof Error
+      ? error
+      : new OneKeyLocalError('Background runtime initialization failed');
+  requestExecutor = undefined;
+  readySignalEmitted = false;
   ensureBackgroundRequestHandlerInstalled();
 }
 
@@ -726,6 +818,15 @@ export function callWebEmbedBridgeViaMainThread(
 
 export function setupBackgroundThreadRPCHandler() {
   const runtimeGlobal = globalThis as IBackgroundRuntimeGlobal;
+  const nativeStorageGlobal = globalThis as INativeStorageGlobal;
+
+  nativeStorageGlobal.__onekeyNativeStorageContractViolationBroadcast =
+    broadcastNativeStorageContractViolation;
+  nativeStorageGlobal.__onekeyNativeSyncStorageBroadcast = (mutation) =>
+    emitAppEventFromBgToUi({
+      eventName: NATIVE_SYNC_STORAGE_MUTATION_EVENT,
+      payload: mutation,
+    });
 
   runtimeGlobal.__setupBackgroundRPCHandler = () => {
     ensureBackgroundRequestHandlerInstalled();
