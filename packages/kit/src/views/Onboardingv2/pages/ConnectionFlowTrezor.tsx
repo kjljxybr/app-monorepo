@@ -24,7 +24,10 @@ import { convertDeviceError } from '@onekeyhq/shared/src/errors/utils/deviceErro
 import { ETranslations } from '@onekeyhq/shared/src/locale';
 import platformEnv from '@onekeyhq/shared/src/platformEnv';
 import { EOnboardingPagesV2 } from '@onekeyhq/shared/src/routes/onboardingv2';
-import { ThirdPartyWalletAvatarImages } from '@onekeyhq/shared/src/utils/avatarUtils';
+import {
+  ThirdPartyWalletAvatarImages,
+  getThirdPartyDeviceAvatarImage,
+} from '@onekeyhq/shared/src/utils/avatarUtils';
 import deviceUtils from '@onekeyhq/shared/src/utils/deviceUtils';
 import { EConnectDeviceChannel } from '@onekeyhq/shared/types/connectDevice';
 import type { IConnectYourDeviceItem } from '@onekeyhq/shared/types/device';
@@ -281,11 +284,23 @@ export default function TrezorConnectionFlow() {
   // --- Device list data ---
   const devicesData = useMemo<IConnectYourDeviceItem[]>(
     () =>
-      searchedDevices.map((item: SearchDevice) => ({
-        title: item.name,
-        src: ThirdPartyWalletAvatarImages.trezor,
-        device: item,
-      })),
+      searchedDevices.map((item: SearchDevice) => {
+        const vendorFields = item as SearchDevice & {
+          vendorModel?: string;
+          vendorModelName?: string;
+        };
+        return {
+          title: item.name,
+          src: ThirdPartyWalletAvatarImages.trezor,
+          device: item,
+          avatarImg: getThirdPartyDeviceAvatarImage({
+            vendor: EHardwareVendor.trezor,
+            vendorModel: vendorFields.vendorModel,
+            vendorModelName: vendorFields.vendorModelName,
+            fallback: 'trezor',
+          }),
+        };
+      }),
     [searchedDevices],
   );
 
@@ -309,6 +324,26 @@ export default function TrezorConnectionFlow() {
     async (data: IConnectYourDeviceItem) => {
       if (!data.device) return;
       await ensureStopScan();
+
+      // The fused scan set forceTransportType to the usbOrBle default (WEBUSB on
+      // desktop) so it could scan BOTH transports at once. Now that the user has
+      // picked a specific device, correct forceTransportType to the transport
+      // that device actually uses — otherwise a BLE device stays under a stale
+      // WEBUSB, which later resolves its connectId to the deviceId instead of the
+      // bleConnectId and fails to reconnect. getForceTransportType handles the
+      // platform (desktop BLE => DesktopWebBle, native => BLE).
+      const transportLabel = getTrezorDeviceTransportLabel(data.device);
+      const selectedChannel =
+        transportLabel === 'BLE'
+          ? EConnectDeviceChannel.bluetooth
+          : EConnectDeviceChannel.usbOrBle;
+      const correctedTransportType =
+        await getForceTransportType(selectedChannel);
+      if (correctedTransportType) {
+        await backgroundApiProxy.serviceHardware.setForceTransportType({
+          forceTransportType: correctedTransportType,
+        });
+      }
 
       navigation.push(EOnboardingPagesV2.FinalizeWalletSetup, {
         deviceData: {
@@ -498,7 +533,10 @@ export default function TrezorConnectionFlow() {
                       }}
                       userSelect="none"
                     >
-                      <WalletAvatar wallet={undefined} img="trezor" />
+                      <WalletAvatar
+                        wallet={undefined}
+                        img={data.avatarImg ?? 'trezor'}
+                      />
                       <ListItem.Text primary={data.device?.name} flex={1} />
                     </ListItem>
                   ))}

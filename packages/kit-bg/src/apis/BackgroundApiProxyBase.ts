@@ -23,11 +23,13 @@ import cacheUtils from '@onekeyhq/shared/src/utils/cacheUtils';
 import { jotaiBgSync } from '../states/jotai/jotaiBgSync';
 
 import { BackgroundServiceProxyBase } from './BackgroundServiceProxyBase';
+import { getLocalBackgroundServiceMethod } from './lazyServiceProxy';
 
 import type {
   IBackgroundApi,
   IBackgroundApiBridge,
   IBackgroundApiInternalCallMessage,
+  IBackgroundAtomStates,
 } from './IBackgroundApi';
 // NOTE: `waitForDataLoaded`, `timerUtils`, `isWebEmbedApiAllowedOrigin`
 // and `IBackgroundApiWebembedCallMessage` used to be imported here for the
@@ -217,11 +219,13 @@ export class BackgroundApiProxyBase
         backgroundApi,
       });
 
-      if (serviceApi[backgroundMethodNameLocal] && serviceApi[methodName]) {
-        const resultPromise = serviceApi[methodName].call(
-          serviceApi,
-          ...params,
-        );
+      const serviceMethod = getLocalBackgroundServiceMethod({
+        serviceApi,
+        methodName,
+        backgroundMethodName: backgroundMethodNameLocal,
+      });
+      if (serviceMethod) {
+        const resultPromise = Reflect.apply(serviceMethod, serviceApi, params);
         ensurePromiseObject(resultPromise, {
           serviceName,
           methodName,
@@ -341,7 +345,12 @@ export class BackgroundApiProxyBase
     globalErrorHandler.addListener(errorToastUtils.showToastOfError);
   }
 
-  async getAtomStates(): Promise<{ states: Record<EAtomNames, any> }> {
+  async getAtomStates(
+    atomNames?: EAtomNames[],
+  ): Promise<{ states: IBackgroundAtomStates }> {
+    if (atomNames) {
+      return this.callBackground('getAtomStates', atomNames);
+    }
     return this.callBackground('getAtomStates');
   }
 

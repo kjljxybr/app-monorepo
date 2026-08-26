@@ -854,9 +854,7 @@ function PopularTrading({ tableLayout }: { tableLayout?: boolean }) {
         return;
       }
 
-      navigation.switchTab(marketTab);
-
-      setTimeout(() => {
+      const navigateToTokenDetail = () => {
         rootNavigationRef.current?.navigate(ERootRoutes.Main, {
           screen: marketTab,
           params: {
@@ -868,9 +866,29 @@ function PopularTrading({ tableLayout }: { tableLayout?: boolean }) {
             },
           },
         });
-      }, 300);
+      };
+
+      if (platformEnv.isNative) {
+        navigateToMarketTab({
+          tabToSelect:
+            resolvedSelectedCategoryId === FAVORITES_CATEGORY_ID
+              ? EMarketHomeTab.Watchlist
+              : undefined,
+          onNavigationComplete: navigateToTokenDetail,
+        });
+        return;
+      }
+      navigation.switchTab(marketTab);
+
+      setTimeout(navigateToTokenDetail, 300);
     },
-    [marketTab, navigateToPerps, navigation],
+    [
+      marketTab,
+      navigateToMarketTab,
+      navigateToPerps,
+      navigation,
+      resolvedSelectedCategoryId,
+    ],
   );
 
   const renderEmptyStateCards = useCallback(() => {
@@ -997,24 +1015,12 @@ function PopularTrading({ tableLayout }: { tableLayout?: boolean }) {
     totalFavoritesCount,
   ]);
 
-  // Header action button (only show "Add tokens" button in empty state)
-  const headerActions = useMemo(() => {
-    if (selectedMarketCategoryId) {
-      return null;
-    }
-
-    // No header action when user has favorites (View more is shown in footer)
-    if (hasUserFavorites) {
-      return null;
-    }
-
-    // Show "Add tokens" button in empty state
-    return (
+  const addTokensButton = useMemo(
+    () => (
       <Button
         testID="home-header-actions-btn"
         size="small"
-        variant="tertiary"
-        icon="PlusSmallOutline"
+        variant="secondary"
         disabled={selectedTokens.length === 0}
         onPress={handleAddTokens}
       >
@@ -1023,14 +1029,9 @@ function PopularTrading({ tableLayout }: { tableLayout?: boolean }) {
           { number: selectedTokens.length || 0 },
         )}
       </Button>
-    );
-  }, [
-    hasUserFavorites,
-    selectedMarketCategoryId,
-    selectedTokens.length,
-    handleAddTokens,
-    intl,
-  ]);
+    ),
+    [selectedTokens.length, handleAddTokens, intl],
+  );
 
   const renderContent = useCallback(() => {
     const listContent = (() => {
@@ -1094,7 +1095,14 @@ function PopularTrading({ tableLayout }: { tableLayout?: boolean }) {
           );
         }
 
-        return <YStack px="$pagePadding">{renderEmptyStateCards()}</YStack>;
+        return (
+          <YStack px="$pagePadding">
+            {renderEmptyStateCards()}
+            <YStack pt="$4" alignItems="center">
+              {addTokensButton}
+            </YStack>
+          </YStack>
+        );
       }
 
       // User has favorites: show table/list layout
@@ -1135,6 +1143,7 @@ function PopularTrading({ tableLayout }: { tableLayout?: boolean }) {
     renderEmptyStateCards,
     renderUserFavoritesList,
     selectedMarketCategoryId,
+    addTokensButton,
     resolvedSelectedCategoryId,
     shouldHideCategorySelector,
     shouldUseTableLayout,
@@ -1143,7 +1152,6 @@ function PopularTrading({ tableLayout }: { tableLayout?: boolean }) {
   return (
     <RichBlock
       title={intl.formatMessage({ id: ETranslations.global_market })}
-      headerActions={headerActions}
       headerContainerProps={{ px: '$pagePadding' }}
       content={renderContent()}
       plainContentContainer

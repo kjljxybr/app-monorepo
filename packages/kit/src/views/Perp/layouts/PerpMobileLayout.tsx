@@ -2,16 +2,13 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import BigNumber from 'bignumber.js';
 import { useIntl } from 'react-intl';
-import {
-  type LayoutChangeEvent,
-  RefreshControl,
-  ScrollView,
-} from 'react-native';
+import { type LayoutChangeEvent, ScrollView } from 'react-native';
 
 import type { IModalNavigationProp } from '@onekeyhq/components';
 import {
   DebugRenderTracker,
   IconButton,
+  RefreshControl,
   SizableText,
   XStack,
   YStack,
@@ -53,6 +50,7 @@ import { PerpTips } from '../components/PerpTips';
 import { PerpTickerBar } from '../components/TickerBar/PerpTickerBar';
 import { PerpTradingPanel } from '../components/TradingPanel/PerpTradingPanel';
 import { usePerpsAccountScopedCacheAddress } from '../hooks/usePerpsAccountScopedCacheAddress';
+import { useVisibleSpotHoldingsCount } from '../hooks/useVisibleSpotHoldingsCount';
 import { isHyperLiquidUnifiedAccountMode } from '../utils';
 import { getPerpsAccountScopedListData } from '../utils/accountScopedData';
 import {
@@ -61,6 +59,8 @@ import {
   isPerpsMobileLayoutTraceRectChanged,
   tracePerpsMobileLayout,
 } from '../utils/mobileLayoutTrace';
+
+import type { ISpotHoldingRawBalance } from '../components/OrderInfoPanel/utils';
 
 export enum ETabName {
   Positions = 'Positions',
@@ -110,12 +110,17 @@ export const TabBarItem = memo(
       >
         <XStack
           py="$2"
-          borderBottomWidth={isFocused ? '$0.5' : '$0'}
-          borderBottomColor="$borderActive"
+          borderBottomWidth={1.5}
+          borderBottomColor={isFocused ? '$borderActive' : 'transparent'}
           onPress={() => onPress(name)}
-          mb={-2}
         >
-          <SizableText size="$bodyMdMedium" pr="$0.5">
+          <SizableText
+            size="$headingXs"
+            textTransform="none"
+            letterSpacing={0}
+            color={isFocused ? '$text' : '$textSubdued'}
+            pr="$0.5"
+          >
             {displayTitle}
           </SizableText>
         </XStack>
@@ -124,7 +129,36 @@ export const TabBarItem = memo(
   },
 );
 
+const MobileHoldingsTabBarItem = memo(
+  ({
+    isFocused,
+    onPress,
+    balances,
+    hasPerpsUsdc,
+  }: {
+    isFocused: boolean;
+    onPress: (name: ETabName) => void;
+    balances: ISpotHoldingRawBalance[];
+    hasPerpsUsdc: boolean;
+  }) => {
+    const holdingsCount = useVisibleSpotHoldingsCount({
+      balances,
+      hasPerpsUsdc,
+    });
+
+    return (
+      <TabBarItem
+        name={ETabName.Balances}
+        isFocused={isFocused}
+        onPress={onPress}
+        tabCount={holdingsCount > 0 ? `(${holdingsCount})` : ''}
+      />
+    );
+  },
+);
+
 TabBarItem.displayName = 'TabBarItem';
+MobileHoldingsTabBarItem.displayName = 'MobileHoldingsTabBarItem';
 
 export function PerpMobileLayout() {
   const tabBarHeight = useScrollContentTabBarOffset();
@@ -249,6 +283,10 @@ export function PerpMobileLayout() {
     ? (cachedSpotBalances?.balances ?? balances)
     : balances;
 
+  const hasPerpsUsdc =
+    !isUnifiedAccountMode &&
+    !!accountSummary?.totalRawUsd &&
+    new BigNumber(accountSummary.totalRawUsd).gt(0);
   const holdingsCount = useMemo(() => {
     const nonUsdcSpotCount = displayBalances.filter(
       (item) => item.coin !== 'USDC' && !new BigNumber(item.total).isZero(),
@@ -256,12 +294,8 @@ export function PerpMobileLayout() {
     const hasSpotUsdc = displayBalances.some(
       (item) => item.coin === 'USDC' && !new BigNumber(item.total).isZero(),
     );
-    const hasPerpsUsdc =
-      !isUnifiedAccountMode &&
-      !!accountSummary?.totalRawUsd &&
-      new BigNumber(accountSummary.totalRawUsd).gt(0);
     return nonUsdcSpotCount + (hasSpotUsdc || hasPerpsUsdc ? 1 : 0);
-  }, [accountSummary?.totalRawUsd, displayBalances, isUnifiedAccountMode]);
+  }, [displayBalances, hasPerpsUsdc]);
 
   const positionsTabCount = useMemo(() => {
     if (positionsLength > 0) {
@@ -276,13 +310,6 @@ export function PerpMobileLayout() {
     }
     return '';
   }, [openOrdersLength]);
-
-  const holdingsTabCount = useMemo(() => {
-    if (holdingsCount > 0) {
-      return `(${holdingsCount})`;
-    }
-    return '';
-  }, [holdingsCount]);
 
   const handleTraceLayout = useCallback(
     (name: string, event: LayoutChangeEvent) => {
@@ -364,6 +391,7 @@ export function PerpMobileLayout() {
       style={{ flex: 1, backgroundColor: '$bgApp' }}
       contentContainerStyle={{ flexGrow: 1, paddingBottom: tabBarHeight }}
       showsVerticalScrollIndicator={false}
+      keyboardShouldPersistTaps="handled"
       stickyHeaderIndices={[1]}
       onLayout={handleScrollViewportLayout}
       onContentSizeChange={handleContentSizeChange}
@@ -380,7 +408,7 @@ export function PerpMobileLayout() {
         <PerpTickerBar />
       </YStack>
       <XStack
-        gap="$3"
+        gap="$3.5"
         px="$4"
         pb="$4"
         onLayout={(event) => handleTraceLayout('firstScreenGrid', event)}
@@ -405,7 +433,7 @@ export function PerpMobileLayout() {
       </XStack>
       <XStack
         bg="$bgApp"
-        borderBottomWidth="$0.5"
+        borderBottomWidth="$px"
         borderBottomColor="$borderSubdued"
         justifyContent="space-between"
         alignItems="center"
@@ -426,11 +454,11 @@ export function PerpMobileLayout() {
             onPress={setActiveTab}
             tabCount={openOrdersTabCount}
           />
-          <TabBarItem
-            name={ETabName.Balances}
+          <MobileHoldingsTabBarItem
             isFocused={activeTab === ETabName.Balances}
             onPress={setActiveTab}
-            tabCount={holdingsTabCount}
+            balances={displayBalances}
+            hasPerpsUsdc={hasPerpsUsdc}
           />
         </XStack>
         <IconButton
@@ -463,7 +491,12 @@ export function PerpMobileLayout() {
           flex={1}
           onLayout={(event) => handleTraceLayout('openOrdersPanel', event)}
         >
-          <PerpOpenOrdersList isMobile useTabsList={false} disableListScroll />
+          <PerpOpenOrdersList
+            isMobile
+            isPanelActive={activeTab === ETabName.OpenOrders}
+            useTabsList={false}
+            disableListScroll
+          />
         </YStack>
         <YStack
           display={activeTab === ETabName.Balances ? 'flex' : 'none'}
