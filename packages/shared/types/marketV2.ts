@@ -51,6 +51,7 @@ export interface IMarketTokenDetail {
   price?: string;
   priceConverted?: string;
   chartPriceUpdatedAt?: number;
+  firstTradeTime?: number | string;
   priceChange1mPercent?: string;
   priceChange5mPercent?: string;
   priceChange30mPercent?: string;
@@ -144,6 +145,7 @@ export interface IMarketTokenDetailPreview {
   tokenImageUris?: string[];
   communityRecognized?: boolean;
   stock?: IMarketStockInfo;
+  firstTradeTime?: number;
   selectedAt: number;
 }
 
@@ -304,9 +306,33 @@ export interface IMarketTokenKLineDataPoint {
   t: number; // timestamp
 }
 
+export type IMarketKLineProvider = 'onekey' | 'hyperliquid';
+
+export interface IMarketTokenKLineHistoryMeta {
+  /**
+   * Stops chart history pagination. A page-budget terminal prevents sparse
+   * assets from repeatedly acquiring a fresh request budget; it does not
+   * assert that the upstream provider has no older candles.
+   */
+  noData: boolean;
+  isPartial?: boolean;
+  stopReason?:
+    | 'target_reached'
+    | 'history_exhausted'
+    | 'page_budget_exhausted'
+    | 'time_budget_exhausted';
+  cancelled?: boolean;
+  error?: string;
+  requestedCount?: number;
+  returnedCount?: number;
+  coveredFrom?: number;
+  coveredTo?: number;
+}
+
 export interface IMarketTokenKLineResponse {
   points: IMarketTokenKLineDataPoint[];
   total: number;
+  historyMeta?: IMarketTokenKLineHistoryMeta;
 }
 
 export interface IMarketWsPriceData {
