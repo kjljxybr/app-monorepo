@@ -1,0 +1,2 @@
+"use strict";(self.rspackChunkweb=self.rspackChunkweb||[]).push([[83791],{253714(s,e,t){var i=t(487541);let SimpleDbEntityBrowserRiskWhiteList=class SimpleDbEntityBrowserRiskWhiteList extends i.t{constructor(...s){super(...s),this.entityName="browserRiskWhilteList",this.enableCache=!1}};t.d(e,{SimpleDbEntityBrowserRiskWhiteList:()=>SimpleDbEntityBrowserRiskWhiteList})}}]);
+//# sourceMappingURL=83791.88e7b763d5.chunk.js.map
